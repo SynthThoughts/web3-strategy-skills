@@ -94,9 +94,9 @@ SLIPPAGE_PCT = 1  # 1% slippage for DEX aggregator swaps
 EMA_PERIOD = 20  # periods for EMA center (v4.1: applied to 1H kline = 20h)
 
 # v4: Trend-adaptive volatility multiplier (v4.2: directional)
-VOLATILITY_MULTIPLIER_BASE = 2.0  # base multiplier (neutral/weak trend)
+VOLATILITY_MULTIPLIER_BASE = 1.5  # base multiplier (neutral/weak trend)
 VOLATILITY_MULTIPLIER_BULL = 3.0  # bullish: wider grid → hold position, trade less
-VOLATILITY_MULTIPLIER_BEAR = 1.5  # bearish: tighter grid → exit faster, trade more
+VOLATILITY_MULTIPLIER_BEAR = 1.0  # bearish: tighter grid → exit faster, trade more
 # v4.2: Asymmetric grid — different step sizes for buy vs sell side
 # Bullish: tighter buy (accumulate fast) + wider sell (hold longer)
 # Bearish: tighter sell (exit fast) + wider buy (wait for dip)

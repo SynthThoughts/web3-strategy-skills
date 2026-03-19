@@ -216,12 +216,12 @@ def generate_html(state: dict, json_blocks: list[dict], events: list[dict]) -> s
     )
 
     # Compute strategy decision variables (must match calc_dynamic_grid directional logic)
-    vol_mult_val = 2.0
+    vol_mult_val = 1.5
     if strength > 0.3:
         if trend == "bullish":
-            vol_mult_val = 2.0 + (3.0 - 2.0) * strength  # 2.0 → 3.0
+            vol_mult_val = 1.5 + (3.0 - 1.5) * strength  # 1.5 → 3.0
         elif trend == "bearish":
-            vol_mult_val = 2.0 - (2.0 - 1.5) * strength  # 2.0 → 1.5
+            vol_mult_val = 1.5 - (1.5 - 1.0) * strength  # 1.5 → 1.0
 
     # Position sizing multipliers
     if trend == "bullish":
@@ -247,11 +247,15 @@ def generate_html(state: dict, json_blocks: list[dict], events: list[dict]) -> s
 
     # Pre-compute tooltip strings (can't use % inside f-strings)
     if strength > 0.3 and trend == "bullish":
-        vol_mult_tip = f"看涨强趋势: 倍数上调至 {vol_mult_val:.1f}x，网格变宽持仓待涨"
+        vol_mult_tip = (
+            f"看涨强趋势: 倍数从 1.5 上调至 {vol_mult_val:.1f}x，网格变宽持仓待涨"
+        )
     elif strength > 0.3 and trend == "bearish":
-        vol_mult_tip = f"看跌强趋势: 倍数下调至 {vol_mult_val:.1f}x，网格收窄加速出货"
+        vol_mult_tip = (
+            f"看跌强趋势: 倍数从 1.5 下调至 {vol_mult_val:.1f}x，网格收窄加速出货"
+        )
     else:
-        vol_mult_tip = "趋势强度 ≤ 30%，使用基础倍数 2.0x"
+        vol_mult_tip = "趋势强度 ≤ 30%，使用基础倍数 1.5x"
     if trend == "bullish":
         sizing_tip = f"看涨: 买入 ×{buy_mult:.2f} (加仓) / 卖出 ×{sell_mult:.2f} (减仓)"
     elif trend == "bearish":
@@ -614,7 +618,7 @@ def generate_html(state: dict, json_blocks: list[dict], events: list[dict]) -> s
         </div>
         <div class="mtf-item" title="{vol_mult_tip}">
           <span class="mtf-label">宽度倍数</span>
-          <span class="mtf-value" style="color:{"#c8ff00" if vol_mult_val > 2.0 else "#ff4c8b" if vol_mult_val < 2.0 else "#ccc"};">{vol_mult_val:.1f}x</span>
+          <span class="mtf-value" style="color:{"#c8ff00" if vol_mult_val > 1.5 else "#ff4c8b" if vol_mult_val < 1.5 else "#ccc"};">{vol_mult_val:.1f}x</span>
         </div>
         <div class="mtf-item" title="{sizing_tip}">
           <span class="mtf-label">仓位倍数</span>
