@@ -512,18 +512,13 @@ def calc_dynamic_grid(
         log(f"Grid center: cold start, using current price ${center:.2f}")
 
     # Calculate volatility and step size (skip if cold start already set step)
-    if hourly_closes or len(price_history) >= 5:
-        # Use 5min history for volatility (captures recent micro-structure)
-        if len(price_history) >= 5:
-            volatility = calc_volatility(price_history)
-            avg_price = sum(price_history) / len(price_history)
-            vol_pct = (volatility / avg_price) * 100 if avg_price > 0 else 0
-        else:
-            volatility = calc_volatility(hourly_closes)
-            avg_price = sum(hourly_closes) / len(hourly_closes)
-            vol_pct = (volatility / avg_price) * 100 if avg_price > 0 else 0
+    if candles and len(candles) >= 2:
+        # v4.1: Use 1H ATR for step sizing (more robust than stddev)
+        vol_pct = calc_kline_volatility(candles)  # ATR as % of price
+        atr_dollar = vol_pct / 100 * current_price
+        log(f"ATR(1H, {len(candles)} bars): {vol_pct:.2f}% = ${atr_dollar:.1f}")
 
-        # v4: Trend-adaptive multiplier — wider grid in trends to reduce over-trading
+        # Trend-adaptive multiplier — wider grid in trends to reduce over-trading
         vol_mult = VOLATILITY_MULTIPLIER_BASE
         if mtf and mtf.get("strength", 0) > 0.3:
             blend = mtf["strength"]
@@ -535,15 +530,26 @@ def calc_dynamic_grid(
                 f"Trend-adaptive: multiplier {vol_mult:.2f} (strength {mtf['strength']:.2f})"
             )
 
-        step = (vol_mult * volatility) / (GRID_LEVELS / 2)
+        step = (vol_mult * atr_dollar) / (GRID_LEVELS / 2)
         step_floor = current_price * STEP_MIN_PCT
         step_ceil = current_price * STEP_MAX_PCT
         step = max(step_floor, min(step_ceil, step))
 
         log(
-            f"Volatility: {vol_pct:.2f}% -> step=${step:.1f} "
-            f"({step / current_price * 100:.2f}% of price, mult={vol_mult:.2f})"
+            f"Step: ${step:.1f} ({step / current_price * 100:.2f}% of price, "
+            f"ATR=${atr_dollar:.1f}, mult={vol_mult:.2f})"
         )
+    elif len(price_history) >= 5:
+        # Fallback: stddev from 5min ticks
+        volatility = calc_volatility(price_history)
+        avg_price = sum(price_history) / len(price_history)
+        vol_pct = (volatility / avg_price) * 100 if avg_price > 0 else 0
+        vol_mult = VOLATILITY_MULTIPLIER_BASE
+        step = (vol_mult * volatility) / (GRID_LEVELS / 2)
+        step_floor = current_price * STEP_MIN_PCT
+        step_ceil = current_price * STEP_MAX_PCT
+        step = max(step_floor, min(step_ceil, step))
+        log(f"Step (5min fallback): ${step:.1f} ({vol_pct:.2f}% stddev)")
 
     # Hard floor: at least $5
     step = max(step, 5.0)

@@ -138,8 +138,10 @@ if mtf and mtf["strength"] > 0.3:
 ### Step Calculation
 
 ```python
-stddev = std(price_history)
-step = (vol_mult * stddev) / (GRID_LEVELS / 2)
+# v4.1: Use 1H ATR for step sizing (more robust than stddev for extreme moves)
+atr_pct = calc_kline_volatility(candles)  # ATR as % of price
+atr_dollar = atr_pct / 100 * current_price
+step = (vol_mult * atr_dollar) / (GRID_LEVELS / 2)
 
 # Clamp to bounds
 step = max(step, price * STEP_MIN_PCT)  # floor: 1.0% of price
