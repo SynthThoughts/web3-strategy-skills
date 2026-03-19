@@ -1479,17 +1479,21 @@ def tick():
     if state.get("stop_triggered"):
         trigger = state["stop_triggered"]
         log(f"STOP ACTIVE: {trigger} -- trading halted")
-        save_state(state)
-        _send_discord_embed(
-            [
-                {
-                    "title": "\U0001f6d1 交易已停止",
-                    "color": 0xFF0000,
-                    "description": f"触发条件: **{trigger}**\n当前价格: ${price:.2f}\n组合价值: ${total_usd:.0f}\n\n使用 `resume-trading` 恢复交易",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-            ]
-        )
+        if not state.get("stop_notified"):
+            state["stop_notified"] = True
+            save_state(state)
+            _send_discord_embed(
+                [
+                    {
+                        "title": "\U0001f6d1 交易已停止",
+                        "color": 0xFF0000,
+                        "description": f"触发条件: **{trigger}**\n当前价格: ${price:.2f}\n组合价值: ${total_usd:.0f}\n\n使用 `resume-trading` 恢复交易",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                ]
+            )
+        else:
+            save_state(state)
         _emit_json(
             {
                 "status": "stopped",
@@ -1838,6 +1842,19 @@ def tick():
                         "grid_to": current_level,
                         "time": datetime.now().isoformat(),
                     }
+                    if failure_info:
+                        _send_discord_embed([{
+                            "title": "\u26a0\ufe0f 交易失败",
+                            "color": 0xFF9800,
+                            "fields": [
+                                {"name": "方向", "value": direction, "inline": True},
+                                {"name": "价格", "value": f"${price:.2f}", "inline": True},
+                                {"name": "原因", "value": failure_info.get("reason", "unknown"), "inline": True},
+                                {"name": "详情", "value": str(failure_info.get("detail", ""))[:200], "inline": False},
+                            ],
+                            "footer": {"text": f"可重试: {'是' if failure_info.get('retriable') else '否'}"},
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        }])
             else:
                 log(f"Skipped trade: {calc_fail}")
                 action = f"{direction} skipped"
@@ -1971,14 +1988,18 @@ def tick():
             if deposits != 0:
                 desc += f" | 资金调整 ${deposits:+.0f}"
             embed = {
-                "title": "\u23f3 ETH 网格 v4 -- 运行中",
+                "title": "\u23f3 ETH 网格 v4.1 -- 运行中",
                 "color": 0x9E9E9E,
                 "description": desc,
                 "footer": {"text": grid_footer},
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
-        sent = _send_discord_embed([embed])
+        # Only send no-trade ticks on the hour; always send event ticks
+        if has_event or datetime.now().minute < 5:
+            sent = _send_discord_embed([embed])
+        else:
+            sent = False
         if not sent:
             pnl_sign = "+" if total_pnl >= 0 else ""
             summary = (
@@ -1999,7 +2020,7 @@ def tick():
     if should_print:
         json_data = {
             "status": tick_status,
-            "version": "4.0",
+            "version": "4.1",
             "market": market_data,
             "portfolio": portfolio_data,
             "grid_level": display_level,
@@ -2166,76 +2187,131 @@ def report():
         price_high = price_low = price or 0
         vol_pct = 0
 
-    print("**ETH 网格机器人 v4 -- 每日报告**")
-    print(f"> 当前价格: `${price:.2f}`" if price else "> 当前价格: N/A")
-    print(
-        f"> 24h 范围: `${price_low:.2f}` - `${price_high:.2f}` | 波动率: `{vol_pct:.1f}%`"
-    )
-
-    # MTF
-    if price and len(history) >= MTF_SHORT_PERIOD:
-        mtf = analyze_multi_timeframe(history, price)
-        print(
-            f"> 趋势: `{mtf['trend']}` ({mtf['strength']:.0%}) | 结构: `{mtf['structure']}`"
-        )
-        print(
-            f"> 动量: 1h `{mtf['momentum_1h']:+.2f}%` | 4h `{mtf['momentum_4h']:+.2f}%`"
-        )
-
-    print("\n**持仓**")
-    print(f"> `{eth_bal:.4f}` ETH + `${usdc_bal:.2f}` USDC = **`${total_usd:.0f}`**")
-    if grid:
-        print(
-            f"> 网格: `${grid.get('range', [0, 0])[0]:.0f}`-`${grid.get('range', [0, 0])[1]:.0f}` "
-            f"(步长 `${grid.get('step', 0):.1f}`) | 层级 `{state.get('current_level', '?')}`/`{GRID_LEVELS}`"
-        )
-
     # PnL
     initial = stats.get("initial_portfolio_usd")
     deposits = stats.get("total_deposits_usd", 0)
     grid_profit = stats.get("grid_profit", 0)
     sell_total = stats.get("total_sell_usdc", 0)
     buy_total = stats.get("total_buy_usdc", 0)
-    print("\n**收益**")
+
+    # Build embed
+    fields = [
+        {"name": "当前价格", "value": f"${price:.2f}" if price else "N/A", "inline": True},
+        {"name": "24h 范围", "value": f"${price_low:.2f} - ${price_high:.2f}", "inline": True},
+        {"name": "波动率", "value": f"{vol_pct:.1f}%", "inline": True},
+        {"name": "持仓", "value": f"{eth_bal:.4f} ETH + ${usdc_bal:.2f} USDC = **${total_usd:.0f}**", "inline": False},
+    ]
+
+    if grid:
+        fields.append({"name": "网格", "value": f"${grid.get('range', [0,0])[0]:.0f}-${grid.get('range', [0,0])[1]:.0f} (步长 ${grid.get('step', 0):.1f}) | L{state.get('current_level', '?')}/{GRID_LEVELS}", "inline": False})
+
     if initial and price:
         cost_basis = initial + deposits
         total_pnl = round(total_usd - cost_basis, 2)
         pct = (total_pnl / cost_basis) * 100 if cost_basis else 0
         holding_pnl = round(total_pnl - grid_profit, 2)
-        print(
-            f"> 总收益: **`${total_pnl:+.2f}` (`{pct:+.1f}%`)**  起始 `${initial:.0f}`"
-        )
-        print(f"> 网格利润: `${grid_profit:+.2f}` | 持仓浮盈: `${holding_pnl:+.2f}`")
-        print(f"> 交易量: 卖出 `${sell_total:.2f}` | 买入 `${buy_total:.2f}`")
+        fields.append({"name": "总收益", "value": f"${total_pnl:+.2f} ({pct:+.1f}%)", "inline": True})
+        fields.append({"name": "网格利润", "value": f"${grid_profit:+.2f}", "inline": True})
+        fields.append({"name": "持仓浮盈", "value": f"${holding_pnl:+.2f}", "inline": True})
+        fields.append({"name": "交易量", "value": f"卖出 ${sell_total:.2f} | 买入 ${buy_total:.2f}", "inline": False})
 
-        # HODL comparison
         initial_price = stats.get("initial_eth_price")
         if initial_price and initial_price > 0:
             initial_eth = initial / initial_price
             hodl_value = initial_eth * price
             hodl_alpha = round(total_usd - hodl_value, 2)
-            print(f"> **HODL Alpha: `${hodl_alpha:+.2f}`**")
+            fields.append({"name": "HODL Alpha", "value": f"${hodl_alpha:+.2f}", "inline": True})
 
-    print(f"\n> 成功率: `{_success_rate_str(state)}`")
+    fields.append({"name": "成功率", "value": f"{_success_rate_str(state)}", "inline": True})
+    fields.append({"name": "累计交易", "value": f"{stats.get('total_trades', 0)} 笔", "inline": True})
 
-    # 今日交易
-    print(f"\n**今日交易: `{len(today_trades)}` 笔**")
+    # Today's trades summary
     if today_trades:
+        trade_lines = []
         for t in today_trades[-10:]:
             dir_cn = "卖出" if t["direction"] == "SELL" else "买入"
             est = t.get("est_profit", 0)
-            profit_str = f" 利润~`${est:.2f}`" if est > 0 else ""
-            trend = t.get("trend", "")
-            trend_str = f" [{trend}]" if trend else ""
-            print(
-                f"> `{t['time'][11:19]}` {dir_cn} `${t['amount_usd']:.2f}` @ `${t['price']:.2f}`{profit_str}{trend_str}"
-            )
+            profit_str = f" ~${est:.2f}" if est > 0 else ""
+            trade_lines.append(f"`{t['time'][11:19]}` {dir_cn} ${t['amount_usd']:.2f} @ ${t['price']:.2f}{profit_str}")
+        fields.append({"name": f"今日交易 ({len(today_trades)}笔)", "value": "\n".join(trade_lines), "inline": False})
     else:
-        print("> 今日暂无交易")
+        fields.append({"name": "今日交易", "value": "暂无", "inline": True})
 
-    print(
-        f"\n> 累计交易: `{stats.get('total_trades', 0)}` 笔 | 运行自: `{stats.get('started_at', '未知')[:10]}`"
-    )
+    # MTF info in footer
+    footer_text = f"运行自 {stats.get('started_at', '未知')[:10]}"
+    if price and len(history) >= MTF_SHORT_PERIOD:
+        mtf = analyze_multi_timeframe(history, price)
+        footer_text = f"趋势 {mtf['trend']} ({mtf['strength']:.0%}) | 结构 {mtf['structure']} | {footer_text}"
+
+    embed = {
+        "title": "\U0001f4ca ETH 网格 v4.1 — 每日报告",
+        "color": 0x2196F3,
+        "fields": fields,
+        "footer": {"text": footer_text},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    sent = _send_discord_embed([embed])
+    if not sent:
+        # Fallback to print output
+        print("**ETH 网格机器人 v4.1 -- 每日报告**")
+        print(f"> 当前价格: `${price:.2f}`" if price else "> 当前价格: N/A")
+        print(
+            f"> 24h 范围: `${price_low:.2f}` - `${price_high:.2f}` | 波动率: `{vol_pct:.1f}%`"
+        )
+
+        if price and len(history) >= MTF_SHORT_PERIOD:
+            if not mtf:
+                mtf = analyze_multi_timeframe(history, price)
+            print(
+                f"> 趋势: `{mtf['trend']}` ({mtf['strength']:.0%}) | 结构: `{mtf['structure']}`"
+            )
+            print(
+                f"> 动量: 1h `{mtf['momentum_1h']:+.2f}%` | 4h `{mtf['momentum_4h']:+.2f}%`"
+            )
+
+        print("\n**持仓**")
+        print(f"> `{eth_bal:.4f}` ETH + `${usdc_bal:.2f}` USDC = **`${total_usd:.0f}`**")
+        if grid:
+            print(
+                f"> 网格: `${grid.get('range', [0, 0])[0]:.0f}`-`${grid.get('range', [0, 0])[1]:.0f}` "
+                f"(步长 `${grid.get('step', 0):.1f}`) | 层级 `{state.get('current_level', '?')}`/`{GRID_LEVELS}`"
+            )
+
+        print("\n**收益**")
+        if initial and price:
+            print(
+                f"> 总收益: **`${total_pnl:+.2f}` (`{pct:+.1f}%`)**  起始 `${initial:.0f}`"
+            )
+            print(f"> 网格利润: `${grid_profit:+.2f}` | 持仓浮盈: `${holding_pnl:+.2f}`")
+            print(f"> 交易量: 卖出 `${sell_total:.2f}` | 买入 `${buy_total:.2f}`")
+
+            initial_price = stats.get("initial_eth_price")
+            if initial_price and initial_price > 0:
+                initial_eth = initial / initial_price
+                hodl_value = initial_eth * price
+                hodl_alpha = round(total_usd - hodl_value, 2)
+                print(f"> **HODL Alpha: `${hodl_alpha:+.2f}`**")
+
+        print(f"\n> 成功率: `{_success_rate_str(state)}`")
+
+        print(f"\n**今日交易: `{len(today_trades)}` 笔**")
+        if today_trades:
+            for t in today_trades[-10:]:
+                dir_cn = "卖出" if t["direction"] == "SELL" else "买入"
+                est = t.get("est_profit", 0)
+                profit_str = f" 利润~`${est:.2f}`" if est > 0 else ""
+                trend = t.get("trend", "")
+                trend_str = f" [{trend}]" if trend else ""
+                print(
+                    f"> `{t['time'][11:19]}` {dir_cn} `${t['amount_usd']:.2f}` @ `${t['price']:.2f}`{profit_str}{trend_str}"
+                )
+        else:
+            print("> 今日暂无交易")
+
+        print(
+            f"\n> 累计交易: `{stats.get('total_trades', 0)}` 笔 | 运行自: `{stats.get('started_at', '未知')[:10]}`"
+        )
 
 
 def history_cmd():
@@ -2524,7 +2600,7 @@ def analyze():
                     break
 
     analysis = {
-        "version": "4.0",
+        "version": "4.1",
         "timestamp": datetime.now().isoformat(),
         "market": {
             "price": round(price, 2),
@@ -2624,6 +2700,7 @@ def resume_trading():
         return
     old_trigger = state["stop_triggered"]
     state.pop("stop_triggered", None)
+    state.pop("stop_notified", None)
     save_state(state)
     log(f"Trading resumed (was: {old_trigger})")
     print(f"交易已恢复 (之前停止原因: {old_trigger})")
