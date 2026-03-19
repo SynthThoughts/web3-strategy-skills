@@ -1,19 +1,33 @@
 ---
 name: grid-trading
-description: "Dynamic grid trading strategy for any token pair on EVM L2 chains via OKX DEX API. v4 adds multi-timeframe trend analysis, trend-adaptive grid sizing, ATR-based volatility, smart money signal integration, sell trailing optimization, and HODL Alpha tracking. Covers grid modes (arithmetic/geometric), position sizing strategies (equal/martingale/anti-martingale/pyramid/trend-adaptive), comprehensive risk controls (stop-loss, take-profit, drawdown protection, circuit breakers), trade execution via OKX DEX aggregator, PnL calculation, and Discord notification. Use when creating, modifying, debugging, or tuning a grid trading bot."
+description: "Dynamic grid trading strategy for any token pair on EVM L2 chains via OKX DEX API. v4.2 adds asymmetric grid steps (buy-dense/sell-wide in bullish, reverse in bearish). v4 adds multi-timeframe trend analysis, trend-adaptive grid sizing, ATR-based volatility, smart money signal integration, sell trailing optimization, and HODL Alpha tracking. Covers grid modes (arithmetic/geometric), asymmetric buy/sell grid spacing, position sizing strategies (equal/martingale/anti-martingale/pyramid/trend-adaptive), comprehensive risk controls (stop-loss, take-profit, drawdown protection, circuit breakers), trade execution via OKX DEX aggregator, PnL calculation, and Discord notification. Use when creating, modifying, debugging, or tuning a grid trading bot."
 license: Apache-2.0
 metadata:
   author: SynthThoughts
-  version: "4.1.0"
+  version: "4.2.0"
   pattern: "pipeline, tool-wrapper"
   steps: "5"
 ---
 
-# Dynamic Grid Trading Strategy v4
+# Dynamic Grid Trading Strategy v4.2
 
-Cron-driven grid bot for EVM L2 chains via `onchainos` CLI. v4 adds trend intelligence: multi-timeframe analysis, signal-enhanced sizing, sell optimization, and HODL Alpha tracking.
+Cron-driven grid bot for EVM L2 chains via `onchainos` CLI. v4.2 adds asymmetric grid steps — different spacing for buy vs sell sides based on trend direction. v4 adds trend intelligence: multi-timeframe analysis, signal-enhanced sizing, sell optimization, and HODL Alpha tracking.
 
 Every tick: fetch price → MTF analysis → compute grid level → trend-adaptive decision → execute swap → report to Discord.
+
+## What's New in v4.2
+
+Asymmetric grid steps — buy and sell sides use different spacing based on trend direction:
+
+| Trend | Buy Side | Sell Side | Effect |
+|-------|----------|-----------|--------|
+| Bullish | Tighter (accumulate fast) | Wider (hold longer) | Buy dense, sell sparse → captures uptrend |
+| Bearish | Wider (wait for dip) | Tighter (exit fast) | Sell dense, buy sparse → reduces downside exposure |
+| Neutral/Weak | Symmetric | Symmetric | Same as v4.1 |
+
+Key config: `ASYM_FACTOR=0.4` (max asymmetry ratio). Asymmetry scales with trend strength and only activates when `strength > 0.3`.
+
+New grid dict fields: `buy_step`, `sell_step` (backward-compatible `step` = average). Level prices are now non-uniform: below center spaced by `buy_step`, above center by `sell_step`.
 
 ## What's New in v4
 
@@ -197,6 +211,7 @@ Auto-retry policy: 1 retry for `retriable=True` with 3s delay and fresh quote.
 | `EMA_PERIOD` | `20` | EMA lookback for grid center (v4.1: applied to 1H kline = 20h) |
 | `VOLATILITY_MULTIPLIER_BASE` | `2.0` | Base grid width = multiplier x stddev |
 | `VOLATILITY_MULTIPLIER_TREND` | `3.0` | Wider grid in trending markets (v4) |
+| `ASYM_FACTOR` | `0.4` | **(v4.2)** Max buy/sell asymmetry ratio. 0=symmetric, 1=fully asymmetric |
 | `GRID_RECALIBRATE_HOURS` | `12` | Max hours before forced recalibration |
 
 ### Multi-Timeframe (v4 New)
@@ -240,7 +255,7 @@ ratio = 1 + (step / center)
 level_prices = [center * (ratio ** (i - half)) for i in range(GRID_LEVELS + 1)]
 ```
 
-Both modes store `level_prices` in the grid dict for unified level lookup via `bisect_right`.
+Both modes store `level_prices` in the grid dict for unified level lookup via `bisect_right`. v4.2 adds asymmetric spacing: levels below center use `buy_step`, levels above use `sell_step`. The `_build_level_prices()` helper handles both symmetric and asymmetric construction.
 
 **Choosing a mode:**
 
@@ -253,16 +268,26 @@ Both modes store `level_prices` in the grid dict for unified level lookup via `b
 
 ### Adaptive Step Sizing
 
-Step scales with real-time volatility, modulated by trend strength (v4):
+Step scales with real-time volatility, modulated by trend strength (v4). v4.2 splits into directional buy/sell steps:
 
 ```
 vol_mult = VOLATILITY_MULTIPLIER_BASE  (2.0)
 if trend_strength > 0.3:
-    vol_mult = blend(BASE, TREND, strength)  (up to 3.5)
+    vol_mult = blend(BASE, TREND, strength)  (up to 3.0)
 
-step = (vol_mult × stddev) / (GRID_LEVELS / 2)
-step = clamp(step, price × STEP_MIN_PCT, price × STEP_MAX_PCT)
-step = max(step, 5.0)  # hard floor $5
+# v4.2: Asymmetric steps based on trend direction
+asym = ASYM_FACTOR × strength  (if strength > 0.3, else 0)
+if bullish:
+    buy_mult  = vol_mult × (1 - asym)   # tighter buy
+    sell_mult = vol_mult × (1 + asym)   # wider sell
+elif bearish:
+    buy_mult  = vol_mult × (1 + asym)   # wider buy
+    sell_mult = vol_mult × (1 - asym)   # tighter sell
+
+buy_step  = (buy_mult × ATR) / (GRID_LEVELS / 2)
+sell_step = (sell_mult × ATR) / (GRID_LEVELS / 2)
+# Both clamped to [price × STEP_MIN_PCT, price × STEP_MAX_PCT], floor $5
+step = (buy_step + sell_step) / 2  # backward-compatible average
 ```
 
 | Parameter | Default | Description |
@@ -272,8 +297,8 @@ step = max(step, 5.0)  # hard floor $5
 | `VOL_RECALIBRATE_RATIO` | `0.3` | Recalibrate if vol shifts >30% from grid snapshot |
 
 **Recalibration triggers (asymmetric):**
-1. **Downside breakout**: Price < grid lower - step → recalibrate **immediately** (buying dips is grid's edge)
-2. **Upside breakout**: Price > grid upper + step → require **N consecutive ticks** confirmation before recalibrating (anti-chase)
+1. **Downside breakout**: Price < grid lower - `buy_step` → recalibrate **immediately** (buying dips is grid's edge)
+2. **Upside breakout**: Price > grid upper + `sell_step` → require **N consecutive ticks** confirmation before recalibrating (anti-chase)
 3. Grid age exceeds `GRID_RECALIBRATE_HOURS`
 4. Current volatility deviates >30% from grid's recorded volatility
 
@@ -389,6 +414,7 @@ def _check_stop_conditions(state, total_usd, price):
 5. v4: Fetch smart money signals (15min cache)
 6. Check if grid needs recalibration (breakout / vol shift / age)
    → v4: calc_dynamic_grid() uses trend-adaptive volatility multiplier
+   → v4.2: asymmetric buy_step/sell_step based on trend direction
 7. Map price → grid level
 8. If level changed:
    a. Direction: BUY if level dropped, SELL if rose
@@ -405,36 +431,41 @@ def _check_stop_conditions(state, total_usd, price):
 
 ```python
 def calc_dynamic_grid(price, price_history, mtf=None):
-    center = EMA(price_history, EMA_PERIOD)
-    vol = stddev(price_history)
+    center = EMA(1H_kline, EMA_PERIOD)  # 20-hour EMA on 1H candles
+    atr = calc_kline_volatility(candles)
 
     # v4: trend-adaptive multiplier
     vol_mult = VOLATILITY_MULTIPLIER_BASE  # 2.0
     if mtf and mtf["strength"] > 0.3:
         vol_mult = blend(BASE=2.0, TREND=3.0, factor=strength)
 
-    step = (vol_mult * vol) / (GRID_LEVELS / 2)
-    step = clamp(step, price * STEP_MIN_PCT, price * STEP_MAX_PCT)
-    step = max(step, 5.0)  # hard floor $5
+    # v4.2: asymmetric buy/sell multipliers
+    asym = ASYM_FACTOR * strength if strength > 0.3 else 0
+    if bullish:
+        buy_mult = vol_mult * (1 - asym)   # tighter buy grid
+        sell_mult = vol_mult * (1 + asym)   # wider sell grid
+    elif bearish:
+        buy_mult = vol_mult * (1 + asym)   # wider buy grid
+        sell_mult = vol_mult * (1 - asym)   # tighter sell grid
 
-    # Build level_prices (arithmetic or geometric)
-    if GRID_TYPE == "geometric":
-        ratio = 1 + (step / center)
-        level_prices = [center * (ratio ** (i - half)) for i in range(GRID_LEVELS + 1)]
-    else:
-        level_prices = [center - half*step + i*step for i in range(GRID_LEVELS + 1)]
+    buy_step = clamp((buy_mult * atr) / half, floor, ceil)
+    sell_step = clamp((sell_mult * atr) / half, floor, ceil)
 
-    return {center, step, levels, range, vol_pct, type, level_prices}
+    # Build asymmetric level_prices via _build_level_prices()
+    # Below center: spaced by buy_step; Above center: spaced by sell_step
+    level_prices = _build_level_prices(center, buy_step, sell_step, half, grid_type)
+
+    return {center, step, buy_step, sell_step, levels, range, vol_pct, type, level_prices}
 ```
 
-**Examples** (at price $2000):
+**Examples** (at price $2000, ATR=$50):
 
-| Volatility | stddev | Trend | Multiplier | Step | Grid Range | Behavior |
+| Trend | Strength | buy_step | sell_step | Buy Range | Sell Range | Behavior |
 |---|---|---|---|---|---|---|
-| Low (1.5%) | $30 | Neutral | 2.5 | $25 | $1925-$2075 | Tight, catches small swings |
-| Medium (3%) | $60 | Neutral | 2.5 | $50 | $1850-$2150 | Normal operation |
-| Medium (3%) | $60 | Bullish (0.7) | 3.2 | $64 | $1808-$2192 | Wider, less trading |
-| High (7%) | $140 | Strong trend | 3.5 | $163 | $1512-$2488 | Very wide, hold position |
+| Neutral | 0.1 | $33 | $33 | $1901-$2000 | $2000-$2099 | Symmetric, normal |
+| Bullish | 0.6 | $33 | $54 | $1901-$2000 | $2000-$2162 | Buy dense + sell wide |
+| Bearish | 0.6 | $54 | $33 | $1838-$2000 | $2000-$2099 | Buy wide + sell dense |
+| Strong Bull | 0.9 | $24 | $66 | $1928-$2000 | $2000-$2198 | Max asymmetry |
 
 ## v4: Sell Optimization Logic
 
@@ -525,10 +556,10 @@ total_pnl_eth = current_eth_equivalent - initial_eth_equivalent
 ```json
 {
   "version": 5,
-  "grid": {"center": 2000, "step": 33.3, "levels": 6,
-           "range": [1900, 2100], "vol_pct": 2.1,
+  "grid": {"center": 2000, "step": 43.5, "buy_step": 33.3, "sell_step": 53.7,
+           "levels": 6, "range": [1900, 2161], "vol_pct": 2.1,
            "type": "arithmetic",
-           "level_prices": [1900, 1933, 1967, 2000, 2033, 2067, 2100]},
+           "level_prices": [1900, 1933, 1967, 2000, 2054, 2107, 2161]},
   "grid_set_at": "ISO timestamp",
   "current_level": 3,
   "price_history": ["...max 288 (24h at 5min)"],
@@ -567,7 +598,8 @@ total_pnl_eth = current_eth_equivalent - initial_eth_equivalent
 ```
 
 Key fields:
-- `grid.type` + `grid.level_prices`: geometric/arithmetic grid support
+- `grid.type` + `grid.level_prices`: geometric/arithmetic grid support (v4.2: asymmetric spacing)
+- `grid.buy_step` / `grid.sell_step`: v4.2 — directional step sizes; `grid.step` = average for backward compat
 - `stats.initial_eth_price`: v4 — records ETH price at bot start for HODL Alpha calculation
 - `stats.portfolio_peak_usd`: highest portfolio value (for trailing stop)
 - `stop_triggered`: string describing trigger condition, or null
@@ -836,3 +868,5 @@ IF Step N fails:
 | Fixed sizing in trends | Selling same size in uptrend = giving away alpha to the market |
 | Ignoring smart money signals | Missing confirmation from on-chain intelligence |
 | Selling immediately in uptrend | v4 sell delay exists for a reason — let trends play out |
+| Symmetric grid in strong trends | v4.2: asymmetric grids accumulate faster on the favorable side |
+| Ignoring `buy_step`/`sell_step` in profit calc | Use actual `level_prices` differences, not average `step` |

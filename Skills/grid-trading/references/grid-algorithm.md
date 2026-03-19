@@ -1,6 +1,6 @@
 # Grid Algorithm Reference
 
-Detailed explanation of the core algorithms in Grid Trading v4.1.
+Detailed explanation of the core algorithms in Grid Trading v4.2.
 
 ## 1. Multi-Timeframe Analysis (MTF)
 
@@ -128,12 +128,33 @@ else:
 vol_mult = VOLATILITY_MULTIPLIER_BASE  # 2.0
 
 if mtf and mtf["strength"] > 0.3:
-    blend_factor = (mtf["strength"] - 0.3) / 0.7  # normalize 0.3-1.0 to 0-1
-    vol_mult = BASE + (TREND - BASE) * blend_factor
+    vol_mult = BASE + (TREND - BASE) * strength
     # Range: 2.0 to 3.0
 ```
 
 **Effect**: In strong trends, the grid becomes wider -> fewer trades -> bot holds position longer -> captures trend moves instead of selling too early.
+
+### v4.2: Asymmetric Buy/Sell Steps
+
+```python
+# Asymmetry scales with trend strength (only active when strength > 0.3)
+asym = ASYM_FACTOR * strength  # ASYM_FACTOR = 0.4
+
+if trend == "bullish":
+    buy_mult  = vol_mult * (1 - asym)   # tighter → accumulate fast
+    sell_mult = vol_mult * (1 + asym)   # wider → hold longer
+elif trend == "bearish":
+    buy_mult  = vol_mult * (1 + asym)   # wider → wait for deeper dips
+    sell_mult = vol_mult * (1 - asym)   # tighter → exit fast
+else:
+    buy_mult = sell_mult = vol_mult     # symmetric
+```
+
+**Example** (bullish, strength=0.6, vol_mult=2.6, ATR=$50):
+- `asym = 0.4 × 0.6 = 0.24`
+- `buy_mult = 2.6 × 0.76 = 1.98` → `buy_step = $33`
+- `sell_mult = 2.6 × 1.24 = 3.22` → `sell_step = $54`
+- Buy side is 38% tighter than sell side
 
 ### Step Calculation
 
@@ -141,28 +162,47 @@ if mtf and mtf["strength"] > 0.3:
 # v4.1: Use 1H ATR for step sizing (more robust than stddev for extreme moves)
 atr_pct = calc_kline_volatility(candles)  # ATR as % of price
 atr_dollar = atr_pct / 100 * current_price
-step = (vol_mult * atr_dollar) / (GRID_LEVELS / 2)
 
-# Clamp to bounds
-step = max(step, price * STEP_MIN_PCT)  # floor: 1.0% of price
-step = min(step, price * STEP_MAX_PCT)  # cap: 6.0% of price
-step = max(step, 5.0)                   # hard floor: $5
+# v4.2: Directional steps
+buy_step  = (buy_mult * atr_dollar) / (GRID_LEVELS / 2)
+sell_step = (sell_mult * atr_dollar) / (GRID_LEVELS / 2)
+
+# Clamp both to bounds
+buy_step  = clamp(buy_step, price * STEP_MIN_PCT, price * STEP_MAX_PCT)
+sell_step = clamp(sell_step, price * STEP_MIN_PCT, price * STEP_MAX_PCT)
+buy_step  = max(buy_step, 5.0)   # hard floor: $5
+sell_step = max(sell_step, 5.0)
+step = (buy_step + sell_step) / 2  # backward-compatible average
 ```
 
 ### Level Construction
 
-**Arithmetic (equal dollar spacing)**:
+v4.2 uses `_build_level_prices()` to construct non-uniform grids:
+
 ```python
-half = GRID_LEVELS // 2
-level_prices = [center - half * step + i * step for i in range(GRID_LEVELS + 1)]
-# Example at center=$2000, step=$33: [1901, 1934, 1967, 2000, 2033, 2066, 2099]
+def _build_level_prices(center, buy_step, sell_step, half, grid_type):
+    """Below center: spaced by buy_step. Above center: spaced by sell_step."""
+    if grid_type == "geometric":
+        buy_ratio = 1 + (buy_step / center)
+        sell_ratio = 1 + (sell_step / center)
+        below = [center / (buy_ratio ** (half - i)) for i in range(half)]
+        above = [center * (sell_ratio ** (i + 1)) for i in range(half)]
+    else:  # arithmetic
+        below = [center - (half - i) * buy_step for i in range(half)]
+        above = [center + (i + 1) * sell_step for i in range(half)]
+    return below + [center] + above
 ```
 
-**Geometric (equal percentage spacing)**:
-```python
-ratio = 1 + (step / center)
-level_prices = [center * (ratio ** (i - half)) for i in range(GRID_LEVELS + 1)]
-# Each level is `ratio` times the previous
+**Symmetric example** (center=$2000, step=$33):
+```
+[1901, 1934, 1967, 2000, 2033, 2066, 2099]
+  ← $33 spacing →         ← $33 spacing →
+```
+
+**Asymmetric example** (center=$2000, buy_step=$33, sell_step=$54):
+```
+[1901, 1934, 1967, 2000, 2054, 2108, 2162]
+  ← $33 spacing →         ← $54 spacing →
 ```
 
 ### Level Lookup
@@ -183,8 +223,8 @@ The grid recalibrates when market conditions shift significantly. Recalibration 
 
 | Trigger | Condition | Behavior |
 |---------|-----------|----------|
-| Downside breakout | `price < grid_lower - step` | Recalibrate **immediately** |
-| Upside breakout | `price > grid_upper + step` | Require `UPSIDE_CONFIRM_TICKS` (6) consecutive ticks above |
+| Downside breakout | `price < grid_lower - buy_step` | Recalibrate **immediately** |
+| Upside breakout | `price > grid_upper + sell_step` | Require `UPSIDE_CONFIRM_TICKS` (6) consecutive ticks above |
 | Volatility shift | `abs(current_vol - grid_vol) / grid_vol > 0.3` | Recalibrate |
 | Age | `hours_since_grid_set > GRID_RECALIBRATE_HOURS` (12h) | Recalibrate |
 

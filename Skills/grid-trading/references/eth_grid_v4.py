@@ -58,7 +58,9 @@ def _resolve_wallet_addr() -> str:
     try:
         result = subprocess.run(
             ["onchainos", "wallet", "addresses"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if result.returncode == 0 and result.stdout.strip():
             data = json.loads(result.stdout.strip())
@@ -76,7 +78,10 @@ def _resolve_wallet_addr() -> str:
 
 WALLET_ADDR = _resolve_wallet_addr()
 if not WALLET_ADDR:
-    print("ERROR: No wallet address found. Login with `onchainos wallet login` or set WALLET_ADDR env.", file=sys.stderr)
+    print(
+        "ERROR: No wallet address found. Login with `onchainos wallet login` or set WALLET_ADDR env.",
+        file=sys.stderr,
+    )
 
 # ── Grid Parameters (v4 tuned) ─────────────────────────────────────────────
 
@@ -93,6 +98,10 @@ VOLATILITY_MULTIPLIER_BASE = 2.0  # base multiplier
 VOLATILITY_MULTIPLIER_TREND = (
     3.0  # wider grid in trending markets (less trading, more holding)
 )
+# v4.2: Asymmetric grid — different step sizes for buy vs sell side
+# Bullish: tighter buy (accumulate fast) + wider sell (hold longer)
+# Bearish: tighter sell (exit fast) + wider buy (wait for dip)
+ASYM_FACTOR = 0.4  # max asymmetry ratio (0 = symmetric, 1 = fully asymmetric)
 
 # Sizing strategy (v4: trend-adaptive, see below)
 SIZING_STRATEGY = "trend_adaptive"  # "equal" | "martingale" | "anti_martingale" | "pyramid" | "trend_adaptive"
@@ -486,6 +495,26 @@ def analyze_multi_timeframe(history: list[float], price: float) -> dict:
 # ── v4: Trend-Adaptive Grid Calculation ─────────────────────────────────────
 
 
+def _build_level_prices(
+    center: float,
+    buy_step: float,
+    sell_step: float,
+    half: int,
+    grid_type: str = "arithmetic",
+) -> list[float]:
+    """Build asymmetric level_prices: below center uses buy_step, above uses sell_step."""
+    if grid_type == "geometric" and center > 0:
+        buy_ratio = 1 + (buy_step / center)
+        sell_ratio = 1 + (sell_step / center)
+        below = [round(center / (buy_ratio ** (half - i)), 2) for i in range(half)]
+        above = [round(center * (sell_ratio ** (i + 1)), 2) for i in range(half)]
+        return below + [round(center, 2)] + above
+    else:
+        below = [round(center - (half - i) * buy_step, 2) for i in range(half)]
+        above = [round(center + (i + 1) * sell_step, 2) for i in range(half)]
+        return below + [round(center, 2)] + above
+
+
 def calc_dynamic_grid(
     current_price: float, price_history: list[float], mtf: dict | None = None
 ) -> dict:
@@ -501,14 +530,20 @@ def calc_dynamic_grid(
 
     if hourly_closes:
         center = calc_ema(hourly_closes, min(EMA_PERIOD, len(hourly_closes)))
-        log(f"Grid center: EMA({min(EMA_PERIOD, len(hourly_closes))}) on 1H kline = ${center:.2f}")
+        log(
+            f"Grid center: EMA({min(EMA_PERIOD, len(hourly_closes))}) on 1H kline = ${center:.2f}"
+        )
     elif len(price_history) >= 5:
         center = calc_ema(price_history, min(EMA_PERIOD, len(price_history)))
-        log(f"Grid center: EMA({min(EMA_PERIOD, len(price_history))}) on 5min fallback = ${center:.2f}")
+        log(
+            f"Grid center: EMA({min(EMA_PERIOD, len(price_history))}) on 5min fallback = ${center:.2f}"
+        )
     else:
         center = current_price
         vol_pct = 0.0
         step = current_price * 0.01
+        buy_step = step
+        sell_step = step
         log(f"Grid center: cold start, using current price ${center:.2f}")
 
     # Calculate volatility and step size (skip if cold start already set step)
@@ -520,27 +555,49 @@ def calc_dynamic_grid(
 
         # Trend-adaptive multiplier — wider grid in trends to reduce over-trading
         vol_mult = VOLATILITY_MULTIPLIER_BASE
-        if mtf and mtf.get("strength", 0) > 0.3:
-            blend = mtf["strength"]
+        strength = mtf.get("strength", 0) if mtf else 0
+        trend = mtf.get("trend", "neutral") if mtf else "neutral"
+        if strength > 0.3:
             vol_mult = (
                 VOLATILITY_MULTIPLIER_BASE
-                + (VOLATILITY_MULTIPLIER_TREND - VOLATILITY_MULTIPLIER_BASE) * blend
-            )
-            log(
-                f"Trend-adaptive: multiplier {vol_mult:.2f} (strength {mtf['strength']:.2f})"
+                + (VOLATILITY_MULTIPLIER_TREND - VOLATILITY_MULTIPLIER_BASE) * strength
             )
 
-        step = (vol_mult * atr_dollar) / (GRID_LEVELS / 2)
+        # v4.2: Asymmetric buy/sell multipliers based on trend direction
+        # Bullish: tighter buy (accumulate fast) + wider sell (hold longer)
+        # Bearish: tighter sell (exit fast) + wider buy (wait for dip)
+        asym = ASYM_FACTOR * strength if strength > 0.3 else 0
+        if trend == "bullish":
+            buy_mult = vol_mult * (1 - asym)
+            sell_mult = vol_mult * (1 + asym)
+        elif trend == "bearish":
+            buy_mult = vol_mult * (1 + asym)
+            sell_mult = vol_mult * (1 - asym)
+        else:
+            buy_mult = vol_mult
+            sell_mult = vol_mult
+
+        half_levels = GRID_LEVELS / 2
+        buy_step = (buy_mult * atr_dollar) / half_levels
+        sell_step = (sell_mult * atr_dollar) / half_levels
         step_floor = current_price * STEP_MIN_PCT
         step_ceil = current_price * STEP_MAX_PCT
-        step = max(step_floor, min(step_ceil, step))
+        buy_step = max(step_floor, min(step_ceil, buy_step))
+        sell_step = max(step_floor, min(step_ceil, sell_step))
+        step = (buy_step + sell_step) / 2  # backward-compatible average
 
-        log(
-            f"Step: ${step:.1f} ({step / current_price * 100:.2f}% of price, "
-            f"ATR=${atr_dollar:.1f}, mult={vol_mult:.2f})"
-        )
+        if asym > 0:
+            log(
+                f"Asymmetric grid ({trend}): buy_step=${buy_step:.1f} "
+                f"sell_step=${sell_step:.1f} (asym={asym:.2f}, mult={vol_mult:.2f})"
+            )
+        else:
+            log(
+                f"Step: ${step:.1f} ({step / current_price * 100:.2f}% of price, "
+                f"ATR=${atr_dollar:.1f}, mult={vol_mult:.2f})"
+            )
     elif len(price_history) >= 5:
-        # Fallback: stddev from 5min ticks
+        # Fallback: stddev from 5min ticks (symmetric only)
         volatility = calc_volatility(price_history)
         avg_price = sum(price_history) / len(price_history)
         vol_pct = (volatility / avg_price) * 100 if avg_price > 0 else 0
@@ -549,31 +606,26 @@ def calc_dynamic_grid(
         step_floor = current_price * STEP_MIN_PCT
         step_ceil = current_price * STEP_MAX_PCT
         step = max(step_floor, min(step_ceil, step))
+        buy_step = step
+        sell_step = step
         log(f"Step (5min fallback): ${step:.1f} ({vol_pct:.2f}% stddev)")
 
     # Hard floor: at least $5
-    step = max(step, 5.0)
+    buy_step = max(buy_step, 5.0)
+    sell_step = max(sell_step, 5.0)
+    step = (buy_step + sell_step) / 2
 
-    half = GRID_LEVELS / 2
-
-    # Build level_prices based on grid type
-    if GRID_TYPE == "geometric" and center > 0:
-        ratio = 1 + (step / center)
-        level_prices = [
-            round(center * (ratio ** (i - half)), 2) for i in range(GRID_LEVELS + 1)
-        ]
-        low = level_prices[0]
-        high = level_prices[-1]
-    else:
-        level_prices = [
-            round(center - half * step + i * step, 2) for i in range(GRID_LEVELS + 1)
-        ]
-        low = center - step * half
-        high = center + step * half
+    # Build asymmetric level_prices: below center uses buy_step, above uses sell_step
+    half = int(GRID_LEVELS / 2)
+    level_prices = _build_level_prices(center, buy_step, sell_step, half, GRID_TYPE)
+    low = level_prices[0]
+    high = level_prices[-1]
 
     return {
         "center": round(center, 2),
         "step": round(step, 2),
+        "buy_step": round(buy_step, 2),
+        "sell_step": round(sell_step, 2),
         "levels": GRID_LEVELS,
         "range": [round(low, 2), round(high, 2)],
         "vol_pct": round(vol_pct, 2),
@@ -808,7 +860,9 @@ def _wallet_contract_call(tx: dict) -> tuple[str | None, dict | None]:
     # Let onchainos estimate gas internally (tx.gas from DEX API is unreliable)
     if tx.get("gas"):
         gas_price_gwei = int(tx["gasPrice"]) / 1e9 if tx.get("gasPrice") else 0
-        log(f"  TX gas hint (not used): dex_gas={tx['gas']}, gasPrice={gas_price_gwei:.2f} gwei")
+        log(
+            f"  TX gas hint (not used): dex_gas={tx['gas']}, gasPrice={gas_price_gwei:.2f} gwei"
+        )
 
     try:
         data = onchainos_cmd(args, timeout=45)
@@ -1107,6 +1161,7 @@ def _emit_json(data: dict):
 
 # ── Discord embed helper ────────────────────────────────────────────────────
 
+
 def _resolve_discord_channel_id() -> str:
     """Resolve Discord channel ID: env override > openclaw.json guilds config."""
     env_id = os.environ.get("DISCORD_CHANNEL_ID", "")
@@ -1125,6 +1180,7 @@ def _resolve_discord_channel_id() -> str:
     except Exception:
         pass
     return ""
+
 
 DISCORD_CHANNEL_ID = _resolve_discord_channel_id()
 
@@ -1533,11 +1589,11 @@ def tick():
 
     if not grid:
         need_recalibrate = True
-    elif price < grid["range"][0] - grid["step"]:
+    elif price < grid["range"][0] - grid.get("buy_step", grid["step"]):
         need_recalibrate = True
         state.pop("upside_breakout_ticks", None)
         log(f"Price ${price:.2f} BELOW grid {grid['range']} - recalibrating (downside)")
-    elif price > grid["range"][1] + grid["step"]:
+    elif price > grid["range"][1] + grid.get("sell_step", grid["step"]):
         ticks = state.get("upside_breakout_ticks", 0) + 1
         state["upside_breakout_ticks"] = ticks
         if ticks >= UPSIDE_CONFIRM_TICKS:
@@ -1565,7 +1621,9 @@ def tick():
         need_recalibrate = True
 
     # Reset upside breakout counter if price is back inside grid
-    if grid and grid["range"][0] <= price <= grid["range"][1] + grid["step"]:
+    if grid and grid["range"][0] <= price <= grid["range"][1] + grid.get(
+        "sell_step", grid["step"]
+    ):
         if state.get("upside_breakout_ticks", 0) > 0:
             log(f"Price ${price:.2f} back in grid range - reset upside counter")
             state.pop("upside_breakout_ticks", None)
@@ -1603,24 +1661,17 @@ def tick():
                     f"(max {MAX_CENTER_SHIFT_PCT * 100:.0f}% from ${old_center:.0f})"
                 )
                 grid["center"] = round(capped_center, 2)
-                half_levels = grid["levels"] / 2
-                if grid.get("type") == "geometric" and capped_center > 0:
-                    ratio = 1 + (grid["step"] / capped_center)
-                    grid["level_prices"] = [
-                        round(capped_center * (ratio ** (i - half_levels)), 2)
-                        for i in range(grid["levels"] + 1)
-                    ]
-                    grid["range"] = [grid["level_prices"][0], grid["level_prices"][-1]]
-                else:
-                    half = grid["step"] * half_levels
-                    grid["level_prices"] = [
-                        round(capped_center - half + i * grid["step"], 2)
-                        for i in range(grid["levels"] + 1)
-                    ]
-                    grid["range"] = [
-                        round(capped_center - half, 2),
-                        round(capped_center + half, 2),
-                    ]
+                half_levels = int(grid["levels"] / 2)
+                b_step = grid.get("buy_step", grid["step"])
+                s_step = grid.get("sell_step", grid["step"])
+                grid["level_prices"] = _build_level_prices(
+                    capped_center,
+                    b_step,
+                    s_step,
+                    half_levels,
+                    grid.get("type", "arithmetic"),
+                )
+                grid["range"] = [grid["level_prices"][0], grid["level_prices"][-1]]
 
         state["grid"] = grid
         state["grid_set_at"] = datetime.now().isoformat()
@@ -1629,10 +1680,13 @@ def tick():
         # Clear sell trail counters on recalibration
         state["sell_trail_counter"] = {}
         step_change = f" (was ${old_step:.1f})" if old_step else ""
+        b_s = grid.get("buy_step", grid["step"])
+        s_s = grid.get("sell_step", grid["step"])
+        asym_info = f" buy=${b_s:.1f} sell=${s_s:.1f}" if abs(b_s - s_s) > 0.01 else ""
         log(
             f"Grid set: ${grid['range'][0]:.0f}-${grid['range'][1]:.0f} "
-            f"step=${grid['step']:.1f}{step_change} vol={grid.get('vol_pct', 0):.1f}% "
-            f"level={new_level}"
+            f"step=${grid['step']:.1f}{asym_info}{step_change} "
+            f"vol={grid.get('vol_pct', 0):.1f}% level={new_level}"
         )
 
     # Determine current grid level
@@ -1775,14 +1829,19 @@ def tick():
                         if direction == "SELL"
                         else (amount / 1e6)
                     )
-                    levels_crossed = abs(current_level - prev_level)
-                    grid_step = grid.get("step", 0)
                     trade_eth = trade_usd / price if price else 0
-                    est_profit = (
-                        round(levels_crossed * grid_step * trade_eth, 2)
-                        if direction == "SELL"
-                        else 0
-                    )
+                    if direction == "SELL":
+                        # Use actual level_prices for accurate profit with asymmetric grids
+                        lp = grid.get("level_prices", [])
+                        if lp and prev_level < len(lp) and current_level < len(lp):
+                            price_diff = abs(lp[prev_level] - lp[current_level])
+                        else:
+                            price_diff = abs(current_level - prev_level) * grid.get(
+                                "step", 0
+                            )
+                        est_profit = round(price_diff * trade_eth, 2)
+                    else:
+                        est_profit = 0
                     trade_record = {
                         "time": datetime.now().isoformat(),
                         "direction": direction,
@@ -1840,18 +1899,44 @@ def tick():
                         "time": datetime.now().isoformat(),
                     }
                     if failure_info:
-                        _send_discord_embed([{
-                            "title": "\u26a0\ufe0f 交易失败",
-                            "color": 0xFF9800,
-                            "fields": [
-                                {"name": "方向", "value": direction, "inline": True},
-                                {"name": "价格", "value": f"${price:.2f}", "inline": True},
-                                {"name": "原因", "value": failure_info.get("reason", "unknown"), "inline": True},
-                                {"name": "详情", "value": str(failure_info.get("detail", ""))[:200], "inline": False},
-                            ],
-                            "footer": {"text": f"可重试: {'是' if failure_info.get('retriable') else '否'}"},
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                        }])
+                        _send_discord_embed(
+                            [
+                                {
+                                    "title": "\u26a0\ufe0f 交易失败",
+                                    "color": 0xFF9800,
+                                    "fields": [
+                                        {
+                                            "name": "方向",
+                                            "value": direction,
+                                            "inline": True,
+                                        },
+                                        {
+                                            "name": "价格",
+                                            "value": f"${price:.2f}",
+                                            "inline": True,
+                                        },
+                                        {
+                                            "name": "原因",
+                                            "value": failure_info.get(
+                                                "reason", "unknown"
+                                            ),
+                                            "inline": True,
+                                        },
+                                        {
+                                            "name": "详情",
+                                            "value": str(
+                                                failure_info.get("detail", "")
+                                            )[:200],
+                                            "inline": False,
+                                        },
+                                    ],
+                                    "footer": {
+                                        "text": f"可重试: {'是' if failure_info.get('retriable') else '否'}"
+                                    },
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                }
+                            ]
+                        )
             else:
                 log(f"Skipped trade: {calc_fail}")
                 action = f"{direction} skipped"
@@ -2191,34 +2276,78 @@ def report():
 
     # Build embed
     fields = [
-        {"name": "当前价格", "value": f"${price:.2f}" if price else "N/A", "inline": True},
-        {"name": "24h 范围", "value": f"${price_low:.2f} - ${price_high:.2f}", "inline": True},
+        {
+            "name": "当前价格",
+            "value": f"${price:.2f}" if price else "N/A",
+            "inline": True,
+        },
+        {
+            "name": "24h 范围",
+            "value": f"${price_low:.2f} - ${price_high:.2f}",
+            "inline": True,
+        },
         {"name": "波动率", "value": f"{vol_pct:.1f}%", "inline": True},
-        {"name": "持仓", "value": f"{eth_bal:.4f} ETH + ${usdc_bal:.2f} USDC = **${total_usd:.0f}**", "inline": False},
+        {
+            "name": "持仓",
+            "value": f"{eth_bal:.4f} ETH + ${usdc_bal:.2f} USDC = **${total_usd:.0f}**",
+            "inline": False,
+        },
     ]
 
     if grid:
-        fields.append({"name": "网格", "value": f"${grid.get('range', [0,0])[0]:.0f}-${grid.get('range', [0,0])[1]:.0f} (步长 ${grid.get('step', 0):.1f}) | L{state.get('current_level', '?')}/{GRID_LEVELS}", "inline": False})
+        fields.append(
+            {
+                "name": "网格",
+                "value": f"${grid.get('range', [0, 0])[0]:.0f}-${grid.get('range', [0, 0])[1]:.0f} (步长 ${grid.get('step', 0):.1f}) | L{state.get('current_level', '?')}/{GRID_LEVELS}",
+                "inline": False,
+            }
+        )
 
     if initial and price:
         cost_basis = initial + deposits
         total_pnl = round(total_usd - cost_basis, 2)
         pct = (total_pnl / cost_basis) * 100 if cost_basis else 0
         holding_pnl = round(total_pnl - grid_profit, 2)
-        fields.append({"name": "总收益", "value": f"${total_pnl:+.2f} ({pct:+.1f}%)", "inline": True})
-        fields.append({"name": "网格利润", "value": f"${grid_profit:+.2f}", "inline": True})
-        fields.append({"name": "持仓浮盈", "value": f"${holding_pnl:+.2f}", "inline": True})
-        fields.append({"name": "交易量", "value": f"卖出 ${sell_total:.2f} | 买入 ${buy_total:.2f}", "inline": False})
+        fields.append(
+            {
+                "name": "总收益",
+                "value": f"${total_pnl:+.2f} ({pct:+.1f}%)",
+                "inline": True,
+            }
+        )
+        fields.append(
+            {"name": "网格利润", "value": f"${grid_profit:+.2f}", "inline": True}
+        )
+        fields.append(
+            {"name": "持仓浮盈", "value": f"${holding_pnl:+.2f}", "inline": True}
+        )
+        fields.append(
+            {
+                "name": "交易量",
+                "value": f"卖出 ${sell_total:.2f} | 买入 ${buy_total:.2f}",
+                "inline": False,
+            }
+        )
 
         initial_price = stats.get("initial_eth_price")
         if initial_price and initial_price > 0:
             initial_eth = initial / initial_price
             hodl_value = initial_eth * price
             hodl_alpha = round(total_usd - hodl_value, 2)
-            fields.append({"name": "HODL Alpha", "value": f"${hodl_alpha:+.2f}", "inline": True})
+            fields.append(
+                {"name": "HODL Alpha", "value": f"${hodl_alpha:+.2f}", "inline": True}
+            )
 
-    fields.append({"name": "成功率", "value": f"{_success_rate_str(state)}", "inline": True})
-    fields.append({"name": "累计交易", "value": f"{stats.get('total_trades', 0)} 笔", "inline": True})
+    fields.append(
+        {"name": "成功率", "value": f"{_success_rate_str(state)}", "inline": True}
+    )
+    fields.append(
+        {
+            "name": "累计交易",
+            "value": f"{stats.get('total_trades', 0)} 笔",
+            "inline": True,
+        }
+    )
 
     # Today's trades summary
     if today_trades:
@@ -2227,8 +2356,16 @@ def report():
             dir_cn = "卖出" if t["direction"] == "SELL" else "买入"
             est = t.get("est_profit", 0)
             profit_str = f" ~${est:.2f}" if est > 0 else ""
-            trade_lines.append(f"`{t['time'][11:19]}` {dir_cn} ${t['amount_usd']:.2f} @ ${t['price']:.2f}{profit_str}")
-        fields.append({"name": f"今日交易 ({len(today_trades)}笔)", "value": "\n".join(trade_lines), "inline": False})
+            trade_lines.append(
+                f"`{t['time'][11:19]}` {dir_cn} ${t['amount_usd']:.2f} @ ${t['price']:.2f}{profit_str}"
+            )
+        fields.append(
+            {
+                "name": f"今日交易 ({len(today_trades)}笔)",
+                "value": "\n".join(trade_lines),
+                "inline": False,
+            }
+        )
     else:
         fields.append({"name": "今日交易", "value": "暂无", "inline": True})
 
@@ -2266,7 +2403,9 @@ def report():
             )
 
         print("\n**持仓**")
-        print(f"> `{eth_bal:.4f}` ETH + `${usdc_bal:.2f}` USDC = **`${total_usd:.0f}`**")
+        print(
+            f"> `{eth_bal:.4f}` ETH + `${usdc_bal:.2f}` USDC = **`${total_usd:.0f}`**"
+        )
         if grid:
             print(
                 f"> 网格: `${grid.get('range', [0, 0])[0]:.0f}`-`${grid.get('range', [0, 0])[1]:.0f}` "
@@ -2278,7 +2417,9 @@ def report():
             print(
                 f"> 总收益: **`${total_pnl:+.2f}` (`{pct:+.1f}%`)**  起始 `${initial:.0f}`"
             )
-            print(f"> 网格利润: `${grid_profit:+.2f}` | 持仓浮盈: `${holding_pnl:+.2f}`")
+            print(
+                f"> 网格利润: `${grid_profit:+.2f}` | 持仓浮盈: `${holding_pnl:+.2f}`"
+            )
             print(f"> 交易量: 卖出 `${sell_total:.2f}` | 买入 `${buy_total:.2f}`")
 
             initial_price = stats.get("initial_eth_price")
