@@ -1,6 +1,6 @@
 # Web3-Skills
 
-Reusable Web3 trading skills for AI coding agents (Claude Code, Cursor, etc.).
+Reusable Web3 trading skills for AI coding agents (Claude Code, Cursor, Gemini CLI, OpenClaw).
 
 Each skill is a self-contained `SKILL.md` that teaches an AI agent how to build, debug, and extend a specific trading strategy — covering architecture, algorithms, parameters, risk controls, and anti-patterns.
 
@@ -21,6 +21,7 @@ cd grid-trading
 ./install.sh --platform claude        # Claude Code
 ./install.sh --platform cursor        # Cursor
 ./install.sh --platform gemini        # Gemini CLI
+./install.sh --platform openclaw      # OpenClaw (skill + cron jobs)
 ./install.sh --global                 # Install to ~/.<platform>/skills/
 ```
 
@@ -40,6 +41,16 @@ cp -r grid-trading /path/to/your/project/.cursor/skills/
 
 ```bash
 cp -r grid-trading /path/to/your/project/.gemini/skills/
+```
+
+### OpenClaw
+
+```bash
+./install.sh --platform openclaw
+# Or manually:
+cp -r grid-trading ~/.openclaw/skills/
+cp grid-trading/vps-snapshot/eth_grid_v4.py ~/.openclaw/scripts/
+openclaw cron add --name eth-grid-tick --schedule "*/5 * * * *" --command "cd ~/.openclaw/scripts && python3 eth_grid_v4.py tick"
 ```
 
 ### Other AI Agents

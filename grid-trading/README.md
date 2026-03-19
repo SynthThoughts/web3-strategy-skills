@@ -4,7 +4,7 @@ Dynamic grid trading strategy for any token pair on EVM L2 chains via OKX DEX AP
 
 ## What is this?
 
-A `SKILL.md` that teaches AI agents (Claude Code, Cursor, Gemini CLI) how to build, deploy, debug, and tune a production grid trading bot. The skill covers the complete lifecycle: architecture, algorithms, parameter tuning, risk controls, and AI-assisted review.
+A `SKILL.md` that teaches AI agents (Claude Code, Cursor, Gemini CLI, OpenClaw) how to build, deploy, debug, and tune a production grid trading bot. The skill covers the complete lifecycle: architecture, algorithms, parameter tuning, risk controls, and AI-assisted review.
 
 ## v4 Core Improvements
 
@@ -39,6 +39,7 @@ A `SKILL.md` that teaches AI agents (Claude Code, Cursor, Gemini CLI) how to bui
 ./install.sh --platform claude        # Claude Code
 ./install.sh --platform cursor        # Cursor
 ./install.sh --platform gemini        # Gemini CLI
+./install.sh --platform openclaw      # OpenClaw (skill + cron jobs)
 ./install.sh --platform claude --global  # Global install (~/.claude/skills/)
 ```
 
@@ -62,6 +63,20 @@ cp SKILL.md references/ assets/ /path/to/project/.cursor/skills/grid-trading/
 ```bash
 mkdir -p /path/to/project/.gemini/skills/grid-trading
 cp SKILL.md references/ assets/ /path/to/project/.gemini/skills/grid-trading/
+```
+
+**OpenClaw**:
+```bash
+# Copy skill files
+mkdir -p ~/.openclaw/skills/grid-trading
+cp -r SKILL.md references/ assets/ ~/.openclaw/skills/grid-trading/
+
+# Copy strategy script
+cp vps-snapshot/eth_grid_v4.py ~/.openclaw/scripts/
+
+# Register cron jobs (requires running gateway)
+openclaw cron add --name eth-grid-tick --schedule "*/5 * * * *" --command "cd ~/.openclaw/scripts && python3 eth_grid_v4.py tick"
+openclaw cron add --name eth-grid-daily --schedule "0 0 * * *" --command "cd ~/.openclaw/scripts && python3 eth_grid_v4.py report"
 ```
 
 ### What Gets Installed

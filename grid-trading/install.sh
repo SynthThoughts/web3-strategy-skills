@@ -1,17 +1,19 @@
 #!/bin/bash
 # Grid Trading v4 Skill Installer
-# Supports: Claude Code, Cursor, Gemini CLI
+# Supports: Claude Code, Cursor, Gemini CLI, OpenClaw
 #
 # Usage:
 #   ./install.sh                          # Auto-detect platform, install to project
 #   ./install.sh --platform claude        # Specify platform explicitly
 #   ./install.sh --global                 # Install globally (user home)
+#   ./install.sh --platform openclaw      # Install to OpenClaw skills directory
 #   ./install.sh --platform gemini --global
 #
 # Platforms:
-#   claude  -> .claude/skills/grid-trading/
-#   cursor  -> .cursor/skills/grid-trading/
-#   gemini  -> .gemini/skills/grid-trading/
+#   claude   -> .claude/skills/grid-trading/
+#   cursor   -> .cursor/skills/grid-trading/
+#   gemini   -> .gemini/skills/grid-trading/
+#   openclaw -> ~/.openclaw/skills/grid-trading/ (always global, symlink)
 
 set -euo pipefail
 
@@ -41,15 +43,19 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "Grid Trading v4 Skill Installer"
             echo ""
-            echo "Usage: $0 [--platform claude|cursor|gemini] [--global]"
+            echo "Usage: $0 [--platform claude|cursor|gemini|openclaw] [--global]"
             echo ""
             echo "Options:"
-            echo "  --platform NAME   Specify target platform (claude, cursor, gemini)"
+            echo "  --platform NAME   Specify target platform (claude, cursor, gemini, openclaw)"
             echo "  --global          Install to user home directory instead of current project"
             echo ""
             echo "Auto-detection (when --platform is omitted):"
-            echo "  Checks for .claude/, .cursor/, .gemini/ in current directory"
+            echo "  Checks for .claude/, .cursor/, .gemini/, .openclaw/ in current directory"
             echo "  If multiple found, installs to all detected platforms"
+            echo ""
+            echo "OpenClaw:"
+            echo "  Always installs globally to ~/.openclaw/skills/grid-trading/"
+            echo "  Optionally registers cron jobs for tick (5min) and daily report"
             exit 0
             ;;
         *)
@@ -63,10 +69,10 @@ done
 # --- Validate platform ---
 if [[ -n "$PLATFORM" ]]; then
     case "$PLATFORM" in
-        claude|cursor|gemini) ;;
+        claude|cursor|gemini|openclaw) ;;
         *)
             echo -e "${RED}Invalid platform: $PLATFORM${NC}" >&2
-            echo "Valid platforms: claude, cursor, gemini"
+            echo "Valid platforms: claude, cursor, gemini, openclaw"
             exit 1
             ;;
     esac
@@ -85,6 +91,9 @@ detect_platforms() {
     fi
     if [[ -d "$base_dir/.gemini" ]]; then
         platforms+=("gemini")
+    fi
+    if [[ -d "$HOME/.openclaw" ]]; then
+        platforms+=("openclaw")
     fi
 
     echo "${platforms[@]}"
@@ -123,6 +132,72 @@ install_skill() {
     fi
 
     echo -e "  ${GREEN}Installed to:${NC} $target_dir"
+
+    # OpenClaw post-install: register cron jobs
+    if [[ "$platform" == "openclaw" ]]; then
+        openclaw_post_install "$target_dir"
+    fi
+}
+
+# --- OpenClaw post-install ---
+openclaw_post_install() {
+    local target_dir="$1"
+    local script_dir="$HOME/.openclaw/scripts"
+
+    echo ""
+    echo -e "${BLUE}OpenClaw post-install...${NC}"
+
+    # Copy strategy script to OpenClaw scripts directory
+    if [[ -f "$SKILL_SRC/vps-snapshot/eth_grid_v4.py" ]]; then
+        mkdir -p "$script_dir"
+        cp "$SKILL_SRC/vps-snapshot/eth_grid_v4.py" "$script_dir/eth_grid_v4.py"
+        echo -e "  ${GREEN}+${NC} scripts/eth_grid_v4.py"
+    fi
+
+    # Check if openclaw cron is available
+    if command -v openclaw &>/dev/null; then
+        echo ""
+        echo -e "${YELLOW}Register cron jobs? (requires running gateway)${NC}"
+        echo "  1) eth-grid-tick:  every 5 min  → eth_grid_v4.py tick"
+        echo "  2) eth-grid-daily: daily 08:00  → eth_grid_v4.py report"
+        echo ""
+        read -rp "Register cron jobs via OpenClaw? [y/N] " answer
+        if [[ "${answer,,}" == "y" ]]; then
+            echo -e "  ${BLUE}Adding cron jobs...${NC}"
+            openclaw cron add \
+                --name "eth-grid-tick" \
+                --schedule "*/5 * * * *" \
+                --command "cd $script_dir && python3 eth_grid_v4.py tick" \
+                2>/dev/null && echo -e "  ${GREEN}+${NC} eth-grid-tick (every 5 min)" \
+                || echo -e "  ${YELLOW}!${NC} eth-grid-tick: skipped (gateway not running or already exists)"
+
+            openclaw cron add \
+                --name "eth-grid-daily" \
+                --schedule "0 0 * * *" \
+                --command "cd $script_dir && python3 eth_grid_v4.py report" \
+                2>/dev/null && echo -e "  ${GREEN}+${NC} eth-grid-daily (daily 08:00 CST)" \
+                || echo -e "  ${YELLOW}!${NC} eth-grid-daily: skipped (gateway not running or already exists)"
+        else
+            echo -e "  Skipped. You can add manually:"
+            echo "    openclaw cron add --name eth-grid-tick --schedule '*/5 * * * *' --command 'cd $script_dir && python3 eth_grid_v4.py tick'"
+            echo "    openclaw cron add --name eth-grid-daily --schedule '0 0 * * *' --command 'cd $script_dir && python3 eth_grid_v4.py report'"
+        fi
+    else
+        echo -e "  ${YELLOW}openclaw CLI not found. Install: npm i -g @anthropic-ai/openclaw${NC}"
+        echo "  After installing, add cron jobs manually:"
+        echo "    openclaw cron add --name eth-grid-tick --schedule '*/5 * * * *' --command 'cd $script_dir && python3 eth_grid_v4.py tick'"
+    fi
+
+    # Verify skill is visible
+    if command -v openclaw &>/dev/null; then
+        echo ""
+        if openclaw skills list 2>/dev/null | grep -q "grid-trading"; then
+            echo -e "  ${GREEN}OK${NC} openclaw skills list shows grid-trading"
+        else
+            echo -e "  ${YELLOW}!${NC} grid-trading not yet visible in 'openclaw skills list'"
+            echo "    This is normal if you just installed. Restart the gateway to pick it up."
+        fi
+    fi
 }
 
 # --- Resolve target directories ---
@@ -140,6 +215,7 @@ get_target_dir() {
         claude) echo "$base_dir/.claude/skills/grid-trading" ;;
         cursor) echo "$base_dir/.cursor/skills/grid-trading" ;;
         gemini) echo "$base_dir/.gemini/skills/grid-trading" ;;
+        openclaw) echo "$HOME/.openclaw/skills/grid-trading" ;;
     esac
 }
 
