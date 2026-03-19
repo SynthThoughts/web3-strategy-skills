@@ -63,7 +63,7 @@ onchainos swap swap \
   --to 0x833589fcd6edb6e08f4c7c32d4f71b54bda02913 \
   --amount 50000000000000000 \
   --chain base \
-  --wallet 0x50125b41c77d242bf7885950058a1dd1e0afd937 \
+  --wallet 0xYOUR_WALLET_ADDRESS \
   --slippage 1
 ```
 
@@ -205,7 +205,7 @@ bullish_score = weighted average across wallet types
 
 ```bash
 onchainos gateway simulate \
-  --from 0x50125b41c77d242bf7885950058a1dd1e0afd937 \
+  --from 0xYOUR_WALLET_ADDRESS \
   --to 0xRouterAddress \
   --data 0xcalldata... \
   --chain base
@@ -241,7 +241,7 @@ onchainos gateway simulate \
 ```bash
 onchainos gateway broadcast \
   --signed-tx 0xSignedTxHex... \
-  --address 0x50125b41c77d242bf7885950058a1dd1e0afd937 \
+  --address 0xYOUR_WALLET_ADDRESS \
   --chain base
 ```
 

@@ -40,7 +40,7 @@ _load_env()
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
-WALLET_ADDR = "0x50125b41c77d242bf7885950058a1dd1e0afd937"
+WALLET_ADDR = os.environ.get("WALLET_ADDR", "")  # Required: set via env or .env file
 
 OKX_API_KEY = os.environ.get("OKX_API_KEY", "")
 OKX_SECRET = os.environ.get("OKX_SECRET_KEY", "")
@@ -1058,7 +1058,7 @@ def _emit_json(data: dict):
 
 # ── Discord embed helper ────────────────────────────────────────────────────
 
-DISCORD_CHANNEL_ID = "1478677591073488906"
+DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")  # Optional: for Discord notifications
 
 
 def _get_discord_token() -> str:
