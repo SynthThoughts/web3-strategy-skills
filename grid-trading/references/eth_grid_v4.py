@@ -1318,11 +1318,11 @@ def _should_delay_sell(
     momentum_1h = mtf.get("momentum_1h", 0)
     if momentum_1h > SELL_MOMENTUM_THRESHOLD * 100:
         trend = mtf.get("trend", "neutral")
-        structure = mtf.get("structure", "ranging")
-        if trend == "bullish" and structure == "uptrend":
-            # Strong uptrend: skip this sell, let it ride
+        if trend == "bullish":
+            # Bullish trend + strong momentum: skip this sell, let it ride
+            structure = mtf.get("structure", "ranging")
             log(
-                f"  v4 sell delay: strong uptrend (1h momentum {momentum_1h:.2f}%, "
+                f"  v4 sell delay: bullish momentum (1h momentum {momentum_1h:.2f}%, "
                 f"structure={structure})"
             )
             return f"trend_hold (momentum +{momentum_1h:.1f}%)"

@@ -283,27 +283,26 @@ v4 introduces sell delay in strong uptrends to avoid premature profit-taking.
 SELL signal detected
   |
   v
-Is trend bullish AND structure == "uptrend"?
-  |-- No  -> Execute sell immediately
-  |-- Yes -> Check momentum protection
-              |
-              v
-         momentum_1h > SELL_MOMENTUM_THRESHOLD (0.5%)?
-           |-- Yes -> SKIP sell ("trend_hold")
-           |-- No  -> Check trailing counter
-                        |
-                        v
-                   sell_trail_counter[level_key] < SELL_TRAIL_TICKS (2)?
-                     |-- Yes -> Increment counter, SKIP ("sell_trail N/2")
-                     |-- No  -> Counter satisfied, EXECUTE sell
+Is momentum_1h > SELL_MOMENTUM_THRESHOLD (0.5%) AND trend == "bullish"?
+  |-- Yes -> SKIP sell ("trend_hold")
+  |-- No  -> Check trailing counter
+               |
+               v
+          sell_trail_counter[level_key] < SELL_TRAIL_TICKS (2)?
+            |-- Yes -> Increment counter, SKIP ("sell_trail N/2")
+            |-- No  -> Counter satisfied, EXECUTE sell
 ```
+
+v4.1 change: Removed `structure == "uptrend"` from momentum protection condition.
+The 8h strict monotonic structure detection was never satisfied in production (always "ranging"),
+making the momentum protection dead code. Now only requires bullish trend + strong momentum.
 
 ### Key Properties
 
 - **Level-specific**: Each level transition (e.g., "2->3") has its own counter
 - **Counter resets**: If price returns to a lower level, the counter for that transition resets
 - **Maximum delay**: 2 ticks = 10 minutes at 5-min intervals
-- **Momentum override**: Strong momentum (>0.5% in 1h) can block sell indefinitely while trend holds
+- **Momentum override**: Strong momentum (>0.5% in 1h) can block sell indefinitely while bullish trend holds
 
 ---
 

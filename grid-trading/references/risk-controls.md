@@ -128,9 +128,9 @@ Trades below $5 are skipped — not worth the gas and slippage cost.
 
 | Control | Parameter | Default | Trigger |
 |---------|-----------|---------|---------|
-| Momentum threshold | `SELL_MOMENTUM_THRESHOLD` | 0.005 (0.5%) | 1h momentum > 0.5% in bullish uptrend |
+| Momentum threshold | `SELL_MOMENTUM_THRESHOLD` | 0.005 (0.5%) | 1h momentum > 0.5% in bullish trend |
 
-Skip sell if the market is actively rallying in a confirmed uptrend.
+Skip sell if the market is actively rallying in a bullish trend. v4.1: removed `structure == "uptrend"` requirement (8h strict monotonic condition was never satisfied in production).
 
 ### 11. Sell Trailing Delay
 
@@ -214,8 +214,8 @@ tick() entry
   |       [10] rapid drop --------> SKIP (BUY only)
   |       [11] position limits ---> SKIP
   |       [12] min trade size ----> SKIP
-  |       [13] sell momentum -----> SKIP (SELL in uptrend)
-  |       [14] sell trailing -----> SKIP (SELL in uptrend)
+  |       [13] sell momentum -----> SKIP (SELL in bullish trend)
+  |       [14] sell trailing -----> SKIP (SELL, wait for confirmation)
   |       |
   |       EXECUTE trade
   |       |-- success: update level + record
