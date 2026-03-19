@@ -50,26 +50,26 @@ Copy the skill files to your AI agent's skill directory:
 **Claude Code**:
 ```bash
 mkdir -p /path/to/project/.claude/skills/grid-trading
-cp SKILL.md references/ assets/ /path/to/project/.claude/skills/grid-trading/
+cp -r SKILL.md references/ /path/to/project/.claude/skills/grid-trading/
 ```
 
 **Cursor**:
 ```bash
 mkdir -p /path/to/project/.cursor/skills/grid-trading
-cp SKILL.md references/ assets/ /path/to/project/.cursor/skills/grid-trading/
+cp -r SKILL.md references/ /path/to/project/.cursor/skills/grid-trading/
 ```
 
 **Gemini CLI**:
 ```bash
 mkdir -p /path/to/project/.gemini/skills/grid-trading
-cp SKILL.md references/ assets/ /path/to/project/.gemini/skills/grid-trading/
+cp -r SKILL.md references/ /path/to/project/.gemini/skills/grid-trading/
 ```
 
 **OpenClaw**:
 ```bash
 # Copy skill files
 mkdir -p ~/.openclaw/skills/grid-trading
-cp -r SKILL.md references/ assets/ ~/.openclaw/skills/grid-trading/
+cp -r SKILL.md references/ ~/.openclaw/skills/grid-trading/
 
 # Copy strategy script
 cp vps-snapshot/eth_grid_v4.py ~/.openclaw/scripts/
@@ -88,8 +88,7 @@ grid-trading/
 │   ├── cli-reference.md  # onchainos CLI command reference
 │   ├── grid-algorithm.md # Core algorithm deep-dive
 │   └── risk-controls.md  # Risk control checklist
-└── assets/
-    └── report-template.md  # Daily report template
+└── vps-snapshot/         # Reference implementation
 ```
 
 ## Quick Start

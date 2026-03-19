@@ -122,15 +122,6 @@ install_skill() {
         echo -e "  ${GREEN}+${NC} references/ (${ref_count} files)"
     fi
 
-    # Copy assets/
-    if [[ -d "$SKILL_SRC/assets" ]]; then
-        mkdir -p "$target_dir/assets"
-        cp "$SKILL_SRC/assets/"* "$target_dir/assets/" 2>/dev/null || true
-        local asset_count
-        asset_count=$(ls -1 "$target_dir/assets/"* 2>/dev/null | wc -l | tr -d ' ')
-        echo -e "  ${GREEN}+${NC} assets/ (${asset_count} files)"
-    fi
-
     echo -e "  ${GREEN}Installed to:${NC} $target_dir"
 
     # OpenClaw post-install: register cron jobs
