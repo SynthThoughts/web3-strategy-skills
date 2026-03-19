@@ -41,7 +41,7 @@
 
 ## 数据来源
 
-参考 `Skills/grid-trading/SKILL.md` 的 AI Review & Optimization 部分：
+参考 `grid-trading/SKILL.md` 的 AI Review & Optimization 部分：
 - 从 `state.json` 读取交易记录
 - 配对 round trips（BUY-SELL 匹配）
 - 分析 win rate、avg spread、loss/micro/good 分类

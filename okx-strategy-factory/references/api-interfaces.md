@@ -2,7 +2,7 @@
 
 策略代码只调用这些抽象接口。实际通过 `onchainos` CLI 执行。
 
-完整的 onchainos 命令参考 `Skills/grid-trading/SKILL.md` 的 Tool Wrapper 部分。
+完整的 onchainos 命令参考 `grid-trading/SKILL.md` 的 Tool Wrapper 部分。
 
 ## Wallet
 

@@ -77,7 +77,7 @@ Strategy → Backtest → Infra(deploy) → LIVE
 **Actions**:
 1. Spawn infra teammate
 2. 通过 1Password 获取 SSH 密钥
-3. 部署到日本 VPS（pre-check → upload → activate → health check）
+3. 部署到目标 VPS（pre-check → upload → activate → health check）
 4. 健康检查通过后更新 `VERSION`
 
 **Gate**:

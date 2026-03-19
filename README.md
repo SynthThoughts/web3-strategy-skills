@@ -139,13 +139,13 @@ cat grid-trading/SKILL.md | pbcopy   # Copy to clipboard on macOS
 
 ```
 skill-name/
-├── SKILL.md          # Core knowledge (YAML frontmatter + architecture + algorithms)
-├── references/       # Detailed docs: CLI reference, algorithms, risk controls
-├── roles/            # Agent role definitions (strategy-factory only)
-├── assets/           # Templates and resources
-├── hooks/            # Task gate scripts (strategy-factory only)
-├── install.sh        # Multi-platform installer
-└── README.md         # User-facing install and usage guide
+├── SKILL.md          # Core knowledge (required)
+├── references/       # Detailed docs: CLI reference, algorithms, risk controls (optional)
+├── roles/            # Agent role definitions (optional, strategy-factory uses this)
+├── assets/           # Templates and resources (optional)
+├── hooks/            # Task gate scripts (optional)
+├── install.sh        # Multi-platform installer (optional)
+└── README.md         # User-facing install and usage guide (optional)
 ```
 
 ## Contributing

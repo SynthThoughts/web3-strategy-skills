@@ -30,7 +30,7 @@ position.open({...})        position.close(id)
 position.checkRiskTriggers()
 ```
 
-实际实现通过 `onchainos` CLI 调用 OKX Web3 API。参考 `Skills/grid-trading/SKILL.md` 的 Tool Wrapper 部分了解具体命令。
+实际实现通过 `onchainos` CLI 调用 OKX Web3 API。参考 `grid-trading/SKILL.md` 的 Tool Wrapper 部分了解具体命令。
 
 ## 修订请求
 

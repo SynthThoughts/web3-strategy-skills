@@ -116,9 +116,9 @@ install_skill() {
     # Copy references/
     if [[ -d "$SKILL_SRC/references" ]]; then
         mkdir -p "$target_dir/references"
-        cp "$SKILL_SRC/references/"*.md "$target_dir/references/" 2>/dev/null || true
+        cp "$SKILL_SRC/references/"* "$target_dir/references/" 2>/dev/null || true
         local ref_count
-        ref_count=$(ls -1 "$target_dir/references/"*.md 2>/dev/null | wc -l | tr -d ' ')
+        ref_count=$(ls -1 "$target_dir/references/"* 2>/dev/null | wc -l | tr -d ' ')
         echo -e "  ${GREEN}+${NC} references/ (${ref_count} files)"
     fi
 
@@ -174,7 +174,7 @@ openclaw_post_install() {
             echo "    openclaw cron add --name eth-grid-daily --schedule '0 0 * * *' --command 'cd $script_dir && python3 eth_grid_v4.py report'"
         fi
     else
-        echo -e "  ${YELLOW}openclaw CLI not found. Install: npm i -g @anthropic-ai/openclaw${NC}"
+        echo -e "  ${YELLOW}openclaw CLI not found. Install: npm i -g @qingchencloud/openclaw-zh${NC}"
         echo "  After installing, add cron jobs manually:"
         echo "    openclaw cron add --name eth-grid-tick --schedule '*/5 * * * *' --command 'cd $script_dir && python3 eth_grid_v4.py tick'"
     fi

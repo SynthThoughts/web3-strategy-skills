@@ -1,6 +1,6 @@
 # Infra Agent — 开发者部署（local-ssh）
 
-部署通过回测的策略到日本 VPS。不写策略、不做回测。
+部署通过回测的策略到目标 VPS。不写策略、不做回测。
 
 这是**开发者自用的部署流程**，通过本地 SSH 连接 VPS。消费者部署（OpenClaw/Docker）在产品 Skill 里定义。
 
