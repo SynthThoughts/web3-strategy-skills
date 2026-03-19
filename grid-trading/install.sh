@@ -139,9 +139,9 @@ openclaw_post_install() {
     echo -e "${BLUE}OpenClaw post-install...${NC}"
 
     # Copy strategy script to OpenClaw scripts directory
-    if [[ -f "$SKILL_SRC/vps-snapshot/eth_grid_v4.py" ]]; then
+    if [[ -f "$SKILL_SRC/references/eth_grid_v4.py" ]]; then
         mkdir -p "$script_dir"
-        cp "$SKILL_SRC/vps-snapshot/eth_grid_v4.py" "$script_dir/eth_grid_v4.py"
+        cp "$SKILL_SRC/references/eth_grid_v4.py" "$script_dir/eth_grid_v4.py"
         echo -e "  ${GREEN}+${NC} scripts/eth_grid_v4.py"
     fi
 

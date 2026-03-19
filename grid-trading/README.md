@@ -72,7 +72,7 @@ mkdir -p ~/.openclaw/skills/grid-trading
 cp -r SKILL.md references/ ~/.openclaw/skills/grid-trading/
 
 # Copy strategy script
-cp vps-snapshot/eth_grid_v4.py ~/.openclaw/scripts/
+cp references/eth_grid_v4.py ~/.openclaw/scripts/
 
 # Register cron jobs (requires running gateway)
 openclaw cron add --name eth-grid-tick --schedule "*/5 * * * *" --command "cd ~/.openclaw/scripts && python3 eth_grid_v4.py tick"
@@ -84,11 +84,11 @@ openclaw cron add --name eth-grid-daily --schedule "0 0 * * *" --command "cd ~/.
 ```
 grid-trading/
 ├── SKILL.md              # Main skill document (all knowledge)
-├── references/           # Detailed reference docs
-│   ├── cli-reference.md  # onchainos CLI command reference
-│   ├── grid-algorithm.md # Core algorithm deep-dive
-│   └── risk-controls.md  # Risk control checklist
-└── vps-snapshot/         # Reference implementation
+└── references/           # Detailed reference docs
+    ├── cli-reference.md  # onchainos CLI command reference
+    ├── grid-algorithm.md # Core algorithm deep-dive
+    ├── risk-controls.md  # Risk control checklist
+    └── eth_grid_v4.py    # Reference implementation
 ```
 
 ## Quick Start

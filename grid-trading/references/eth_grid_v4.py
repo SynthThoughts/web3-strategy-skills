@@ -1,0 +1,2593 @@
+#!/usr/bin/env python3
+"""
+ETH/USDC Dynamic Grid Trading Bot v4 — Base Chain
+Improvements over v3:
+  1. Multi-timeframe analysis (5min tick + 1h trend + 4h structure)
+  2. Trend-adaptive grid: asymmetric sizing in trending markets
+  3. K-line/OHLC volatility via onchainos market kline
+  4. Smart money / whale signal integration as trade confirmation
+  5. Improved sell logic with trailing grid profit locking
+  6. HODL-alpha tracking with trend-follow overlay
+
+Uses OKX DEX API (via onchainos CLI) + OnchainOS Agentic Wallet (TEE signing).
+Designed for OpenClaw cron integration.
+"""
+
+import bisect
+import json
+import subprocess
+import os
+import sys
+import math
+import time
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+# ── Load .env if present ────────────────────────────────────────────────────
+
+
+def _load_env():
+    env_file = Path(__file__).parent / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+
+
+_load_env()
+
+# ── Config ──────────────────────────────────────────────────────────────────
+
+WALLET_ADDR = "0x50125b41c77d242bf7885950058a1dd1e0afd937"
+
+OKX_API_KEY = os.environ.get("OKX_API_KEY", "")
+OKX_SECRET = os.environ.get("OKX_SECRET_KEY", "")
+OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
+
+# Token addresses (Base chain)
+ETH_ADDR = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+USDC_ADDR = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+CHAIN_ID = "8453"
+
+# ── Grid Parameters (v4 tuned) ─────────────────────────────────────────────
+
+GRID_LEVELS = 6  # 6 levels
+GRID_TYPE = "arithmetic"  # "arithmetic" | "geometric"
+MAX_TRADE_PCT = 0.12  # max 12% of total portfolio per trade
+MIN_TRADE_USD = 5.0  # minimum trade size in USD
+GAS_RESERVE_ETH = 0.003  # Reserve for gas (Base L2 gas is <$0.01)
+SLIPPAGE_PCT = 1  # 1% slippage for DEX aggregator swaps
+EMA_PERIOD = 20  # periods for EMA center
+
+# v4: Trend-adaptive volatility multiplier
+VOLATILITY_MULTIPLIER_BASE = 2.5  # base multiplier
+VOLATILITY_MULTIPLIER_TREND = (
+    3.5  # wider grid in trending markets (less trading, more holding)
+)
+
+# Sizing strategy (v4: trend-adaptive, see below)
+SIZING_STRATEGY = "trend_adaptive"  # "equal" | "martingale" | "anti_martingale" | "pyramid" | "trend_adaptive"
+SIZING_MULTIPLIER_MIN = 0.5
+SIZING_MULTIPLIER_MAX = 2.0
+
+# Stop-loss / take-profit protection
+STOP_LOSS_PCT = 0.15  # stop at 15% loss from cost basis
+TRAILING_STOP_PCT = 0.10  # stop at 10% drawdown from peak
+TAKE_PROFIT_PCT = 0.0  # 0=disabled
+
+# Position limits (v4: trend-asymmetric)
+POSITION_MAX_PCT_DEFAULT = 70  # Block BUY when ETH > this %
+POSITION_MIN_PCT_DEFAULT = 30  # Block SELL when ETH < this %
+POSITION_MAX_PCT_BULLISH = 80  # Allow more ETH in bullish trend
+POSITION_MIN_PCT_BEARISH = 25  # Allow less ETH in bearish trend
+
+# Adaptive step bounds (as fraction of price)
+STEP_MIN_PCT = 0.010  # v4: raised from 0.008 to 1.0% (covers DEX costs better)
+STEP_MAX_PCT = 0.060  # cap: 6%
+VOL_RECALIBRATE_RATIO = 0.3  # recalibrate if vol changes >30% from last grid
+MAX_CONSECUTIVE_ERRORS = 5  # circuit breaker threshold
+MAX_SAME_DIR_TRADES = 3  # max consecutive same-direction trades before pause
+COOLDOWN_AFTER_ERRORS = 3600  # 1 hour cooldown after circuit break
+QUIET_INTERVAL = 3600  # seconds between no-trade status reports (1 hour)
+MIN_TRADE_INTERVAL = 1800  # 30min cooldown between same-direction trades
+GRID_RECALIBRATE_HOURS = 12  # Keep grid fixed; recalibrate only when needed
+UPSIDE_CONFIRM_TICKS = (
+    6  # 30min: price must hold above grid before upside recalibration
+)
+MAX_CENTER_SHIFT_PCT = 0.03  # max 3% grid center shift per recalibration (anti-chase)
+
+# v4: Multi-timeframe settings
+MTF_SHORT_PERIOD = 5  # 5-bar EMA (25min @ 5min tick)
+MTF_MEDIUM_PERIOD = 12  # 12-bar EMA (1h @ 5min tick)
+MTF_LONG_PERIOD = 48  # 48-bar EMA (4h @ 5min tick)
+MTF_STRUCTURE_PERIOD = 96  # 96-bar (8h @ 5min tick) for structure detection
+
+# v4: Signal integration
+SIGNAL_ENABLED = True  # fetch smart money signals
+SIGNAL_WEIGHT = 0.15  # signal influence on sizing (0-1)
+SIGNAL_COOLDOWN_SEC = 900  # 15min between signal checks
+SIGNAL_MIN_TRIGGER_WALLETS = 3  # minimum trigger wallet count to consider signal
+
+# v4: Sell improvement — trailing grid lock
+SELL_TRAIL_TICKS = 2  # wait 2 ticks (10min) of price stability before selling
+SELL_MOMENTUM_THRESHOLD = 0.005  # skip sell if 1h momentum > 0.5% (strong uptrend)
+
+# Paths
+SCRIPT_DIR = Path(__file__).parent
+STATE_FILE = SCRIPT_DIR / "grid_state_v4.json"
+LOG_FILE = SCRIPT_DIR / "grid_bot_v4.log"
+MAX_LOG_BYTES = 1_000_000  # 1MB log rotation
+
+# ── Logging ─────────────────────────────────────────────────────────────────
+
+
+def log(msg: str):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line)
+    try:
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > MAX_LOG_BYTES:
+            lines = LOG_FILE.read_text().splitlines()
+            LOG_FILE.write_text("\n".join(lines[len(lines) // 2 :]) + "\n")
+        with open(LOG_FILE, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+# ── onchainos CLI wrapper ────────────────────────────────────────────────────
+
+
+def onchainos_cmd(args: list[str], timeout: int = 30) -> dict | None:
+    """Run onchainos CLI command, return parsed JSON."""
+    env = os.environ.copy()
+    env.setdefault("OKX_API_KEY", OKX_API_KEY)
+    env.setdefault("OKX_SECRET_KEY", OKX_SECRET)
+    env.setdefault("OKX_PASSPHRASE", OKX_PASSPHRASE)
+    try:
+        result = subprocess.run(
+            ["onchainos"] + args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+        output = result.stdout.strip() if result.stdout else ""
+        if output:
+            try:
+                data = json.loads(output)
+                if isinstance(data, dict) and "ok" in data:
+                    return data
+                return {"ok": True, "data": data if isinstance(data, list) else [data]}
+            except json.JSONDecodeError:
+                pass
+        if result.returncode != 0:
+            stderr = result.stderr.strip() if result.stderr else ""
+            log(
+                f"onchainos rc={result.returncode}: {' '.join(args[:3])} "
+                f"{'stderr=' + stderr[:150] if stderr else 'no output'}"
+            )
+    except subprocess.TimeoutExpired:
+        log(f"onchainos timeout: {' '.join(args[:3])}")
+    except Exception as e:
+        log(f"onchainos error: {e}")
+    return None
+
+
+# ── Price & Balance ─────────────────────────────────────────────────────────
+
+
+def get_eth_price() -> float | None:
+    """Get ETH/USDC price via onchainos swap quote."""
+    data = onchainos_cmd(
+        [
+            "swap",
+            "quote",
+            "--from",
+            ETH_ADDR,
+            "--to",
+            USDC_ADDR,
+            "--amount",
+            "1000000000000000000",
+            "--chain",
+            "base",
+        ]
+    )
+    if data and data.get("ok") and data.get("data"):
+        return int(data["data"][0]["toTokenAmount"]) / 1e6
+    return None
+
+
+def get_balances() -> tuple[float, float]:
+    """Get ETH and USDC balances via onchainos wallet balance."""
+    data = onchainos_cmd(["wallet", "balance", "--chain", CHAIN_ID], timeout=15)
+    eth, usdc = 0.0, 0.0
+    if data and data.get("ok") and data.get("data"):
+        details = data["data"].get("details", [])
+        for chain_detail in details:
+            for token in chain_detail.get("tokenAssets", []):
+                if token.get("tokenAddress") == "" and token.get("symbol") == "ETH":
+                    eth = float(token.get("balance", "0"))
+                elif token.get("tokenAddress", "").lower() == USDC_ADDR.lower():
+                    usdc = float(token.get("balance", "0"))
+    if eth == 0.0 and usdc == 0.0:
+        log(
+            f"Balance query returned empty, raw: {json.dumps(data)[:200] if data else 'None'}"
+        )
+    return eth, usdc
+
+
+# ── v4: K-line / OHLC Data ────────────────────────────────────────────────
+
+
+def get_kline_data(bar: str = "1H", limit: int = 24) -> list[dict] | None:
+    """Fetch K-line data via onchainos market kline.
+    Returns list of {open, high, low, close, volume, ts}."""
+    data = onchainos_cmd(
+        [
+            "market",
+            "kline",
+            "--address",
+            ETH_ADDR,
+            "--chain",
+            "base",
+            "--bar",
+            bar,
+            "--limit",
+            str(limit),
+        ],
+        timeout=15,
+    )
+    if data and data.get("ok") and data.get("data"):
+        candles = []
+        for c in data["data"]:
+            try:
+                # onchainos returns arrays: [ts, open, high, low, close, volume, ...]
+                if isinstance(c, list) and len(c) >= 6:
+                    candles.append(
+                        {
+                            "ts": int(c[0]),
+                            "open": float(c[1]),
+                            "high": float(c[2]),
+                            "low": float(c[3]),
+                            "close": float(c[4]),
+                            "volume": float(c[5]),
+                        }
+                    )
+                elif isinstance(c, dict):
+                    candles.append(
+                        {
+                            "ts": int(c.get("ts", 0)),
+                            "open": float(c.get("open", 0)),
+                            "high": float(c.get("high", 0)),
+                            "low": float(c.get("low", 0)),
+                            "close": float(c.get("close", 0)),
+                            "volume": float(c.get("volume", 0)),
+                        }
+                    )
+            except (ValueError, TypeError, IndexError):
+                continue
+        return candles if candles else None
+    return None
+
+
+def calc_kline_volatility(candles: list[dict]) -> float:
+    """Calculate true range based volatility from OHLC candles.
+    Returns average true range as percentage of price."""
+    if not candles or len(candles) < 2:
+        return 0.0
+    true_ranges = []
+    for i in range(1, len(candles)):
+        hi = candles[i]["high"]
+        lo = candles[i]["low"]
+        pc = candles[i - 1]["close"]
+        tr = max(hi - lo, abs(hi - pc), abs(lo - pc))
+        true_ranges.append(tr)
+    atr = sum(true_ranges) / len(true_ranges)
+    avg_price = sum(c["close"] for c in candles) / len(candles)
+    return (atr / avg_price) * 100 if avg_price > 0 else 0.0
+
+
+# ── v4: Smart Money Signal Integration ──────────────────────────────────────
+
+
+def get_smart_money_signals() -> dict:
+    """Fetch smart money/whale signals for ETH on Base.
+    Returns {bullish_score: float, signals: list, fetched_at: str}."""
+    result = {
+        "bullish_score": 0.0,
+        "signals": [],
+        "fetched_at": datetime.now().isoformat(),
+    }
+
+    data = onchainos_cmd(
+        [
+            "signal",
+            "list",
+            "--chain",
+            "base",
+            "--wallet-type",
+            "1,2,3",  # smart money + KOL + whale
+            "--token-address",
+            ETH_ADDR,
+        ],
+        timeout=15,
+    )
+
+    if not data or not data.get("ok") or not data.get("data"):
+        return result
+
+    signals = data["data"] if isinstance(data["data"], list) else [data["data"]]
+    eth_signals = []
+
+    for sig in signals:
+        token_addr = sig.get("tokenAddress", "").lower()
+        # Accept ETH-related signals
+        if token_addr in [
+            ETH_ADDR.lower(),
+            "",
+            "0x4200000000000000000000000000000000000006",
+        ]:
+            trigger_count = int(sig.get("triggerWalletCount", 0))
+            if trigger_count >= SIGNAL_MIN_TRIGGER_WALLETS:
+                sold_ratio = float(sig.get("soldRatioPercent", "100"))
+                wallet_type = sig.get("walletType", "")
+                eth_signals.append(
+                    {
+                        "wallet_type": wallet_type,
+                        "trigger_wallets": trigger_count,
+                        "sold_ratio_pct": sold_ratio,
+                        "amount_usd": float(sig.get("amountUsd", 0)),
+                    }
+                )
+
+    if eth_signals:
+        # Score: more trigger wallets + lower sold ratio = more bullish
+        scores = []
+        for s in eth_signals:
+            wallet_score = min(s["trigger_wallets"] / 10, 1.0)  # normalize to 0-1
+            hold_score = 1.0 - (s["sold_ratio_pct"] / 100.0)  # 0% sold = 1.0 score
+            type_weight = {"SMART_MONEY": 1.0, "WHALE": 0.8, "INFLUENCER": 0.6}.get(
+                s["wallet_type"], 0.5
+            )
+            scores.append(wallet_score * hold_score * type_weight)
+        result["bullish_score"] = round(min(sum(scores) / len(scores), 1.0), 3)
+        result["signals"] = eth_signals
+
+    return result
+
+
+# ── v4: Multi-Timeframe Analysis ────────────────────────────────────────────
+
+
+def calc_ema(prices: list[float], period: int) -> float:
+    """Calculate Exponential Moving Average."""
+    if not prices:
+        return 0.0
+    if len(prices) < period:
+        return sum(prices) / len(prices)
+    k = 2 / (period + 1)
+    ema = sum(prices[:period]) / period
+    for p in prices[period:]:
+        ema = p * k + ema * (1 - k)
+    return ema
+
+
+def calc_volatility(prices: list[float]) -> float:
+    """Calculate standard deviation of prices."""
+    if len(prices) < 2:
+        return 0.0
+    mean = sum(prices) / len(prices)
+    variance = sum((p - mean) ** 2 for p in prices) / len(prices)
+    return math.sqrt(variance)
+
+
+def analyze_multi_timeframe(history: list[float], price: float) -> dict:
+    """Multi-timeframe trend analysis.
+    Returns {trend: str, strength: float, momentum_1h: float, structure: str,
+             ema_short, ema_medium, ema_long}."""
+    result = {
+        "trend": "neutral",
+        "strength": 0.0,
+        "momentum_1h": 0.0,
+        "momentum_4h": 0.0,
+        "structure": "ranging",
+        "ema_short": price,
+        "ema_medium": price,
+        "ema_long": price,
+    }
+
+    if len(history) < MTF_SHORT_PERIOD:
+        return result
+
+    ema_short = calc_ema(history, min(MTF_SHORT_PERIOD, len(history)))
+    ema_medium = calc_ema(history, min(MTF_MEDIUM_PERIOD, len(history)))
+    ema_long = calc_ema(history, min(MTF_LONG_PERIOD, len(history)))
+    result["ema_short"] = round(ema_short, 2)
+    result["ema_medium"] = round(ema_medium, 2)
+    result["ema_long"] = round(ema_long, 2)
+
+    # 1h momentum
+    if len(history) >= 12:
+        result["momentum_1h"] = round((price - history[-12]) / history[-12] * 100, 3)
+
+    # 4h momentum
+    if len(history) >= 48:
+        result["momentum_4h"] = round((price - history[-48]) / history[-48] * 100, 3)
+
+    # Trend detection: EMA alignment
+    if ema_short > ema_medium > ema_long:
+        result["trend"] = "bullish"
+        # Strength: how spread apart the EMAs are
+        spread = (ema_short - ema_long) / ema_long * 100
+        result["strength"] = round(min(spread / 2.0, 1.0), 3)  # normalize, cap at 1.0
+    elif ema_short < ema_medium < ema_long:
+        result["trend"] = "bearish"
+        spread = (ema_long - ema_short) / ema_long * 100
+        result["strength"] = round(min(spread / 2.0, 1.0), 3)
+    else:
+        result["trend"] = "neutral"
+        result["strength"] = 0.0
+
+    # Structure detection: higher highs/lows vs lower highs/lows
+    if len(history) >= MTF_STRUCTURE_PERIOD:
+        # Split into 4 segments, check if pivot highs/lows are ascending
+        seg_len = MTF_STRUCTURE_PERIOD // 4
+        segments = [
+            history[-(i + 1) * seg_len : -i * seg_len or None] for i in range(3, -1, -1)
+        ]
+        seg_highs = [max(s) for s in segments if s]
+        seg_lows = [min(s) for s in segments if s]
+
+        hh = all(seg_highs[i] >= seg_highs[i - 1] for i in range(1, len(seg_highs)))
+        hl = all(seg_lows[i] >= seg_lows[i - 1] for i in range(1, len(seg_lows)))
+        lh = all(seg_highs[i] <= seg_highs[i - 1] for i in range(1, len(seg_highs)))
+        ll = all(seg_lows[i] <= seg_lows[i - 1] for i in range(1, len(seg_lows)))
+
+        if hh and hl:
+            result["structure"] = "uptrend"
+        elif lh and ll:
+            result["structure"] = "downtrend"
+        else:
+            result["structure"] = "ranging"
+
+    return result
+
+
+# ── v4: Trend-Adaptive Grid Calculation ─────────────────────────────────────
+
+
+def calc_dynamic_grid(
+    current_price: float, price_history: list[float], mtf: dict | None = None
+) -> dict:
+    """Calculate dynamic grid with trend-adaptive parameters.
+    v4: In trending markets, use wider grid (hold more, trade less).
+    """
+    if len(price_history) < 5:
+        step = current_price * 0.01
+        center = current_price
+        vol_pct = 0.0
+    else:
+        center = calc_ema(price_history, min(EMA_PERIOD, len(price_history)))
+        volatility = calc_volatility(price_history)
+        avg_price = sum(price_history) / len(price_history)
+        vol_pct = (volatility / avg_price) * 100 if avg_price > 0 else 0
+
+        # v4: Trend-adaptive multiplier — wider grid in trends to reduce over-trading
+        vol_mult = VOLATILITY_MULTIPLIER_BASE
+        if mtf and mtf.get("strength", 0) > 0.3:
+            # Blend toward trend multiplier based on strength
+            blend = mtf["strength"]
+            vol_mult = (
+                VOLATILITY_MULTIPLIER_BASE
+                + (VOLATILITY_MULTIPLIER_TREND - VOLATILITY_MULTIPLIER_BASE) * blend
+            )
+            log(
+                f"Trend-adaptive: multiplier {vol_mult:.2f} (strength {mtf['strength']:.2f})"
+            )
+
+        step = (vol_mult * volatility) / (GRID_LEVELS / 2)
+        step_floor = current_price * STEP_MIN_PCT
+        step_ceil = current_price * STEP_MAX_PCT
+        step = max(step_floor, min(step_ceil, step))
+
+        log(
+            f"Volatility: {vol_pct:.2f}% -> step=${step:.1f} "
+            f"({step / current_price * 100:.2f}% of price, mult={vol_mult:.2f})"
+        )
+
+    # Hard floor: at least $5
+    step = max(step, 5.0)
+
+    half = GRID_LEVELS / 2
+
+    # Build level_prices based on grid type
+    if GRID_TYPE == "geometric" and center > 0:
+        ratio = 1 + (step / center)
+        level_prices = [
+            round(center * (ratio ** (i - half)), 2) for i in range(GRID_LEVELS + 1)
+        ]
+        low = level_prices[0]
+        high = level_prices[-1]
+    else:
+        level_prices = [
+            round(center - half * step + i * step, 2) for i in range(GRID_LEVELS + 1)
+        ]
+        low = center - step * half
+        high = center + step * half
+
+    return {
+        "center": round(center, 2),
+        "step": round(step, 2),
+        "levels": GRID_LEVELS,
+        "range": [round(low, 2), round(high, 2)],
+        "vol_pct": round(vol_pct, 2),
+        "type": GRID_TYPE,
+        "level_prices": level_prices,
+    }
+
+
+def price_to_level(price: float, grid: dict) -> int:
+    """Convert price to grid level (0 = bottom, GRID_LEVELS = top)."""
+    level_prices = grid.get("level_prices")
+    if level_prices:
+        level = bisect.bisect_right(level_prices, price) - 1
+        return max(0, min(GRID_LEVELS, level))
+    low = grid["range"][0]
+    step = grid["step"]
+    if step <= 0:
+        return GRID_LEVELS // 2
+    level = int((price - low) / step)
+    return max(0, min(GRID_LEVELS, level))
+
+
+# ── Trade Execution ─────────────────────────────────────────────────────────
+
+
+def _calc_sizing_multiplier(
+    level: int,
+    grid_levels: int,
+    direction: str,
+    mtf: dict | None = None,
+    signal: dict | None = None,
+) -> float:
+    """v4: Trend-adaptive sizing.
+    - In bullish trend: buy more (larger buys), sell less (smaller sells) → hold more ETH
+    - In bearish trend: buy less, sell more → hold more USDC
+    - Signal boost: if smart money is bullish, slight increase in buy size
+    """
+    base_mult = 1.0
+
+    if SIZING_STRATEGY == "trend_adaptive" and mtf:
+        trend = mtf.get("trend", "neutral")
+        strength = mtf.get("strength", 0)
+
+        if trend == "bullish":
+            if direction == "BUY":
+                # In uptrend, buy aggressively
+                base_mult = 1.0 + strength * (SIZING_MULTIPLIER_MAX - 1.0)
+            else:
+                # In uptrend, sell conservatively (hold more ETH to capture upside)
+                base_mult = 1.0 - strength * (1.0 - SIZING_MULTIPLIER_MIN)
+        elif trend == "bearish":
+            if direction == "SELL":
+                base_mult = 1.0 + strength * (SIZING_MULTIPLIER_MAX - 1.0)
+            else:
+                base_mult = 1.0 - strength * (1.0 - SIZING_MULTIPLIER_MIN)
+
+    elif SIZING_STRATEGY == "equal" or grid_levels <= 0:
+        base_mult = 1.0
+    elif SIZING_STRATEGY in ("martingale", "anti_martingale", "pyramid"):
+        half = grid_levels / 2
+        dist = abs(level - half) / half if half > 0 else 0
+        mn, mx = SIZING_MULTIPLIER_MIN, SIZING_MULTIPLIER_MAX
+        if SIZING_STRATEGY == "martingale":
+            base_mult = mn + (mx - mn) * dist
+        elif SIZING_STRATEGY == "anti_martingale":
+            base_mult = mx - (mx - mn) * dist
+        elif SIZING_STRATEGY == "pyramid":
+            base_mult = mx - (mx - mn) * dist
+
+    # v4: Signal boost
+    if signal and SIGNAL_ENABLED:
+        bull_score = signal.get("bullish_score", 0)
+        if bull_score > 0.3 and direction == "BUY":
+            base_mult *= 1.0 + SIGNAL_WEIGHT * bull_score
+        elif bull_score > 0.3 and direction == "SELL":
+            base_mult *= 1.0 - SIGNAL_WEIGHT * bull_score * 0.5  # slight sell reduction
+
+    return max(SIZING_MULTIPLIER_MIN, min(SIZING_MULTIPLIER_MAX, base_mult))
+
+
+def _check_stop_conditions(state: dict, total_usd: float, price: float) -> str | None:
+    """Check stop-loss, trailing-stop, and take-profit conditions."""
+    stats = state.get("stats", {})
+    initial = stats.get("initial_portfolio_usd")
+    if not initial or initial <= 0:
+        return None
+
+    deposits = stats.get("total_deposits_usd", 0)
+    cost_basis = initial + deposits
+
+    peak = stats.get("portfolio_peak_usd", cost_basis)
+    if total_usd > peak:
+        peak = total_usd
+        stats["portfolio_peak_usd"] = round(peak, 2)
+
+    pnl_pct = (total_usd - cost_basis) / cost_basis
+
+    if STOP_LOSS_PCT > 0 and pnl_pct <= -STOP_LOSS_PCT:
+        return f"stop_loss ({pnl_pct * 100:+.1f}% <= -{STOP_LOSS_PCT * 100:.0f}%)"
+
+    if TRAILING_STOP_PCT > 0 and peak > 0:
+        drawdown = (peak - total_usd) / peak
+        if drawdown >= TRAILING_STOP_PCT:
+            return (
+                f"trailing_stop (drawdown {drawdown * 100:.1f}% from peak ${peak:.0f})"
+            )
+
+    if TAKE_PROFIT_PCT > 0 and pnl_pct >= TAKE_PROFIT_PCT:
+        return f"take_profit ({pnl_pct * 100:+.1f}% >= +{TAKE_PROFIT_PCT * 100:.0f}%)"
+
+    return None
+
+
+def calc_trade_amount(
+    direction: str,
+    eth_bal: float,
+    usdc_bal: float,
+    price: float,
+    current_level: int | None = None,
+    grid_levels: int | None = None,
+    mtf: dict | None = None,
+    signal: dict | None = None,
+) -> tuple[int | None, dict | None]:
+    """Calculate trade amount. Returns (amount, failure_info)."""
+    available_eth = eth_bal - GAS_RESERVE_ETH
+    if available_eth < 0:
+        available_eth = 0.0
+
+    total_usd = available_eth * price + usdc_bal
+    max_usd = total_usd * MAX_TRADE_PCT
+
+    # Apply sizing strategy multiplier
+    if current_level is not None and grid_levels is not None:
+        multiplier = _calc_sizing_multiplier(
+            current_level, grid_levels, direction, mtf, signal
+        )
+        max_usd *= multiplier
+        log(f"  Sizing: {direction} mult={multiplier:.2f} -> max_usd=${max_usd:.2f}")
+
+    if max_usd < MIN_TRADE_USD:
+        log(f"Trade too small: max ${max_usd:.2f} < min ${MIN_TRADE_USD}")
+        return None, {
+            "reason": "below_minimum",
+            "detail": f"max ${max_usd:.2f} < min ${MIN_TRADE_USD}",
+            "retriable": False,
+            "hint": "amount_too_small",
+        }
+
+    if direction == "SELL":
+        eth_to_sell = min(max_usd / price, available_eth)
+        if eth_to_sell * price < MIN_TRADE_USD:
+            return None, {
+                "reason": "insufficient_balance",
+                "detail": f"ETH to sell {eth_to_sell:.6f} below min",
+                "retriable": False,
+                "hint": "low_balance",
+            }
+        return int(eth_to_sell * 1e18), None
+    else:
+        usdc_to_spend = min(max_usd, usdc_bal * 0.95)
+        if usdc_to_spend < MIN_TRADE_USD:
+            return None, {
+                "reason": "insufficient_balance",
+                "detail": f"USDC ${usdc_to_spend:.2f} below min",
+                "retriable": False,
+                "hint": "low_balance",
+            }
+        return int(usdc_to_spend * 1e6), None
+
+
+def ensure_approval(spender: str, amount: int) -> bool:
+    """Ensure USDC approval for spender via onchainos."""
+    state = load_state()
+    approved_routers = state.get("approved_routers", [])
+    if spender.lower() in [r.lower() for r in approved_routers]:
+        return True
+
+    log(f"USDC approval needed for {spender[:10]}... Approving...")
+    max_approval = (
+        "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+    )
+    data = onchainos_cmd(
+        [
+            "swap",
+            "approve",
+            "--token",
+            USDC_ADDR,
+            "--amount",
+            max_approval,
+            "--chain",
+            "base",
+        ]
+    )
+
+    if not data or not data.get("ok") or not data.get("data"):
+        log(f"Approve API failed: {json.dumps(data)[:200] if data else 'no response'}")
+        return False
+
+    approve_tx = data["data"][0]
+    approve_tx["to"] = USDC_ADDR
+
+    tx_hash, fail = _wallet_contract_call(approve_tx)
+    if not tx_hash:
+        log(f"Approval failed: {fail}")
+        return False
+
+    log(f"Approval TX: {tx_hash}")
+    time.sleep(5)
+
+    approved_routers.append(spender)
+    state["approved_routers"] = approved_routers
+    save_state(state)
+    log(f"Router {spender[:10]}... added to approved list")
+    return True
+
+
+def _wallet_contract_call(tx: dict) -> tuple[str | None, dict | None]:
+    """Sign + broadcast via onchainos wallet contract-call (TEE signing)."""
+    value_wei = int(tx.get("value", "0"))
+    value_eth = str(value_wei / 1e18) if value_wei > 0 else "0"
+
+    args = [
+        "wallet",
+        "contract-call",
+        "--to",
+        tx["to"],
+        "--chain",
+        CHAIN_ID,
+        "--input-data",
+        tx.get("data", "0x"),
+        "--value",
+        value_eth,
+    ]
+
+    if tx.get("gas"):
+        gas_limit = int(int(tx["gas"]) * 1.5)
+        args.extend(["--gas-limit", str(gas_limit)])
+        gas_price_gwei = int(tx["gasPrice"]) / 1e9 if tx.get("gasPrice") else 0
+        log(f"  TX gas: limit={gas_limit}, gasPrice={gas_price_gwei:.2f} gwei")
+
+    try:
+        data = onchainos_cmd(args, timeout=45)
+
+        if data and data.get("ok") and data.get("data"):
+            result = (
+                data["data"]
+                if isinstance(data["data"], dict)
+                else (
+                    data["data"][0] if isinstance(data["data"], list) else data["data"]
+                )
+            )
+            tx_hash = (
+                result.get("txHash") or result.get("hash") or result.get("orderId")
+            )
+            if tx_hash:
+                log(f"  Broadcast OK: {tx_hash}")
+                return tx_hash, None
+            log(f"  Response missing hash: {json.dumps(result)[:300]}")
+            return None, {
+                "reason": "no_hash",
+                "detail": json.dumps(result)[:200],
+                "retriable": True,
+                "hint": "transient_error",
+            }
+
+        detail = json.dumps(data)[:200] if data else "no response"
+        log(f"  contract-call failed: {detail}")
+        return None, {
+            "reason": "contract_call_failed",
+            "detail": detail,
+            "retriable": True,
+            "hint": "transient_error",
+        }
+    except Exception as e:
+        return None, {
+            "reason": "exception",
+            "detail": str(e),
+            "retriable": True,
+            "hint": "transient_error",
+        }
+
+
+def simulate_tx(tx: dict) -> dict | None:
+    """Simulate transaction via onchainos gateway simulate (non-blocking diagnostic)."""
+    data = onchainos_cmd(
+        [
+            "gateway",
+            "simulate",
+            "--from",
+            WALLET_ADDR,
+            "--to",
+            tx["to"],
+            "--data",
+            tx.get("data", "0x"),
+            "--amount",
+            tx.get("value", "0"),
+            "--chain",
+            "base",
+        ],
+        timeout=15,
+    )
+    if data and data.get("ok") and data.get("data"):
+        sim = data["data"][0] if isinstance(data["data"], list) else data["data"]
+        fail_reason = sim.get("failReason", "")
+        gas_used = sim.get("gasUsed", "")
+        success = not fail_reason
+        log(
+            f"  Simulation: {'OK' if success else 'FAIL'} gasUsed={gas_used}"
+            + (f" reason={fail_reason}" if fail_reason else "")
+        )
+        return {"success": success, "failReason": fail_reason, "gasUsed": gas_used}
+    if data:
+        log(f"  Simulation error: {json.dumps(data)[:300]}")
+    return None
+
+
+def execute_swap(
+    direction: str, amount: int, price: float, chain: str = "base"
+) -> tuple[str | None, dict | None]:
+    """Execute swap via onchainos CLI + Agentic Wallet (TEE signing)."""
+    if direction == "SELL":
+        from_token, to_token = ETH_ADDR, USDC_ADDR
+    else:
+        from_token, to_token = USDC_ADDR, ETH_ADDR
+
+    for attempt in range(2):
+        quote_time = time.time()
+
+        swap_data = onchainos_cmd(
+            [
+                "swap",
+                "swap",
+                "--from",
+                from_token,
+                "--to",
+                to_token,
+                "--amount",
+                str(amount),
+                "--chain",
+                chain,
+                "--wallet",
+                WALLET_ADDR,
+                "--slippage",
+                str(SLIPPAGE_PCT),
+            ]
+        )
+
+        if not swap_data or not swap_data.get("ok") or not swap_data.get("data"):
+            detail = json.dumps(swap_data)[:200] if swap_data else "no response"
+            log(f"Swap quote failed (attempt {attempt + 1}): {detail}")
+            if attempt == 0:
+                time.sleep(3)
+                continue
+            return None, {
+                "reason": "swap_quote_failed",
+                "detail": detail,
+                "retriable": True,
+                "hint": "transient_api_error",
+            }
+
+        tx = swap_data["data"][0]["tx"]
+        log(
+            f"  OKX swap: to={tx['to'][:10]}... value={tx.get('value', '0')} "
+            f"gas={tx.get('gas', 'N/A')} gasPrice={tx.get('gasPrice', 'N/A')}"
+        )
+        route_data = swap_data["data"][0]
+        log(
+            f"  Route: minReceive={route_data.get('minReceiveAmount', tx.get('minReceiveAmount', 'N/A'))} "
+            f"slippage={SLIPPAGE_PCT}%"
+        )
+
+        sim_result = simulate_tx(tx)
+
+        if direction == "BUY":
+            router_addr = tx["to"]
+            if not ensure_approval(router_addr, amount):
+                log(f"Failed to approve USDC for router {router_addr}")
+                return None, {
+                    "reason": "approval_failed",
+                    "detail": f"router {router_addr}",
+                    "retriable": True,
+                    "hint": "approval_might_be_pending",
+                }
+
+        elapsed = time.time() - quote_time
+        log(f"  Time quote-to-submit: {elapsed:.1f}s")
+        tx_hash, fail = _wallet_contract_call(tx)
+        if tx_hash:
+            return tx_hash, None
+
+        if fail and sim_result:
+            fail["simulation"] = sim_result
+
+        log(f"Swap failed (attempt {attempt + 1}): {fail}")
+        if (
+            attempt == 0
+            and fail
+            and fail.get("hint")
+            in ("network_timeout", "transient_error", "retry_with_fresh_quote")
+        ):
+            time.sleep(3)
+            continue
+        return None, fail
+
+    return None, {
+        "reason": "max_retries",
+        "detail": "exhausted auto-retry",
+        "retriable": True,
+        "hint": "retry_with_fresh_quote",
+    }
+
+
+# ── State Management ────────────────────────────────────────────────────────
+
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except Exception:
+            pass
+    return {
+        "version": 5,
+        "grid": None,
+        "current_level": None,
+        "price_history": [],
+        "trades": [],
+        "last_balances": None,
+        "stats": {
+            "total_trades": 0,
+            "total_sell_usdc": 0.0,
+            "total_buy_usdc": 0.0,
+            "realized_pnl": 0.0,
+            "grid_profit": 0.0,
+            "initial_portfolio_usd": None,
+            "initial_eth_price": None,
+            "started_at": datetime.now().isoformat(),
+            "last_check": None,
+            "trade_attempts": 0,
+            "trade_successes": 0,
+            "trade_failures": 0,
+            "sell_attempts": 0,
+            "sell_successes": 0,
+            "buy_attempts": 0,
+            "buy_successes": 0,
+            "retry_attempts": 0,
+            "retry_successes": 0,
+            "total_deposits_usd": 0.0,
+            "deposit_history": [],
+        },
+        "errors": {"consecutive": 0, "cooldown_until": None},
+        # v4 new fields
+        "mtf_cache": None,
+        "signal_cache": None,
+        "kline_cache": None,
+        "sell_trail_counter": {},  # {level: tick_count}
+    }
+
+
+def save_state(state: dict):
+    if STATE_FILE.exists():
+        bak = STATE_FILE.with_suffix(".json.bak")
+        bak.write_text(STATE_FILE.read_text())
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+# ── Market Analysis Helpers ─────────────────────────────────────────────────
+
+
+def _calc_market_data(
+    price: float,
+    history: list[float],
+    grid: dict,
+    mtf: dict | None = None,
+    signal: dict | None = None,
+    kline_vol: float | None = None,
+) -> dict:
+    """Calculate market analysis data for JSON output (v4 enriched)."""
+    ema = calc_ema(history, min(EMA_PERIOD, len(history))) if history else price
+    vol = calc_volatility(history) if len(history) >= 2 else 0
+    avg = sum(history) / len(history) if history else price
+    vol_pct = round((vol / avg) * 100, 2) if avg else 0
+    price_vs_ema = round(((price - ema) / ema) * 100, 2) if ema else 0
+
+    grid_low, grid_high = grid["range"]
+    grid_span = grid_high - grid_low
+    grid_util = round((price - grid_low) / grid_span, 2) if grid_span > 0 else 0.5
+    grid_util = max(0, min(1, grid_util))
+
+    result = {
+        "price": round(price, 2),
+        "ema": round(ema, 2),
+        "volatility_pct": vol_pct,
+        "price_vs_ema_pct": price_vs_ema,
+        "grid_utilization": grid_util,
+    }
+
+    # v4: MTF data
+    if mtf:
+        result["trend"] = mtf.get("trend", "neutral")
+        result["trend_strength"] = mtf.get("strength", 0)
+        result["momentum_1h"] = mtf.get("momentum_1h", 0)
+        result["momentum_4h"] = mtf.get("momentum_4h", 0)
+        result["structure"] = mtf.get("structure", "ranging")
+    else:
+        # Fallback trend from v3 logic
+        if len(history) >= 10:
+            ema_short = calc_ema(history, min(5, len(history)))
+            result["trend"] = (
+                "bullish"
+                if ema_short > ema * 1.001
+                else "bearish"
+                if ema_short < ema * 0.999
+                else "neutral"
+            )
+        else:
+            result["trend"] = "neutral"
+
+    # v4: Signal data
+    if signal:
+        result["signal_bullish_score"] = signal.get("bullish_score", 0)
+
+    # v4: K-line ATR volatility
+    if kline_vol is not None:
+        result["kline_atr_pct"] = round(kline_vol, 2)
+
+    return result
+
+
+def _emit_json(data: dict):
+    """Print JSON block for AI agent parsing."""
+    print("---JSON---")
+    print(json.dumps(data, indent=2))
+
+
+# ── Discord embed helper ────────────────────────────────────────────────────
+
+DISCORD_CHANNEL_ID = "1478677591073488906"
+
+
+def _get_discord_token() -> str:
+    cfg_path = Path.home() / ".openclaw" / "openclaw.json"
+    if cfg_path.exists():
+        cfg = json.loads(cfg_path.read_text())
+        return cfg.get("channels", {}).get("discord", {}).get("token", "")
+    return ""
+
+
+def _send_discord_embed(embeds: list[dict], content: str = ""):
+    """Send a Discord embed (card) message directly via Bot API."""
+    import urllib.request
+    import urllib.error
+
+    token = _get_discord_token()
+    if not token:
+        log("Discord embed: no token found, falling back to print")
+        return False
+    url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages"
+    payload = {"embeds": embeds}
+    if content:
+        payload["content"] = content
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bot {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "DiscordBot (https://openclaw.ai, 1.0)",
+        },
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        return True
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
+        log(f"Discord embed error: {e}")
+        return False
+
+
+def _record_attempt(state: dict, direction: str, success: bool, is_retry: bool = False):
+    """Record a trade attempt for success rate tracking."""
+    s = state["stats"]
+    s["trade_attempts"] = s.get("trade_attempts", 0) + 1
+    if success:
+        s["trade_successes"] = s.get("trade_successes", 0) + 1
+    else:
+        s["trade_failures"] = s.get("trade_failures", 0) + 1
+    dir_key = direction.lower()
+    s[f"{dir_key}_attempts"] = s.get(f"{dir_key}_attempts", 0) + 1
+    if success:
+        s[f"{dir_key}_successes"] = s.get(f"{dir_key}_successes", 0) + 1
+    if is_retry:
+        s["retry_attempts"] = s.get("retry_attempts", 0) + 1
+        if success:
+            s["retry_successes"] = s.get("retry_successes", 0) + 1
+
+
+def _success_rate_str(state: dict) -> str:
+    s = state.get("stats", {})
+    total = s.get("trade_attempts", 0)
+    success = s.get("trade_successes", 0)
+    if total == 0:
+        return "N/A"
+    rate = round(success / total * 100, 1)
+    return f"{success}/{total} ({rate}%)"
+
+
+def _success_rate_data(state: dict) -> dict:
+    s = state.get("stats", {})
+    total = s.get("trade_attempts", 0)
+    success = s.get("trade_successes", 0)
+    return {
+        "total_attempts": total,
+        "successes": success,
+        "failures": s.get("trade_failures", 0),
+        "rate_pct": round(success / total * 100, 1) if total > 0 else None,
+        "sell": {
+            "attempts": s.get("sell_attempts", 0),
+            "successes": s.get("sell_successes", 0),
+        },
+        "buy": {
+            "attempts": s.get("buy_attempts", 0),
+            "successes": s.get("buy_successes", 0),
+        },
+        "retry": {
+            "attempts": s.get("retry_attempts", 0),
+            "successes": s.get("retry_successes", 0),
+        },
+    }
+
+
+def _detect_deposits(
+    state: dict, eth_bal: float, usdc_bal: float, price: float
+) -> float | None:
+    """Detect external deposits/withdrawals."""
+    last = state.get("last_balances")
+    if not last:
+        return None
+
+    last_time = last.get("time", "")
+    delta_eth = eth_bal - last["eth"]
+    delta_usdc = usdc_bal - last["usdc"]
+
+    for t in state.get("trades", []):
+        if t["time"] > last_time:
+            trade_eth = t["amount_usd"] / t["price"]
+            if t["direction"] == "SELL":
+                delta_eth += trade_eth
+                delta_usdc -= t["amount_usd"]
+            else:
+                delta_eth -= trade_eth
+                delta_usdc += t["amount_usd"]
+
+    deposit_usd = delta_eth * price + delta_usdc
+
+    if abs(deposit_usd) > 100:
+        event_type = "deposit" if deposit_usd > 0 else "withdrawal"
+        event = {
+            "time": datetime.now().isoformat(),
+            "eth_delta": round(delta_eth, 6),
+            "usdc_delta": round(delta_usdc, 2),
+            "usd_value": round(deposit_usd, 2),
+            "type": event_type,
+        }
+
+        dep_history = state["stats"].get("deposit_history", [])
+        dep_history.append(event)
+        if len(dep_history) > 20:
+            dep_history = dep_history[-20:]
+        state["stats"]["deposit_history"] = dep_history
+        state["stats"]["total_deposits_usd"] = round(
+            state["stats"].get("total_deposits_usd", 0) + deposit_usd, 2
+        )
+
+        type_cn = "存入" if deposit_usd > 0 else "取出"
+        log(
+            f"检测到{type_cn}: ~${abs(deposit_usd):.2f} (ETH {delta_eth:+.6f}, USDC {delta_usdc:+.2f})"
+        )
+        return deposit_usd
+
+    return None
+
+
+# ── v4: Trend-Adaptive Position Limits ──────────────────────────────────────
+
+
+def _get_position_limits(mtf: dict | None) -> tuple[int, int]:
+    """Return (max_pct, min_pct) for position limits based on trend."""
+    if not mtf:
+        return POSITION_MAX_PCT_DEFAULT, POSITION_MIN_PCT_DEFAULT
+
+    trend = mtf.get("trend", "neutral")
+    strength = mtf.get("strength", 0)
+
+    if trend == "bullish" and strength > 0.3:
+        # Allow holding more ETH in bullish market
+        max_pct = POSITION_MAX_PCT_DEFAULT + int(
+            (POSITION_MAX_PCT_BULLISH - POSITION_MAX_PCT_DEFAULT) * strength
+        )
+        min_pct = POSITION_MIN_PCT_DEFAULT
+        return max_pct, min_pct
+    elif trend == "bearish" and strength > 0.3:
+        max_pct = POSITION_MAX_PCT_DEFAULT
+        min_pct = POSITION_MIN_PCT_DEFAULT - int(
+            (POSITION_MIN_PCT_DEFAULT - POSITION_MIN_PCT_BEARISH) * strength
+        )
+        return max_pct, min_pct
+
+    return POSITION_MAX_PCT_DEFAULT, POSITION_MIN_PCT_DEFAULT
+
+
+# ── v4: Sell Optimization ───────────────────────────────────────────────────
+
+
+def _should_delay_sell(
+    state: dict,
+    current_level: int,
+    prev_level: int,
+    mtf: dict | None,
+    history: list[float],
+) -> str | None:
+    """v4: Check if we should delay sell in strong uptrend.
+    Returns skip reason or None."""
+    if not mtf:
+        return None
+
+    # If strong bullish momentum, delay sells to capture more upside
+    momentum_1h = mtf.get("momentum_1h", 0)
+    if momentum_1h > SELL_MOMENTUM_THRESHOLD * 100:
+        trend = mtf.get("trend", "neutral")
+        structure = mtf.get("structure", "ranging")
+        if trend == "bullish" and structure == "uptrend":
+            # Strong uptrend: skip this sell, let it ride
+            log(
+                f"  v4 sell delay: strong uptrend (1h momentum {momentum_1h:.2f}%, "
+                f"structure={structure})"
+            )
+            return f"trend_hold (momentum +{momentum_1h:.1f}%)"
+
+    # Trailing sell: wait a few ticks before selling to confirm reversal
+    trail = state.get("sell_trail_counter", {})
+    level_key = f"{prev_level}->{current_level}"
+    count = trail.get(level_key, 0)
+    if count < SELL_TRAIL_TICKS:
+        trail[level_key] = count + 1
+        state["sell_trail_counter"] = trail
+        remaining = SELL_TRAIL_TICKS - count - 1
+        log(f"  v4 sell trail: waiting {remaining} more ticks for level {level_key}")
+        return f"sell_trail ({count + 1}/{SELL_TRAIL_TICKS})"
+
+    # Clear trail counter after triggering
+    trail.pop(level_key, None)
+    state["sell_trail_counter"] = trail
+    return None
+
+
+# ── Core Logic ──────────────────────────────────────────────────────────────
+
+
+def tick():
+    """Main tick: check price, execute trade if grid crossing detected.
+    v4: multi-timeframe, signal-enhanced, sell-optimized."""
+    state = load_state()
+
+    # Circuit breaker check
+    errors = state.get("errors", {})
+    if errors.get("consecutive", 0) >= MAX_CONSECUTIVE_ERRORS:
+        cooldown = errors.get("cooldown_until")
+        if cooldown and datetime.fromisoformat(cooldown) > datetime.now():
+            remaining = (
+                datetime.fromisoformat(cooldown) - datetime.now()
+            ).seconds // 60
+            log(
+                f"CIRCUIT BREAKER: {errors['consecutive']} consecutive errors. "
+                f"Cooldown {remaining}min remaining."
+            )
+            _emit_json(
+                {
+                    "status": "circuit_breaker",
+                    "retriable": False,
+                    "hint": "cooldown_active",
+                    "remaining_min": remaining,
+                }
+            )
+            return
+        else:
+            log("Circuit breaker cooldown expired, resuming.")
+            errors["consecutive"] = 0
+            errors["cooldown_until"] = None
+
+    # Get current price
+    price = get_eth_price()
+    if not price:
+        errors["consecutive"] = errors.get("consecutive", 0) + 1
+        if errors["consecutive"] >= MAX_CONSECUTIVE_ERRORS:
+            errors["cooldown_until"] = (
+                datetime.now() + timedelta(seconds=COOLDOWN_AFTER_ERRORS)
+            ).isoformat()
+            log(f"CIRCUIT BREAKER TRIGGERED after {errors['consecutive']} errors")
+        state["errors"] = errors
+        save_state(state)
+        log("Failed to get price")
+        _emit_json(
+            {
+                "status": "error",
+                "reason": "price_fetch_failed",
+                "retriable": True,
+                "hint": "transient_api_error",
+            }
+        )
+        return
+
+    errors["consecutive"] = 0
+    state["errors"] = errors
+
+    # Update price history (keep last 288 = 24h at 5min intervals)
+    history = state.get("price_history", [])
+    history.append(price)
+    if len(history) > 288:
+        history = history[-288:]
+    state["price_history"] = history
+
+    # Get balances
+    eth_bal, usdc_bal = get_balances()
+    total_usd = eth_bal * price + usdc_bal
+
+    # Snapshot initial portfolio on first tick
+    if state["stats"].get("initial_portfolio_usd") is None:
+        state["stats"]["initial_portfolio_usd"] = round(total_usd, 2)
+        state["stats"]["initial_eth_price"] = round(price, 2)
+        log(f"Initial portfolio snapshot: ${total_usd:.2f} @ ETH ${price:.2f}")
+
+    # Detect external deposits/withdrawals
+    detected_deposit = _detect_deposits(state, eth_bal, usdc_bal, price)
+
+    # ── v4: Multi-timeframe analysis ──
+    mtf = analyze_multi_timeframe(history, price)
+    state["mtf_cache"] = mtf
+
+    # ── v4: K-line volatility (fetch every 1h) ──
+    kline_vol = None
+    kline_cache = state.get("kline_cache")
+    kline_stale = True
+    if kline_cache and kline_cache.get("fetched_at"):
+        elapsed = (
+            datetime.now() - datetime.fromisoformat(kline_cache["fetched_at"])
+        ).total_seconds()
+        kline_stale = elapsed > 3600  # refresh hourly
+    if kline_stale:
+        candles = get_kline_data("1H", 24)
+        if candles:
+            kline_vol = calc_kline_volatility(candles)
+            state["kline_cache"] = {
+                "atr_pct": round(kline_vol, 3),
+                "candles_count": len(candles),
+                "fetched_at": datetime.now().isoformat(),
+            }
+            log(f"v4 K-line ATR: {kline_vol:.2f}%")
+        else:
+            kline_vol = kline_cache.get("atr_pct") if kline_cache else None
+    else:
+        kline_vol = kline_cache.get("atr_pct") if kline_cache else None
+
+    # ── v4: Smart money signals (fetch every 15min) ──
+    signal = None
+    if SIGNAL_ENABLED:
+        sig_cache = state.get("signal_cache")
+        sig_stale = True
+        if sig_cache and sig_cache.get("fetched_at"):
+            elapsed = (
+                datetime.now() - datetime.fromisoformat(sig_cache["fetched_at"])
+            ).total_seconds()
+            sig_stale = elapsed > SIGNAL_COOLDOWN_SEC
+        if sig_stale:
+            signal = get_smart_money_signals()
+            state["signal_cache"] = signal
+            if signal.get("signals"):
+                log(
+                    f"v4 Signal: bullish_score={signal['bullish_score']:.2f}, "
+                    f"{len(signal['signals'])} signals"
+                )
+        else:
+            signal = sig_cache
+
+    # ── Stop-loss / trailing-stop / take-profit guard ──
+    if state.get("stop_triggered"):
+        trigger = state["stop_triggered"]
+        log(f"STOP ACTIVE: {trigger} -- trading halted")
+        save_state(state)
+        _send_discord_embed(
+            [
+                {
+                    "title": "\U0001f6d1 交易已停止",
+                    "color": 0xFF0000,
+                    "description": f"触发条件: **{trigger}**\n当前价格: ${price:.2f}\n组合价值: ${total_usd:.0f}\n\n使用 `resume-trading` 恢复交易",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            ]
+        )
+        _emit_json(
+            {
+                "status": "stopped",
+                "stop_triggered": trigger,
+                "portfolio_usd": round(total_usd, 2),
+                "price": round(price, 2),
+            }
+        )
+        return
+
+    stop_trigger = _check_stop_conditions(state, total_usd, price)
+    if stop_trigger:
+        state["stop_triggered"] = stop_trigger
+        log(f"STOP TRIGGERED: {stop_trigger}")
+        save_state(state)
+        _send_discord_embed(
+            [
+                {
+                    "title": "\U0001f6a8 止损/止盈触发!",
+                    "color": 0xFF0000,
+                    "description": f"**{stop_trigger}**\n价格: ${price:.2f}\n组合价值: ${total_usd:.0f}\n\n交易已自动停止。使用 `resume-trading` 恢复。",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            ]
+        )
+        _emit_json(
+            {
+                "status": "stop_triggered",
+                "trigger": stop_trigger,
+                "portfolio_usd": round(total_usd, 2),
+                "price": round(price, 2),
+            }
+        )
+        return
+
+    # ── Grid stability: only recalibrate when needed ──
+    grid = state.get("grid")
+    grid_set_at = state.get("grid_set_at")
+    need_recalibrate = False
+
+    if not grid:
+        need_recalibrate = True
+    elif price < grid["range"][0] - grid["step"]:
+        need_recalibrate = True
+        state.pop("upside_breakout_ticks", None)
+        log(f"Price ${price:.2f} BELOW grid {grid['range']} - recalibrating (downside)")
+    elif price > grid["range"][1] + grid["step"]:
+        ticks = state.get("upside_breakout_ticks", 0) + 1
+        state["upside_breakout_ticks"] = ticks
+        if ticks >= UPSIDE_CONFIRM_TICKS:
+            need_recalibrate = True
+            state.pop("upside_breakout_ticks", None)
+            log(
+                f"Price ${price:.2f} ABOVE grid {grid['range']} - recalibrating "
+                f"(confirmed after {ticks} ticks)"
+            )
+        else:
+            log(
+                f"Price ${price:.2f} above grid {grid['range']} - "
+                f"waiting confirmation ({ticks}/{UPSIDE_CONFIRM_TICKS})"
+            )
+    elif grid_set_at:
+        hours_since = (
+            datetime.now() - datetime.fromisoformat(grid_set_at)
+        ).total_seconds() / 3600
+        if hours_since > GRID_RECALIBRATE_HOURS:
+            need_recalibrate = True
+            log(
+                f"Grid age {hours_since:.1f}h > {GRID_RECALIBRATE_HOURS}h - recalibrating"
+            )
+    else:
+        need_recalibrate = True
+
+    # Reset upside breakout counter if price is back inside grid
+    if grid and grid["range"][0] <= price <= grid["range"][1] + grid["step"]:
+        if state.get("upside_breakout_ticks", 0) > 0:
+            log(f"Price ${price:.2f} back in grid range - reset upside counter")
+            state.pop("upside_breakout_ticks", None)
+
+    # Volatility shift detection
+    if not need_recalibrate and grid and len(history) >= 5:
+        cur_vol = calc_volatility(history)
+        avg_p = sum(history) / len(history)
+        cur_vol_pct = (cur_vol / avg_p) * 100 if avg_p > 0 else 0
+        grid_vol_pct = grid.get("vol_pct", 0)
+        if grid_vol_pct > 0:
+            vol_change_ratio = abs(cur_vol_pct - grid_vol_pct) / grid_vol_pct
+            if vol_change_ratio > VOL_RECALIBRATE_RATIO:
+                need_recalibrate = True
+                log(
+                    f"Volatility shift: {grid_vol_pct:.2f}% -> {cur_vol_pct:.2f}% "
+                    f"(delta {vol_change_ratio * 100:.0f}%) - recalibrating"
+                )
+
+    if need_recalibrate:
+        old_step = grid["step"] if grid else 0
+        old_center = grid["center"] if grid else price
+        grid = calc_dynamic_grid(price, history, mtf)
+
+        # Cap grid center shift
+        if old_center and old_center > 0:
+            max_shift = old_center * MAX_CENTER_SHIFT_PCT
+            new_center = grid["center"]
+            if abs(new_center - old_center) > max_shift:
+                capped_center = old_center + max_shift * (
+                    1 if new_center > old_center else -1
+                )
+                log(
+                    f"Center shift capped: ${new_center:.0f} -> ${capped_center:.0f} "
+                    f"(max {MAX_CENTER_SHIFT_PCT * 100:.0f}% from ${old_center:.0f})"
+                )
+                grid["center"] = round(capped_center, 2)
+                half_levels = grid["levels"] / 2
+                if grid.get("type") == "geometric" and capped_center > 0:
+                    ratio = 1 + (grid["step"] / capped_center)
+                    grid["level_prices"] = [
+                        round(capped_center * (ratio ** (i - half_levels)), 2)
+                        for i in range(grid["levels"] + 1)
+                    ]
+                    grid["range"] = [grid["level_prices"][0], grid["level_prices"][-1]]
+                else:
+                    half = grid["step"] * half_levels
+                    grid["level_prices"] = [
+                        round(capped_center - half + i * grid["step"], 2)
+                        for i in range(grid["levels"] + 1)
+                    ]
+                    grid["range"] = [
+                        round(capped_center - half, 2),
+                        round(capped_center + half, 2),
+                    ]
+
+        state["grid"] = grid
+        state["grid_set_at"] = datetime.now().isoformat()
+        new_level = price_to_level(price, grid)
+        state["current_level"] = new_level
+        # Clear sell trail counters on recalibration
+        state["sell_trail_counter"] = {}
+        step_change = f" (was ${old_step:.1f})" if old_step else ""
+        log(
+            f"Grid set: ${grid['range'][0]:.0f}-${grid['range'][1]:.0f} "
+            f"step=${grid['step']:.1f}{step_change} vol={grid.get('vol_pct', 0):.1f}% "
+            f"level={new_level}"
+        )
+
+    # Determine current grid level
+    current_level = price_to_level(price, grid)
+    prev_level = state.get("current_level")
+
+    state["stats"]["last_check"] = datetime.now().isoformat()
+
+    # Prepare output data
+    market_data = _calc_market_data(price, history, grid, mtf, signal, kline_vol)
+    eth_pct = round((eth_bal * price / total_usd) * 100, 1) if total_usd > 0 else 0
+    portfolio_data = {
+        "eth": round(eth_bal, 6),
+        "usdc": round(usdc_bal, 2),
+        "total_usd": round(total_usd, 2),
+        "eth_pct": eth_pct,
+    }
+
+    action = None
+    tx_hash = None
+    tick_status = "no_trade"
+    failure_info = None
+    direction = None
+
+    if prev_level is not None and current_level != prev_level:
+        direction = "SELL" if current_level > prev_level else "BUY"
+        skip_reason = None
+
+        # ── Cooldown: min interval between same-direction trades ──
+        last_trade_times = state.get("last_trade_times", {})
+        last_time_str = last_trade_times.get(direction)
+        if last_time_str:
+            elapsed = (
+                datetime.now() - datetime.fromisoformat(last_time_str)
+            ).total_seconds()
+            if elapsed < MIN_TRADE_INTERVAL:
+                skip_reason = f"cooldown ({int(MIN_TRADE_INTERVAL - elapsed)}s left)"
+                tick_status = "cooldown"
+
+        # ── v4: Trend-adaptive position limits ──
+        if not skip_reason:
+            pos_max, pos_min = _get_position_limits(mtf)
+            if direction == "BUY" and eth_pct > pos_max:
+                skip_reason = f"ETH-heavy ({eth_pct:.0f}% > {pos_max}%)"
+                tick_status = "position_limit"
+            elif direction == "SELL" and eth_pct < pos_min:
+                skip_reason = f"USDC-heavy ({eth_pct:.0f}% < {pos_min}%)"
+                tick_status = "position_limit"
+
+        # ── Anti-repeat: skip same boundary trade ──
+        if not skip_reason:
+            last_trade = state["trades"][-1] if state["trades"] else None
+            if (
+                last_trade
+                and last_trade["direction"] == direction
+                and last_trade["grid_to"] == current_level
+                and last_trade["grid_from"] == prev_level
+            ):
+                skip_reason = "repeat boundary"
+                tick_status = "skip_repeat"
+
+        # ── Consecutive same-direction limit ──
+        if not skip_reason:
+            recent = state.get("trades", [])[-MAX_SAME_DIR_TRADES:]
+            if len(recent) >= MAX_SAME_DIR_TRADES and all(
+                t["direction"] == direction for t in recent
+            ):
+                last_trade_time = datetime.fromisoformat(recent[-1]["time"])
+                grid_set_time = datetime.fromisoformat(
+                    state.get("grid_set_at", recent[-1]["time"])
+                )
+                time_since_last = (datetime.now() - last_trade_time).total_seconds()
+                grid_recalibrated = grid_set_time > last_trade_time
+                if grid_recalibrated or time_since_last > 3600:
+                    reason = (
+                        "grid recalibrated"
+                        if grid_recalibrated
+                        else f"{time_since_last / 60:.0f}min elapsed"
+                    )
+                    log(f"Consecutive {direction} limit reset ({reason})")
+                else:
+                    skip_reason = (
+                        f"consecutive {direction} limit ({MAX_SAME_DIR_TRADES})"
+                    )
+                    tick_status = "consecutive_limit"
+
+        # ── Rapid drop detection: don't buy into a falling knife ──
+        if not skip_reason and direction == "BUY":
+            recent_prices = history[-6:]
+            if len(recent_prices) >= 3:
+                drop_pct = (
+                    (recent_prices[-1] - max(recent_prices)) / max(recent_prices) * 100
+                )
+                if drop_pct < -2.0:
+                    skip_reason = f"rapid drop ({drop_pct:.1f}% in 30min)"
+                    tick_status = "rapid_drop"
+
+        # ── v4: Sell delay in strong uptrend ──
+        if not skip_reason and direction == "SELL":
+            sell_delay = _should_delay_sell(
+                state, current_level, prev_level, mtf, history
+            )
+            if sell_delay:
+                skip_reason = sell_delay
+                tick_status = "sell_delayed"
+
+        if skip_reason:
+            log(f"SKIP {direction} L{prev_level}-L{current_level}: {skip_reason}")
+            direction = None
+        else:
+            # Clear sell trail counter on execution
+            trail = state.get("sell_trail_counter", {})
+            level_key = f"{prev_level}->{current_level}"
+            trail.pop(level_key, None)
+            state["sell_trail_counter"] = trail
+
+            # Calculate trade amount (v4: with MTF and signal)
+            amount, calc_fail = calc_trade_amount(
+                direction,
+                eth_bal,
+                usdc_bal,
+                price,
+                current_level=current_level,
+                grid_levels=GRID_LEVELS,
+                mtf=mtf,
+                signal=signal,
+            )
+
+            if amount:
+                log(
+                    f"GRID CROSSING: L{prev_level}-L{current_level} | "
+                    f"${price:.2f} | {direction} | trend={mtf.get('trend', 'N/A')}"
+                )
+                tx_hash, swap_fail = execute_swap(direction, amount, price)
+
+                if tx_hash:
+                    _record_attempt(state, direction, True)
+                    trade_usd = (
+                        (amount / 1e18 * price)
+                        if direction == "SELL"
+                        else (amount / 1e6)
+                    )
+                    levels_crossed = abs(current_level - prev_level)
+                    grid_step = grid.get("step", 0)
+                    trade_eth = trade_usd / price if price else 0
+                    est_profit = (
+                        round(levels_crossed * grid_step * trade_eth, 2)
+                        if direction == "SELL"
+                        else 0
+                    )
+                    trade_record = {
+                        "time": datetime.now().isoformat(),
+                        "direction": direction,
+                        "price": round(price, 2),
+                        "amount_usd": round(trade_usd, 2),
+                        "est_profit": est_profit,
+                        "tx": tx_hash,
+                        "grid_from": prev_level,
+                        "grid_to": current_level,
+                        "trend": mtf.get("trend", "neutral"),
+                        "signal_score": signal.get("bullish_score", 0) if signal else 0,
+                    }
+                    state["trades"].append(trade_record)
+                    if len(state["trades"]) > 50:
+                        state["trades"] = state["trades"][-50:]
+                    state["stats"]["total_trades"] += 1
+                    if direction == "SELL":
+                        state["stats"]["total_sell_usdc"] = round(
+                            state["stats"].get("total_sell_usdc", 0) + trade_usd, 2
+                        )
+                    else:
+                        state["stats"]["total_buy_usdc"] = round(
+                            state["stats"].get("total_buy_usdc", 0) + trade_usd, 2
+                        )
+                    _total_usd = eth_bal * price + usdc_bal
+                    _initial = state["stats"].get("initial_portfolio_usd") or 0
+                    _deposits = state["stats"].get("total_deposits_usd", 0)
+                    state["stats"]["realized_pnl"] = round(
+                        _total_usd - _initial - _deposits, 2
+                    )
+                    state["stats"]["grid_profit"] = round(
+                        state["stats"].get("grid_profit", 0) + est_profit, 2
+                    )
+                    dir_cn = "卖出" if direction == "SELL" else "买入"
+                    profit_str = f" (利润 ~${est_profit:.2f})" if est_profit > 0 else ""
+                    action = f"{dir_cn} ${trade_usd:.2f}{profit_str}"
+                    tick_status = "trade_executed"
+                    log(f"TX: https://basescan.org/tx/{tx_hash}")
+                    state["current_level"] = current_level
+                    if "last_trade_times" not in state:
+                        state["last_trade_times"] = {}
+                    state["last_trade_times"][direction] = datetime.now().isoformat()
+                else:
+                    _record_attempt(state, direction, False)
+                    log(f"Trade execution failed: {swap_fail}")
+                    dir_cn = "卖出" if direction == "SELL" else "买入"
+                    action = f"{dir_cn} 失败"
+                    tick_status = "trade_failed"
+                    failure_info = swap_fail
+                    state["last_failed_trade"] = {
+                        "direction": direction,
+                        "price": price,
+                        "grid_from": prev_level,
+                        "grid_to": current_level,
+                        "time": datetime.now().isoformat(),
+                    }
+            else:
+                log(f"Skipped trade: {calc_fail}")
+                action = f"{direction} skipped"
+                tick_status = "trade_skipped"
+                failure_info = calc_fail
+    else:
+        if prev_level is None:
+            state["current_level"] = current_level
+            log(f"Grid initialized at level {current_level}")
+            tick_status = "initialized"
+
+    # Save balance snapshot
+    state["last_balances"] = {
+        "eth": round(eth_bal, 6),
+        "usdc": round(usdc_bal, 2),
+        "time": datetime.now().isoformat(),
+    }
+    save_state(state)
+
+    # Output summary
+    display_level = state.get("current_level", current_level)
+    grid_range = f"${grid['range'][0]:.0f}-${grid['range'][1]:.0f}"
+    initial = state["stats"].get("initial_portfolio_usd")
+    deposits = state["stats"].get("total_deposits_usd", 0)
+    cost_basis = (initial or 0) + deposits
+    total_pnl = round(total_usd - cost_basis, 2) if initial else 0
+    grid_profit = state["stats"].get("grid_profit", 0)
+    trades_count = state["stats"].get("total_trades", 0)
+    has_event = bool(action or detected_deposit)
+
+    # HODL comparison
+    initial_price = state["stats"].get("initial_eth_price")
+    hodl_alpha = None
+    if initial and initial_price and initial_price > 0:
+        initial_eth = initial / initial_price
+        hodl_value = initial_eth * price
+        hodl_alpha = round(total_usd - hodl_value, 2)
+
+    # Quiet mode
+    should_print = True
+    if not has_event:
+        last_quiet = state.get("last_quiet_report")
+        now_iso = datetime.now().isoformat()
+        if last_quiet:
+            elapsed = (
+                datetime.now() - datetime.fromisoformat(last_quiet)
+            ).total_seconds()
+            if elapsed < QUIET_INTERVAL:
+                should_print = False
+        if should_print:
+            state["last_quiet_report"] = now_iso
+            save_state(state)
+
+    if should_print:
+        pnl_emoji = "\U0001f7e2" if total_pnl >= 0 else "\U0001f534"
+        pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
+        trend_str = mtf.get("trend", "?") if mtf else "?"
+        vol_info = (
+            f" | 波动 {grid.get('vol_pct', 0):.1f}%" if grid.get("vol_pct") else ""
+        )
+        trend_info = f" | 趋势 {trend_str}" if trend_str != "?" else ""
+        grid_footer = (
+            f"网格 {grid_range} | 步长 ${grid['step']:.1f}{vol_info}{trend_info}"
+        )
+        alpha_str = f" | Alpha ${hodl_alpha:+.2f}" if hodl_alpha is not None else ""
+
+        if has_event:
+            dir_cn = action if action else ""
+            embed_color = 0x00C853 if "卖出" in dir_cn else 0x2979FF
+            fields = [
+                {"name": "价格", "value": f"${price:.2f}", "inline": True},
+                {
+                    "name": "层级",
+                    "value": f"L{display_level}/{GRID_LEVELS}",
+                    "inline": True,
+                },
+                {"name": "总值", "value": f"${total_usd:.0f}", "inline": True},
+                {
+                    "name": "持仓",
+                    "value": f"{eth_bal:.4f} ETH + ${usdc_bal:.1f} USDC",
+                    "inline": False,
+                },
+                {"name": "总收益", "value": pnl_str, "inline": True},
+                {"name": "网格利润", "value": f"${grid_profit:+.2f}", "inline": True},
+                {
+                    "name": "交易次数",
+                    "value": f"{trades_count} | [BaseScan](https://basescan.org/tx/{tx_hash})"
+                    if tx_hash
+                    else str(trades_count),
+                    "inline": True,
+                },
+            ]
+            if hodl_alpha is not None:
+                fields.append(
+                    {
+                        "name": "HODL Alpha",
+                        "value": f"${hodl_alpha:+.2f}",
+                        "inline": True,
+                    }
+                )
+            if mtf:
+                fields.append(
+                    {
+                        "name": "趋势",
+                        "value": f"{mtf.get('trend', 'N/A')} ({mtf.get('strength', 0):.0%})",
+                        "inline": True,
+                    }
+                )
+            if detected_deposit:
+                dep_cn = "存入" if detected_deposit > 0 else "取出"
+                fields.append(
+                    {
+                        "name": f"检测到{dep_cn}",
+                        "value": f"${abs(detected_deposit):.2f} (已调整收益基准)",
+                        "inline": False,
+                    }
+                )
+            embed = {
+                "title": f"\u26a1 {dir_cn}",
+                "color": embed_color,
+                "fields": fields,
+                "footer": {"text": grid_footer},
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        else:
+            desc = (
+                f"**${price:.2f}** | L{display_level}/{GRID_LEVELS} | "
+                f"{eth_bal:.4f} ETH + ${usdc_bal:.1f} USDC = ${total_usd:.0f}\n"
+                f"{pnl_emoji} 收益 {pnl_str} | 网格利润 ${grid_profit:+.2f} | {trades_count}笔{alpha_str}"
+            )
+            if deposits != 0:
+                desc += f" | 资金调整 ${deposits:+.0f}"
+            embed = {
+                "title": "\u23f3 ETH 网格 v4 -- 运行中",
+                "color": 0x9E9E9E,
+                "description": desc,
+                "footer": {"text": grid_footer},
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+        sent = _send_discord_embed([embed])
+        if not sent:
+            pnl_sign = "+" if total_pnl >= 0 else ""
+            summary = (
+                f"**ETH** `${price:.2f}` | L`{display_level}`/`{GRID_LEVELS}` "
+                f"| 网格 {grid_range} (步长 `${grid['step']:.1f}`) "
+                f"| `{eth_bal:.4f}` ETH + `${usdc_bal:.1f}` USDC (`${total_usd:.0f}`)"
+            )
+            summary += f"\n> 总收益 `{pnl_sign}${total_pnl:.2f}` | 网格利润 `${grid_profit:+.2f}` | 交易 `{trades_count}` 笔{alpha_str}"
+            if action:
+                summary += f" | **{action}**"
+                if tx_hash:
+                    summary += f"\n<https://basescan.org/tx/{tx_hash}>"
+            else:
+                summary += " | 无交易"
+            print(summary)
+
+    # Output structured JSON for AI agent
+    if should_print:
+        json_data = {
+            "status": tick_status,
+            "version": "4.0",
+            "market": market_data,
+            "portfolio": portfolio_data,
+            "grid_level": display_level,
+            "prev_level": prev_level,
+            "success_rate": _success_rate_data(state),
+            "cost_basis": cost_basis,
+            "total_deposits_usd": deposits,
+            "hodl_alpha": hodl_alpha,
+        }
+        if detected_deposit:
+            json_data["detected_deposit_usd"] = round(detected_deposit, 2)
+        if direction:
+            json_data["direction"] = direction
+        if tx_hash:
+            json_data["tx_hash"] = tx_hash
+        if failure_info:
+            json_data.update(
+                {
+                    "failure_reason": failure_info.get("reason", "unknown"),
+                    "failure_detail": failure_info.get("detail", ""),
+                    "retriable": failure_info.get("retriable", False),
+                    "retry_hint": failure_info.get("hint", ""),
+                }
+            )
+            if failure_info.get("simulation"):
+                json_data["simulation"] = failure_info["simulation"]
+        _emit_json(json_data)
+
+
+# ── Sub-commands ────────────────────────────────────────────────────────────
+
+
+def status():
+    """Print current status (v4 enriched)."""
+    state = load_state()
+    price = get_eth_price()
+    eth_bal, usdc_bal = get_balances()
+
+    grid = state.get("grid")
+    total_usd = eth_bal * (price or 0) + usdc_bal
+    stats = state.get("stats", {})
+    history = state.get("price_history", [])
+
+    print("**ETH 网格机器人 v4 -- 状态**")
+    print(f"> 价格: `${price:.2f}`" if price else "> 价格: 不可用")
+    print(
+        f"> 余额: `{eth_bal:.6f}` ETH + `${usdc_bal:.2f}` USDC = **`${total_usd:.0f}`**"
+    )
+
+    if grid:
+        print(
+            f"> 网格: `${grid['range'][0]:.0f}`-`${grid['range'][1]:.0f}` | "
+            f"步长 `${grid['step']:.1f}` | 中心 `${grid['center']:.0f}`"
+        )
+        print(f"> 层级: `{state.get('current_level', '?')}`/`{GRID_LEVELS}`")
+    else:
+        print("> 网格: 未初始化")
+
+    # MTF info
+    if price and len(history) >= MTF_SHORT_PERIOD:
+        mtf = analyze_multi_timeframe(history, price)
+        print("\n**多时间框架分析**")
+        print(
+            f"> 趋势: `{mtf['trend']}` (强度 `{mtf['strength']:.0%}`) | 结构: `{mtf['structure']}`"
+        )
+        print(
+            f"> 动量: 1h `{mtf['momentum_1h']:+.2f}%` | 4h `{mtf['momentum_4h']:+.2f}%`"
+        )
+        print(
+            f"> EMA: 短 `${mtf['ema_short']:.1f}` | 中 `${mtf['ema_medium']:.1f}` | 长 `${mtf['ema_long']:.1f}`"
+        )
+
+    # PnL
+    initial = stats.get("initial_portfolio_usd")
+    deposits = stats.get("total_deposits_usd", 0)
+    grid_profit = stats.get("grid_profit", 0)
+    sell_total = stats.get("total_sell_usdc", 0)
+    buy_total = stats.get("total_buy_usdc", 0)
+    print("\n**收益统计**")
+    if initial and price:
+        cost_basis = initial + deposits
+        total_pnl = round(total_usd - cost_basis, 2)
+        holding_pnl = round(total_pnl - grid_profit, 2)
+        pct = (total_pnl / cost_basis) * 100 if cost_basis else 0
+        print(
+            f"> 总收益: **`${total_pnl:+.2f}`** (`{pct:+.1f}%`)  起始 `${initial:.0f}`"
+        )
+        print(
+            f"> 网格利润: `${grid_profit:+.2f}` (卖出赚差价) | 持仓浮盈: `${holding_pnl:+.2f}` (ETH涨跌)"
+        )
+        print(f"> 交易量: 卖出 `${sell_total:.2f}` | 买入 `${buy_total:.2f}`")
+
+        # HODL comparison
+        initial_price = stats.get("initial_eth_price")
+        if initial_price and initial_price > 0:
+            initial_eth = initial / initial_price
+            hodl_value = initial_eth * price
+            hodl_alpha = round(total_usd - hodl_value, 2)
+            hodl_pct = round((price - initial_price) / initial_price * 100, 2)
+            print(
+                f"> HODL对比: ETH `{hodl_pct:+.1f}%` | HODL价值 `${hodl_value:.0f}` | **Alpha `${hodl_alpha:+.2f}`**"
+            )
+
+        if deposits != 0:
+            print(f"> 资金调整: `${deposits:+.2f}` | 成本基准 `${cost_basis:.0f}`")
+
+    # Signal info
+    sig = state.get("signal_cache")
+    if sig and sig.get("signals"):
+        print("\n**智能信号**")
+        print(
+            f"> 看涨评分: `{sig['bullish_score']:.2f}` | 信号数: `{len(sig['signals'])}`"
+        )
+
+    # Success rate
+    print(f"\n> 成功率: `{_success_rate_str(state)}`")
+
+    # Stop status
+    stop_trigger = state.get("stop_triggered")
+    if stop_trigger:
+        print(f"\n> \U0001f6d1 **交易已停止**: `{stop_trigger}`")
+        print("> 使用 `resume-trading` 恢复交易")
+
+    # Strategy info
+    print("\n**策略配置 v4**")
+    print(f"> 资金策略: `{SIZING_STRATEGY}` | 网格类型: `{GRID_TYPE}`")
+    print(
+        f"> 步长范围: `{STEP_MIN_PCT * 100:.1f}%`-`{STEP_MAX_PCT * 100:.1f}%` | 卖出追踪: `{SELL_TRAIL_TICKS}` ticks"
+    )
+    parts = []
+    if STOP_LOSS_PCT > 0:
+        parts.append(f"止损 {STOP_LOSS_PCT * 100:.0f}%")
+    if TRAILING_STOP_PCT > 0:
+        parts.append(f"追踪止损 {TRAILING_STOP_PCT * 100:.0f}%")
+    if TAKE_PROFIT_PCT > 0:
+        parts.append(f"止盈 {TAKE_PROFIT_PCT * 100:.0f}%")
+    if parts:
+        peak = stats.get("portfolio_peak_usd")
+        peak_str = f" | 峰值 `${peak:.0f}`" if peak else ""
+        print(f"> 保护: {' | '.join(parts)}{peak_str}")
+
+
+def report():
+    """Generate daily report (v4 enriched with trend + alpha)."""
+    state = load_state()
+    price = get_eth_price()
+    eth_bal, usdc_bal = get_balances()
+    total_usd = eth_bal * (price or 0) + usdc_bal
+
+    stats = state.get("stats", {})
+    trades = state.get("trades", [])
+    grid = state.get("grid", {})
+    history = state.get("price_history", [])
+
+    today = datetime.now().date().isoformat()
+    today_trades = [t for t in trades if t["time"].startswith(today)]
+
+    if history:
+        price_high = max(history)
+        price_low = min(history)
+        volatility = calc_volatility(history)
+        vol_pct = (volatility / (sum(history) / len(history))) * 100 if history else 0
+    else:
+        price_high = price_low = price or 0
+        vol_pct = 0
+
+    print("**ETH 网格机器人 v4 -- 每日报告**")
+    print(f"> 当前价格: `${price:.2f}`" if price else "> 当前价格: N/A")
+    print(
+        f"> 24h 范围: `${price_low:.2f}` - `${price_high:.2f}` | 波动率: `{vol_pct:.1f}%`"
+    )
+
+    # MTF
+    if price and len(history) >= MTF_SHORT_PERIOD:
+        mtf = analyze_multi_timeframe(history, price)
+        print(
+            f"> 趋势: `{mtf['trend']}` ({mtf['strength']:.0%}) | 结构: `{mtf['structure']}`"
+        )
+        print(
+            f"> 动量: 1h `{mtf['momentum_1h']:+.2f}%` | 4h `{mtf['momentum_4h']:+.2f}%`"
+        )
+
+    print("\n**持仓**")
+    print(f"> `{eth_bal:.4f}` ETH + `${usdc_bal:.2f}` USDC = **`${total_usd:.0f}`**")
+    if grid:
+        print(
+            f"> 网格: `${grid.get('range', [0, 0])[0]:.0f}`-`${grid.get('range', [0, 0])[1]:.0f}` "
+            f"(步长 `${grid.get('step', 0):.1f}`) | 层级 `{state.get('current_level', '?')}`/`{GRID_LEVELS}`"
+        )
+
+    # PnL
+    initial = stats.get("initial_portfolio_usd")
+    deposits = stats.get("total_deposits_usd", 0)
+    grid_profit = stats.get("grid_profit", 0)
+    sell_total = stats.get("total_sell_usdc", 0)
+    buy_total = stats.get("total_buy_usdc", 0)
+    print("\n**收益**")
+    if initial and price:
+        cost_basis = initial + deposits
+        total_pnl = round(total_usd - cost_basis, 2)
+        pct = (total_pnl / cost_basis) * 100 if cost_basis else 0
+        holding_pnl = round(total_pnl - grid_profit, 2)
+        print(
+            f"> 总收益: **`${total_pnl:+.2f}` (`{pct:+.1f}%`)**  起始 `${initial:.0f}`"
+        )
+        print(f"> 网格利润: `${grid_profit:+.2f}` | 持仓浮盈: `${holding_pnl:+.2f}`")
+        print(f"> 交易量: 卖出 `${sell_total:.2f}` | 买入 `${buy_total:.2f}`")
+
+        # HODL comparison
+        initial_price = stats.get("initial_eth_price")
+        if initial_price and initial_price > 0:
+            initial_eth = initial / initial_price
+            hodl_value = initial_eth * price
+            hodl_alpha = round(total_usd - hodl_value, 2)
+            print(f"> **HODL Alpha: `${hodl_alpha:+.2f}`**")
+
+    print(f"\n> 成功率: `{_success_rate_str(state)}`")
+
+    # 今日交易
+    print(f"\n**今日交易: `{len(today_trades)}` 笔**")
+    if today_trades:
+        for t in today_trades[-10:]:
+            dir_cn = "卖出" if t["direction"] == "SELL" else "买入"
+            est = t.get("est_profit", 0)
+            profit_str = f" 利润~`${est:.2f}`" if est > 0 else ""
+            trend = t.get("trend", "")
+            trend_str = f" [{trend}]" if trend else ""
+            print(
+                f"> `{t['time'][11:19]}` {dir_cn} `${t['amount_usd']:.2f}` @ `${t['price']:.2f}`{profit_str}{trend_str}"
+            )
+    else:
+        print("> 今日暂无交易")
+
+    print(
+        f"\n> 累计交易: `{stats.get('total_trades', 0)}` 笔 | 运行自: `{stats.get('started_at', '未知')[:10]}`"
+    )
+
+
+def history_cmd():
+    """Show recent trade history."""
+    state = load_state()
+    trades = state.get("trades", [])
+    if not trades:
+        print("暂无交易记录")
+        return
+
+    print(f"**最近 `{len(trades)}` 笔交易**")
+    for t in trades:
+        dir_cn = "卖出" if t["direction"] == "SELL" else "买入"
+        est = t.get("est_profit", 0)
+        profit_str = f" | 利润~`${est:.2f}`" if est > 0 else ""
+        trend = t.get("trend", "")
+        trend_str = f" [{trend}]" if trend else ""
+        print(
+            f"> `{t['time'][:19]}` | {dir_cn} `${t['amount_usd']:>8.2f}` "
+            f"@ `${t['price']:.2f}` | L`{t['grid_from']}`->L`{t['grid_to']}`{profit_str}{trend_str} "
+            f"| `{t['tx'][:16]}...`"
+        )
+
+
+def reset():
+    """Reset state (recalibrate grid from scratch)."""
+    price = get_eth_price()
+    eth_bal, usdc_bal = get_balances()
+
+    state = load_state()
+    old_trades = state.get("trades", [])
+    old_stats = state.get("stats", {})
+
+    new_state = {
+        "version": 5,
+        "grid": None,
+        "current_level": None,
+        "price_history": [price] if price else [],
+        "trades": old_trades,
+        "stats": {
+            "total_trades": old_stats.get("total_trades", 0),
+            "total_sell_usdc": old_stats.get("total_sell_usdc", 0.0),
+            "total_buy_usdc": old_stats.get("total_buy_usdc", 0.0),
+            "realized_pnl": old_stats.get("realized_pnl", 0.0),
+            "grid_profit": old_stats.get("grid_profit", 0.0),
+            "initial_portfolio_usd": None,
+            "initial_eth_price": None,
+            "started_at": datetime.now().isoformat(),
+            "last_check": datetime.now().isoformat(),
+            "trade_attempts": 0,
+            "trade_successes": 0,
+            "trade_failures": 0,
+            "sell_attempts": 0,
+            "sell_successes": 0,
+            "buy_attempts": 0,
+            "buy_successes": 0,
+            "retry_attempts": 0,
+            "retry_successes": 0,
+            "total_deposits_usd": 0.0,
+            "deposit_history": [],
+        },
+        "errors": {"consecutive": 0, "cooldown_until": None},
+        "last_failed_trade": None,
+        "last_balances": None,
+        "grid_set_at": None,
+        "last_trade_times": {},
+        "mtf_cache": None,
+        "signal_cache": None,
+        "kline_cache": None,
+        "sell_trail_counter": {},
+    }
+    save_state(new_state)
+
+    total = eth_bal * (price or 0) + usdc_bal
+    print(f"网格已重置 (v4)。价格: `${price:.2f}`, 余额: `${total:.0f}`")
+    print("计数器已重置。下次 tick 时将重新校准网格。")
+
+
+def retry():
+    """Retry the last failed trade with a fresh quote."""
+    state = load_state()
+    last_fail = state.get("last_failed_trade")
+
+    if not last_fail:
+        print("无需重试")
+        _emit_json({"status": "no_retry_needed"})
+        return
+
+    fail_time = datetime.fromisoformat(last_fail["time"])
+    if (datetime.now() - fail_time).total_seconds() > 600:
+        print("上次失败交易已超过10分钟，跳过重试")
+        _emit_json({"status": "retry_expired", "failed_at": last_fail["time"]})
+        state.pop("last_failed_trade", None)
+        save_state(state)
+        return
+
+    direction = last_fail["direction"]
+    dir_cn = "卖出" if direction == "SELL" else "买入"
+    price = get_eth_price()
+    if not price:
+        print("无法重试: 价格不可用")
+        _emit_json({"status": "error", "reason": "price_fetch_failed"})
+        return
+
+    eth_bal, usdc_bal = get_balances()
+    amount, calc_fail = calc_trade_amount(direction, eth_bal, usdc_bal, price)
+
+    if not amount:
+        print(f"无法重试: {calc_fail}")
+        _emit_json(
+            {"status": "retry_failed", "reason": calc_fail.get("reason", "unknown")}
+        )
+        return
+
+    log(
+        f"RETRY: {direction} at ${price:.2f} (original fail at ${last_fail['price']:.2f})"
+    )
+    tx_hash, swap_fail = execute_swap(direction, amount, price)
+
+    if tx_hash:
+        _record_attempt(state, direction, True, is_retry=True)
+        trade_usd = (amount / 1e18 * price) if direction == "SELL" else (amount / 1e6)
+        trade_record = {
+            "time": datetime.now().isoformat(),
+            "direction": direction,
+            "price": round(price, 2),
+            "amount_usd": round(trade_usd, 2),
+            "tx": tx_hash,
+            "grid_from": last_fail["grid_from"],
+            "grid_to": last_fail["grid_to"],
+            "trend": "retry",
+        }
+        state["trades"].append(trade_record)
+        if len(state["trades"]) > 50:
+            state["trades"] = state["trades"][-50:]
+        state["stats"]["total_trades"] += 1
+        if direction == "SELL":
+            state["stats"]["total_sell_usdc"] = round(
+                state["stats"].get("total_sell_usdc", 0) + trade_usd, 2
+            )
+        else:
+            state["stats"]["total_buy_usdc"] = round(
+                state["stats"].get("total_buy_usdc", 0) + trade_usd, 2
+            )
+        _total_usd = eth_bal * price + usdc_bal
+        _initial = state["stats"].get("initial_portfolio_usd") or 0
+        _deposits = state["stats"].get("total_deposits_usd", 0)
+        state["stats"]["realized_pnl"] = round(_total_usd - _initial - _deposits, 2)
+        state.pop("last_failed_trade", None)
+        save_state(state)
+        print(f"**重试成功**: {dir_cn} `${trade_usd:.2f}` @ `${price:.2f}`")
+        log(f"RETRY TX: https://basescan.org/tx/{tx_hash}")
+        _emit_json(
+            {
+                "status": "retry_success",
+                "direction": direction,
+                "tx_hash": tx_hash,
+                "amount_usd": round(trade_usd, 2),
+            }
+        )
+    else:
+        _record_attempt(state, direction, False, is_retry=True)
+        save_state(state)
+        print(
+            f"**重试失败**: {dir_cn} -- {swap_fail.get('reason', '未知') if swap_fail else '未知'}"
+        )
+        log(f"RETRY FAILED: {swap_fail}")
+        _emit_json(
+            {
+                "status": "retry_failed",
+                "direction": direction,
+                "failure_reason": swap_fail.get("reason", "unknown")
+                if swap_fail
+                else "unknown",
+            }
+        )
+
+
+def analyze():
+    """Output detailed market analysis JSON for AI agent (v4 enriched)."""
+    state = load_state()
+    price = get_eth_price()
+    eth_bal, usdc_bal = get_balances()
+    history = state.get("price_history", [])
+    grid = state.get("grid")
+    trades = state.get("trades", [])
+    stats = state.get("stats", {})
+
+    if not price:
+        print(json.dumps({"error": "price_unavailable"}))
+        return
+
+    total_usd = eth_bal * price + usdc_bal
+
+    # MTF analysis
+    mtf = analyze_multi_timeframe(history, price)
+
+    # K-line ATR
+    candles = get_kline_data("1H", 24)
+    kline_vol = calc_kline_volatility(candles) if candles else None
+
+    # Signal
+    signal = get_smart_money_signals() if SIGNAL_ENABLED else None
+
+    # Price changes
+    def pct_change(window):
+        if len(history) < window:
+            return None
+        old = history[-window]
+        return round(((price - old) / old) * 100, 2)
+
+    price_changes = {
+        "1h": pct_change(12),
+        "4h": pct_change(48),
+        "24h": pct_change(288),
+    }
+
+    # Volatility trend
+    vol_recent = calc_volatility(history[-24:]) if len(history) >= 24 else None
+    vol_older = calc_volatility(history[-72:-24]) if len(history) >= 72 else None
+    if vol_recent and vol_older and vol_older > 0:
+        vol_trend = (
+            "increasing"
+            if vol_recent > vol_older * 1.2
+            else "decreasing"
+            if vol_recent < vol_older * 0.8
+            else "stable"
+        )
+    else:
+        vol_trend = "insufficient_data"
+
+    # Grid efficiency
+    grid_efficiency = None
+    if grid and len(history) >= 12:
+        grid_low, grid_high = grid["range"]
+        recent = history[-12:]
+        in_grid = sum(1 for p in recent if grid_low <= p <= grid_high)
+        grid_efficiency = round(in_grid / len(recent), 2)
+
+    # HODL alpha
+    initial = stats.get("initial_portfolio_usd")
+    initial_price = stats.get("initial_eth_price")
+    hodl_alpha = None
+    if initial and initial_price and initial_price > 0:
+        initial_eth = initial / initial_price
+        hodl_value = initial_eth * price
+        hodl_alpha = round(total_usd - hodl_value, 2)
+
+    # Round trip analysis (last 20 trades)
+    round_trips = []
+    buy_stack = []
+    for t in trades[-20:]:
+        if t["direction"] == "BUY":
+            buy_stack.append(t)
+        else:
+            for j in range(len(buy_stack) - 1, -1, -1):
+                if buy_stack[j]["grid_to"] == t["grid_from"]:
+                    matched_buy = buy_stack.pop(j)
+                    spread = (
+                        (t["price"] - matched_buy["price"]) / matched_buy["price"] * 100
+                    )
+                    hold_min = 0
+                    try:
+                        hold_min = int(
+                            (
+                                datetime.fromisoformat(t["time"])
+                                - datetime.fromisoformat(matched_buy["time"])
+                            ).total_seconds()
+                            / 60
+                        )
+                    except Exception:
+                        pass
+                    round_trips.append(
+                        {
+                            "buy_price": matched_buy["price"],
+                            "sell_price": t["price"],
+                            "spread_pct": round(spread, 3),
+                            "hold_min": hold_min,
+                            "status": "good"
+                            if spread >= 0.3
+                            else "micro"
+                            if spread > 0
+                            else "loss",
+                        }
+                    )
+                    break
+
+    analysis = {
+        "version": "4.0",
+        "timestamp": datetime.now().isoformat(),
+        "market": {
+            "price": round(price, 2),
+            "ema_20": round(calc_ema(history, min(EMA_PERIOD, len(history))), 2)
+            if history
+            else price,
+            "price_changes": price_changes,
+            "volatility_pct": round(
+                (calc_volatility(history) / (sum(history) / len(history))) * 100, 2
+            )
+            if len(history) >= 2
+            else 0,
+            "volatility_trend": vol_trend,
+            "kline_atr_pct": round(kline_vol, 2) if kline_vol else None,
+        },
+        "multi_timeframe": mtf,
+        "signal": {
+            "bullish_score": signal.get("bullish_score", 0) if signal else 0,
+            "signal_count": len(signal.get("signals", [])) if signal else 0,
+            "signals": signal.get("signals", []) if signal else [],
+        },
+        "portfolio": {
+            "eth": round(eth_bal, 6),
+            "usdc": round(usdc_bal, 2),
+            "total_usd": round(total_usd, 2),
+            "eth_pct": round((eth_bal * price / total_usd) * 100, 1)
+            if total_usd > 0
+            else 0,
+        },
+        "pnl": {
+            "total_pnl": round(
+                total_usd - ((initial or 0) + stats.get("total_deposits_usd", 0)), 2
+            ),
+            "grid_profit": stats.get("grid_profit", 0),
+            "hodl_alpha": hodl_alpha,
+        },
+        "grid": {
+            "range": grid["range"] if grid else None,
+            "step": grid["step"] if grid else None,
+            "level": state.get("current_level"),
+            "efficiency": grid_efficiency,
+        },
+        "round_trips": {
+            "count": len(round_trips),
+            "good": sum(1 for r in round_trips if r["status"] == "good"),
+            "micro": sum(1 for r in round_trips if r["status"] == "micro"),
+            "loss": sum(1 for r in round_trips if r["status"] == "loss"),
+            "avg_spread_pct": round(
+                sum(r["spread_pct"] for r in round_trips) / len(round_trips), 3
+            )
+            if round_trips
+            else 0,
+            "details": round_trips[-5:],  # last 5
+        },
+        "success_rate": _success_rate_data(state),
+    }
+
+    print(json.dumps(analysis, indent=2))
+
+
+def deposit():
+    """Manually record deposit/withdrawal."""
+    if len(sys.argv) < 3:
+        print("用法: eth_grid_v4.py deposit <金额USD>")
+        print("正数=存入, 负数=取出. 例: deposit 100 或 deposit -50")
+        return
+
+    try:
+        amount = float(sys.argv[2])
+    except ValueError:
+        print("无效金额")
+        return
+
+    state = load_state()
+    event = {
+        "time": datetime.now().isoformat(),
+        "usd_value": round(amount, 2),
+        "type": "manual_deposit" if amount > 0 else "manual_withdrawal",
+    }
+    dep_history = state["stats"].get("deposit_history", [])
+    dep_history.append(event)
+    state["stats"]["deposit_history"] = dep_history
+    state["stats"]["total_deposits_usd"] = round(
+        state["stats"].get("total_deposits_usd", 0) + amount, 2
+    )
+    save_state(state)
+
+    type_cn = "存入" if amount > 0 else "取出"
+    print(f"已记录{type_cn}: ${abs(amount):.2f}")
+
+
+def resume_trading():
+    """Clear stop_triggered flag and resume trading."""
+    state = load_state()
+    if not state.get("stop_triggered"):
+        print("交易未停止，无需恢复")
+        return
+    old_trigger = state["stop_triggered"]
+    state.pop("stop_triggered", None)
+    save_state(state)
+    log(f"Trading resumed (was: {old_trigger})")
+    print(f"交易已恢复 (之前停止原因: {old_trigger})")
+    _send_discord_embed(
+        [
+            {
+                "title": "\u2705 交易已恢复",
+                "color": 0x00C853,
+                "description": f"之前停止原因: {old_trigger}",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        ]
+    )
+
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+COMMANDS = {
+    "tick": tick,
+    "status": status,
+    "report": report,
+    "history": history_cmd,
+    "reset": reset,
+    "retry": retry,
+    "analyze": analyze,
+    "deposit": deposit,
+    "resume-trading": resume_trading,
+}
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "tick"
+    handler = COMMANDS.get(cmd)
+    if handler:
+        handler()
+    else:
+        print(f"未知命令: {cmd}")
+        print(f"可用命令: {', '.join(COMMANDS.keys())}")
+        sys.exit(1)
