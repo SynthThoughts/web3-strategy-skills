@@ -12,7 +12,7 @@ These checks run before any grid logic. If any triggers, the tick exits immediat
 |---------|-----------|---------|---------|
 | Stop-Loss | `STOP_LOSS_PCT` | 0.15 (15%) | Portfolio drops 15% below cost basis |
 | Trailing Stop | `TRAILING_STOP_PCT` | 0.10 (10%) | Portfolio drops 10% from peak value |
-| Take-Profit | `TAKE_PROFIT_PCT` | 0.0 (disabled) | Portfolio reaches profit target |
+| ~~Take-Profit~~ | ~~`TAKE_PROFIT_PCT`~~ | Removed (v4.1) | Not applicable to grid strategies |
 
 **Behavior**: Sets `stop_triggered` in state. All subsequent ticks log + send red Discord alert + refuse trading until `resume-trading` command is issued.
 

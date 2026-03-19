@@ -102,7 +102,7 @@ SIZING_MULTIPLIER_MAX = 2.0
 # Stop-loss / take-profit protection
 STOP_LOSS_PCT = 0.15  # stop at 15% loss from cost basis
 TRAILING_STOP_PCT = 0.10  # stop at 10% drawdown from peak
-TAKE_PROFIT_PCT = 0.0  # 0=disabled
+
 
 # Position limits (v4: trend-asymmetric)
 POSITION_MAX_PCT_DEFAULT = 70  # Block BUY when ETH > this %
@@ -680,9 +680,6 @@ def _check_stop_conditions(state: dict, total_usd: float, price: float) -> str |
             return (
                 f"trailing_stop (drawdown {drawdown * 100:.1f}% from peak ${peak:.0f})"
             )
-
-    if TAKE_PROFIT_PCT > 0 and pnl_pct >= TAKE_PROFIT_PCT:
-        return f"take_profit ({pnl_pct * 100:+.1f}% >= +{TAKE_PROFIT_PCT * 100:.0f}%)"
 
     return None
 
@@ -2155,8 +2152,6 @@ def status():
         parts.append(f"止损 {STOP_LOSS_PCT * 100:.0f}%")
     if TRAILING_STOP_PCT > 0:
         parts.append(f"追踪止损 {TRAILING_STOP_PCT * 100:.0f}%")
-    if TAKE_PROFIT_PCT > 0:
-        parts.append(f"止盈 {TAKE_PROFIT_PCT * 100:.0f}%")
     if parts:
         peak = stats.get("portfolio_peak_usd")
         peak_str = f" | 峰值 `${peak:.0f}`" if peak else ""

@@ -360,7 +360,6 @@ Three protection mechanisms. When triggered, trading halts and a red Discord ale
 |---|---|---|
 | `STOP_LOSS_PCT` | `0.15` | Stop if portfolio drops 15% below cost basis |
 | `TRAILING_STOP_PCT` | `0.10` | Stop if portfolio drops 10% from peak |
-| `TAKE_PROFIT_PCT` | `0.0` | 0=disabled. Stop on profit target |
 
 ```python
 def _check_stop_conditions(state, total_usd, price):
