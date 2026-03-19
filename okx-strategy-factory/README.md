@@ -37,21 +37,23 @@ User Request
 npx clawhub install okx-strategy-factory
 ```
 
-### One-Line Install
+### Manual Install
 
+**Claude Code**:
 ```bash
-./install.sh                          # Auto-detect platform
-./install.sh --platform claude        # Claude Code
-./install.sh --platform cursor        # Cursor
-./install.sh --platform gemini        # Gemini CLI
-./install.sh --platform openclaw      # OpenClaw
+cp -r okx-strategy-factory /path/to/project/.claude/skills/
+# Or global:
+cp -r okx-strategy-factory ~/.claude/skills/
 ```
 
-### Manual Install (Claude Code)
-
+**Cursor**:
 ```bash
-mkdir -p /path/to/project/.claude/skills/okx-strategy-factory
-cp -r SKILL.md roles/ references/ assets/ hooks/ /path/to/project/.claude/skills/okx-strategy-factory/
+cp -r okx-strategy-factory /path/to/project/.cursor/skills/
+```
+
+**Gemini CLI**:
+```bash
+cp -r okx-strategy-factory /path/to/project/.gemini/skills/
 ```
 
 ## Quick Start
@@ -137,7 +139,7 @@ Steps execute strictly in order. No skipping. Iteration always triggers a full r
 - **OKX API Key** — with DEX trading permissions
 - **OnchainOS Agentic Wallet** — with TEE signing enabled
 - **Python 3.10+** — for backtest engine and trading scripts
-- **VPS** (optional) — for live deployment (Japan VPS recommended)
+- **VPS** (optional) — for live deployment
 - **1Password CLI** (optional) — for secure credential management (`op`)
 
 ## License
