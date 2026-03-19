@@ -13,6 +13,12 @@ Each skill is a self-contained `SKILL.md` that teaches an AI agent how to build,
 
 ## How to Use
 
+### ClawHub (Recommended for OpenClaw)
+
+```bash
+npx clawhub install grid-trading
+```
+
 ### Quick Install (any skill with install.sh)
 
 ```bash

@@ -31,6 +31,12 @@ A `SKILL.md` that teaches AI agents (Claude Code, Cursor, Gemini CLI, OpenClaw) 
 
 ## Installation
 
+### ClawHub (Recommended for OpenClaw)
+
+```bash
+npx clawhub install grid-trading
+```
+
 ### One-Line Install
 
 ```bash
