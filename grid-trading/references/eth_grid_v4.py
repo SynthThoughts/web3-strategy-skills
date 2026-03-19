@@ -782,11 +782,10 @@ def _wallet_contract_call(tx: dict) -> tuple[str | None, dict | None]:
         value_eth,
     ]
 
+    # Let onchainos estimate gas internally (tx.gas from DEX API is unreliable)
     if tx.get("gas"):
-        gas_limit = int(int(tx["gas"]) * 1.5)
-        args.extend(["--gas-limit", str(gas_limit)])
         gas_price_gwei = int(tx["gasPrice"]) / 1e9 if tx.get("gasPrice") else 0
-        log(f"  TX gas: limit={gas_limit}, gasPrice={gas_price_gwei:.2f} gwei")
+        log(f"  TX gas hint (not used): dex_gas={tx['gas']}, gasPrice={gas_price_gwei:.2f} gwei")
 
     try:
         data = onchainos_cmd(args, timeout=45)
@@ -1085,7 +1084,26 @@ def _emit_json(data: dict):
 
 # ── Discord embed helper ────────────────────────────────────────────────────
 
-DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")  # Optional: for Discord notifications
+def _resolve_discord_channel_id() -> str:
+    """Resolve Discord channel ID: env override > openclaw.json guilds config."""
+    env_id = os.environ.get("DISCORD_CHANNEL_ID", "")
+    if env_id:
+        return env_id
+    try:
+        cfg_path = Path.home() / ".openclaw" / "openclaw.json"
+        if cfg_path.exists():
+            cfg = json.loads(cfg_path.read_text())
+            guilds = cfg.get("channels", {}).get("discord", {}).get("guilds", {})
+            for guild_id, guild_cfg in guilds.items():
+                channels = guild_cfg.get("channels", {})
+                for ch_id, ch_cfg in channels.items():
+                    if ch_cfg.get("allow"):
+                        return ch_id
+    except Exception:
+        pass
+    return ""
+
+DISCORD_CHANNEL_ID = _resolve_discord_channel_id()
 
 
 def _get_discord_token() -> str:
