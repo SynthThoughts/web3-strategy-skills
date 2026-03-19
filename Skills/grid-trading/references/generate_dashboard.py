@@ -215,9 +215,13 @@ def generate_html(state: dict, json_blocks: list[dict], events: list[dict]) -> s
         structure, structure
     )
 
-    # Compute strategy decision variables
-    blend = max(0, min((strength - 0.3) / 0.7, 1)) if strength > 0.3 else 0
-    vol_mult_val = 2.0 + blend * 1.0  # 2.0 → 3.0
+    # Compute strategy decision variables (must match calc_dynamic_grid directional logic)
+    vol_mult_val = 2.0
+    if strength > 0.3:
+        if trend == "bullish":
+            vol_mult_val = 2.0 + (3.0 - 2.0) * strength  # 2.0 → 3.0
+        elif trend == "bearish":
+            vol_mult_val = 2.0 - (2.0 - 1.5) * strength  # 2.0 → 1.5
 
     # Position sizing multipliers
     if trend == "bullish":
@@ -242,11 +246,12 @@ def generate_html(state: dict, json_blocks: list[dict], events: list[dict]) -> s
         pos_min = 30
 
     # Pre-compute tooltip strings (can't use % inside f-strings)
-    vol_mult_tip = (
-        f"趋势强度 > 30%，倍数从 2.0 上调至 {vol_mult_val:.1f}，网格变宽减少交易频率"
-        if strength > 0.3
-        else "趋势强度 ≤ 30%，使用基础倍数 2.0"
-    )
+    if strength > 0.3 and trend == "bullish":
+        vol_mult_tip = f"看涨强趋势: 倍数上调至 {vol_mult_val:.1f}x，网格变宽持仓待涨"
+    elif strength > 0.3 and trend == "bearish":
+        vol_mult_tip = f"看跌强趋势: 倍数下调至 {vol_mult_val:.1f}x，网格收窄加速出货"
+    else:
+        vol_mult_tip = "趋势强度 ≤ 30%，使用基础倍数 2.0x"
     if trend == "bullish":
         sizing_tip = f"看涨: 买入 ×{buy_mult:.2f} (加仓) / 卖出 ×{sell_mult:.2f} (减仓)"
     elif trend == "bearish":
@@ -609,7 +614,7 @@ def generate_html(state: dict, json_blocks: list[dict], events: list[dict]) -> s
         </div>
         <div class="mtf-item" title="{vol_mult_tip}">
           <span class="mtf-label">宽度倍数</span>
-          <span class="mtf-value" style="color:{"#c8ff00" if vol_mult_val > 2.0 else "#ccc"};">{vol_mult_val:.1f}x</span>
+          <span class="mtf-value" style="color:{"#c8ff00" if vol_mult_val > 2.0 else "#ff4c8b" if vol_mult_val < 2.0 else "#ccc"};">{vol_mult_val:.1f}x</span>
         </div>
         <div class="mtf-item" title="{sizing_tip}">
           <span class="mtf-label">仓位倍数</span>
@@ -971,7 +976,7 @@ def _build_risk_controls_html(state: dict, mtf: dict) -> str:
     else:
         items.append(
             (
-                "✓",
+                "🔒",
                 "止损",
                 f"{pnl_pct:+.1f}%",
                 "risk-ok",
@@ -1004,7 +1009,7 @@ def _build_risk_controls_html(state: dict, mtf: dict) -> str:
     if consec_err >= 5:
         items.append(
             (
-                "⚡",
+                "🔌",
                 "熔断器",
                 f"已触发 ({consec_err})",
                 "risk-alert",
@@ -1014,7 +1019,7 @@ def _build_risk_controls_html(state: dict, mtf: dict) -> str:
     else:
         items.append(
             (
-                "✓",
+                "🔌",
                 "熔断器",
                 f"{consec_err}/5",
                 "risk-ok",
@@ -1086,7 +1091,7 @@ def _build_risk_controls_html(state: dict, mtf: dict) -> str:
     drop_active = drop_pct > 2
     items.append(
         (
-            "⚡",
+            "⛑",
             "急跌保护",
             f"{drop_pct:.1f}%" if drop_pct > 0.1 else "正常",
             "risk-warn" if drop_active else "risk-ok",
@@ -1113,7 +1118,7 @@ def _build_risk_controls_html(state: dict, mtf: dict) -> str:
     else:
         items.append(
             (
-                "✓",
+                "🛡",
                 "卖出保护",
                 "待命",
                 "risk-ok",

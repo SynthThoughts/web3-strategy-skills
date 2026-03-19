@@ -93,11 +93,10 @@ GAS_RESERVE_ETH = 0.003  # Reserve for gas (Base L2 gas is <$0.01)
 SLIPPAGE_PCT = 1  # 1% slippage for DEX aggregator swaps
 EMA_PERIOD = 20  # periods for EMA center (v4.1: applied to 1H kline = 20h)
 
-# v4: Trend-adaptive volatility multiplier
-VOLATILITY_MULTIPLIER_BASE = 2.0  # base multiplier
-VOLATILITY_MULTIPLIER_TREND = (
-    3.0  # wider grid in trending markets (less trading, more holding)
-)
+# v4: Trend-adaptive volatility multiplier (v4.2: directional)
+VOLATILITY_MULTIPLIER_BASE = 2.0  # base multiplier (neutral/weak trend)
+VOLATILITY_MULTIPLIER_BULL = 3.0  # bullish: wider grid → hold position, trade less
+VOLATILITY_MULTIPLIER_BEAR = 1.5  # bearish: tighter grid → exit faster, trade more
 # v4.2: Asymmetric grid — different step sizes for buy vs sell side
 # Bullish: tighter buy (accumulate fast) + wider sell (hold longer)
 # Bearish: tighter sell (exit fast) + wider buy (wait for dip)
@@ -553,15 +552,23 @@ def calc_dynamic_grid(
         atr_dollar = vol_pct / 100 * current_price
         log(f"ATR(1H, {len(candles)} bars): {vol_pct:.2f}% = ${atr_dollar:.1f}")
 
-        # Trend-adaptive multiplier — wider grid in trends to reduce over-trading
+        # Trend-adaptive multiplier — directional: bull widens, bear tightens
         vol_mult = VOLATILITY_MULTIPLIER_BASE
         strength = mtf.get("strength", 0) if mtf else 0
         trend = mtf.get("trend", "neutral") if mtf else "neutral"
         if strength > 0.3:
-            vol_mult = (
-                VOLATILITY_MULTIPLIER_BASE
-                + (VOLATILITY_MULTIPLIER_TREND - VOLATILITY_MULTIPLIER_BASE) * strength
-            )
+            if trend == "bullish":
+                vol_mult = (
+                    VOLATILITY_MULTIPLIER_BASE
+                    + (VOLATILITY_MULTIPLIER_BULL - VOLATILITY_MULTIPLIER_BASE)
+                    * strength
+                )  # 2.0 → 3.0: widen to hold
+            elif trend == "bearish":
+                vol_mult = (
+                    VOLATILITY_MULTIPLIER_BASE
+                    - (VOLATILITY_MULTIPLIER_BASE - VOLATILITY_MULTIPLIER_BEAR)
+                    * strength
+                )  # 2.0 → 1.5: tighten to exit
 
         # v4.2: Asymmetric buy/sell multipliers based on trend direction
         # Bullish: tighter buy (accumulate fast) + wider sell (hold longer)
