@@ -1466,8 +1466,16 @@ def tick():
         history = history[-288:]
     state["price_history"] = history
 
-    # Get balances
+    # Get balances (fallback to last known if API fails)
     eth_bal, usdc_bal = get_balances()
+    if eth_bal == 0.0 and usdc_bal == 0.0:
+        last_bal = state.get("last_balances", {})
+        if last_bal.get("eth", 0) > 0 or last_bal.get("usdc", 0) > 0:
+            eth_bal = last_bal.get("eth", 0)
+            usdc_bal = last_bal.get("usdc", 0)
+            log(
+                f"Balance API returned 0 — using last known: ETH={eth_bal}, USDC={usdc_bal}"
+            )
     total_usd = eth_bal * price + usdc_bal
 
     # Snapshot initial portfolio on first tick
