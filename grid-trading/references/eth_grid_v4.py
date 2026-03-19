@@ -40,8 +40,6 @@ _load_env()
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
-WALLET_ADDR = os.environ.get("WALLET_ADDR", "")  # Required: set via env or .env file
-
 OKX_API_KEY = os.environ.get("OKX_API_KEY", "")
 OKX_SECRET = os.environ.get("OKX_SECRET_KEY", "")
 OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
@@ -50,6 +48,35 @@ OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
 ETH_ADDR = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 USDC_ADDR = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 CHAIN_ID = "8453"
+
+
+def _resolve_wallet_addr() -> str:
+    """Resolve wallet address: env override > onchainos wallet addresses."""
+    env_addr = os.environ.get("WALLET_ADDR", "")
+    if env_addr:
+        return env_addr
+    try:
+        result = subprocess.run(
+            ["onchainos", "wallet", "addresses"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            data = json.loads(result.stdout.strip())
+            if data.get("ok") and data.get("data", {}).get("evm"):
+                evm_addrs = data["data"]["evm"]
+                # Prefer the address matching CHAIN_ID, fallback to first EVM
+                for entry in evm_addrs:
+                    if entry.get("chainIndex") == CHAIN_ID:
+                        return entry["address"]
+                return evm_addrs[0]["address"]
+    except Exception:
+        pass
+    return ""
+
+
+WALLET_ADDR = _resolve_wallet_addr()
+if not WALLET_ADDR:
+    print("ERROR: No wallet address found. Login with `onchainos wallet login` or set WALLET_ADDR env.", file=sys.stderr)
 
 # ── Grid Parameters (v4 tuned) ─────────────────────────────────────────────
 
