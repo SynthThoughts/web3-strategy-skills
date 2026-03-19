@@ -585,7 +585,7 @@ def generate_html(state: dict, json_blocks: list[dict], events: list[dict]) -> s
         <span title="网格中心价格，基于 20H EMA">中心 <span style="color:#ccc;font-weight:600;">${grid_center:,.0f}</span></span>
         <span title="当前价格所在层级 / 总层数">层级 <span style="color:#ccc;font-weight:600;">L{current_level}/{grid.get("levels", 6)}</span></span>
         <span title="{grid_pos_tip}" style="color:{"#c8ff00" if current_level < grid.get("levels", 6) / 2 else "#ff4c8b" if current_level > grid.get("levels", 6) / 2 else "#aaa"};">{grid_pos_label}</span>
-        <span title="Smart Money 信号看涨评分 (0-1)，> 0.3 时放大买入">信号 <span style="color:{"#c8ff00" if bullish_score > 0.3 else "#555"};font-weight:600;">{bullish_score:.2f}</span></span>
+        <span title="市场情绪评分 (0-1)：基于 Smart Money 整体活跃度，> 0.3 时放大买入">信号 <span style="color:{"#c8ff00" if bullish_score > 0.3 else "#555"};font-weight:600;">{bullish_score:.2f}</span></span>
       </div>
       <span style="color:#555;">{step_footer} · ATR {atr_pct:.2f}%</span>
     </div>

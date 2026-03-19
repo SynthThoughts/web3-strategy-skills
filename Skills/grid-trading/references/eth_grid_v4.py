@@ -329,67 +329,77 @@ def calc_kline_volatility(candles: list[dict]) -> float:
 
 
 def get_smart_money_signals() -> dict:
-    """Fetch smart money/whale signals for ETH on Base.
-    Returns {bullish_score: float, signals: list, fetched_at: str}."""
+    """Fetch aggregate smart money/whale activity as market sentiment proxy.
+
+    Smart money signals track small-cap token buying — ETH itself never appears.
+    Instead, we use overall activity as a risk-on/risk-off indicator:
+      - High buy activity + low sold ratios = risk-on sentiment → bullish for ETH
+      - Low activity + high sold ratios = risk-off → bearish
+
+    Queries both Ethereum and Base for broader coverage.
+    Returns {bullish_score: float, signal_count: int, avg_sold_pct: float, fetched_at: str}.
+    """
     result = {
         "bullish_score": 0.0,
-        "signals": [],
+        "signal_count": 0,
+        "avg_sold_pct": 100.0,
         "fetched_at": datetime.now().isoformat(),
     }
 
-    data = onchainos_cmd(
-        [
-            "signal",
-            "list",
-            "--chain",
-            "base",
-            "--wallet-type",
-            "1,2,3",  # smart money + KOL + whale
-            "--token-address",
-            ETH_ADDR,
-        ],
-        timeout=15,
-    )
+    all_signals = []
+    for chain in ["1", "8453"]:  # Ethereum + Base
+        data = onchainos_cmd(
+            [
+                "signal",
+                "list",
+                "--chain",
+                chain,
+                "--wallet-type",
+                "1,2,3",  # smart money + KOL + whale
+                "--min-amount-usd",
+                "1000",  # filter noise
+            ],
+            timeout=15,
+        )
+        if data and data.get("ok") and data.get("data"):
+            sigs = data["data"] if isinstance(data["data"], list) else [data["data"]]
+            all_signals.extend(sigs)
 
-    if not data or not data.get("ok") or not data.get("data"):
+    if not all_signals:
         return result
 
-    signals = data["data"] if isinstance(data["data"], list) else [data["data"]]
-    eth_signals = []
+    # Aggregate metrics
+    total_amount_usd = 0.0
+    sold_ratios = []
+    type_counts = {"1": 0, "2": 0, "3": 0}  # smart money, KOL, whale
 
-    for sig in signals:
-        token_addr = sig.get("tokenAddress", "").lower()
-        # Accept ETH-related signals
-        if token_addr in [
-            ETH_ADDR.lower(),
-            "",
-            "0x4200000000000000000000000000000000000006",
-        ]:
-            trigger_count = int(sig.get("triggerWalletCount", 0))
-            if trigger_count >= SIGNAL_MIN_TRIGGER_WALLETS:
-                sold_ratio = float(sig.get("soldRatioPercent", "100"))
-                wallet_type = sig.get("walletType", "")
-                eth_signals.append(
-                    {
-                        "wallet_type": wallet_type,
-                        "trigger_wallets": trigger_count,
-                        "sold_ratio_pct": sold_ratio,
-                        "amount_usd": float(sig.get("amountUsd", 0)),
-                    }
-                )
+    for sig in all_signals:
+        amount = float(sig.get("amountUsd", 0))
+        sold_pct = float(sig.get("soldRatioPercent", "100"))
+        wtype = sig.get("walletType", "")
 
-    if eth_signals:
-        # Score: more trigger wallets + lower sold ratio = more bullish
-        scores = []
-        for s in eth_signals:
-            wallet_score = min(s["trigger_wallets"] / 10, 1.0)  # normalize to 0-1
-            hold_score = 1.0 - (s["sold_ratio_pct"] / 100.0)  # 0% sold = 1.0 score
-            type_weight = {"SMART_MONEY": 1.0, "WHALE": 0.8, "INFLUENCER": 0.6}.get(
-                s["wallet_type"], 0.5
-            )
-            scores.append(wallet_score * hold_score * type_weight)
-        result["bullish_score"] = round(min(sum(scores) / len(scores), 1.0), 3)
-        result["signals"] = eth_signals
+        total_amount_usd += amount
+        sold_ratios.append(sold_pct)
+        if wtype in type_counts:
+            type_counts[wtype] += 1
+
+    avg_sold = sum(sold_ratios) / len(sold_ratios) if sold_ratios else 100.0
+
+    # Bullish score components:
+    # 1. Activity level: more signals = more active market (0-1)
+    activity_score = min(len(all_signals) / 20, 1.0)
+    # 2. Holding conviction: lower avg sold ratio = stronger hands (0-1)
+    hold_score = 1.0 - (avg_sold / 100.0)
+    # 3. Volume weight: higher total USD = stronger signal (0-1)
+    volume_score = min(total_amount_usd / 50000, 1.0)
+    # 4. Smart money premium: weight smart money signals higher
+    sm_ratio = type_counts["1"] / max(len(all_signals), 1)
+    sm_bonus = sm_ratio * 0.2  # up to 0.2 bonus
+
+    raw_score = (activity_score * 0.3 + hold_score * 0.4 + volume_score * 0.3) + sm_bonus
+    result["bullish_score"] = round(min(raw_score, 1.0), 3)
+    result["signal_count"] = len(all_signals)
+    result["avg_sold_pct"] = round(avg_sold, 1)
 
     return result
 
@@ -1535,10 +1545,10 @@ def tick():
         if sig_stale:
             signal = get_smart_money_signals()
             state["signal_cache"] = signal
-            if signal.get("signals"):
+            if signal.get("signal_count", 0) > 0:
                 log(
                     f"v4 Signal: bullish_score={signal['bullish_score']:.2f}, "
-                    f"{len(signal['signals'])} signals"
+                    f"{signal['signal_count']} signals, avg_sold={signal['avg_sold_pct']:.0f}%"
                 )
         else:
             signal = sig_cache
