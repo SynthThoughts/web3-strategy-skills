@@ -125,7 +125,7 @@ See `SKILL.md` for the complete parameter reference.
 
 ## Prerequisites
 
-- **onchainos CLI**: Installed and in PATH (`npm i -g @qingchencloud/openclaw-zh`)
+- **onchainos CLI**: Installed and in PATH (`npx skills add okx/onchainos-skills`)
 - **OKX API Key**: With DEX trading permissions
 - **Wallet**: OnchainOS Agentic Wallet with TEE signing
 - **Python 3.10+**: For the trading script
