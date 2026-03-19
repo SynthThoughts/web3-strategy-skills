@@ -295,11 +295,11 @@ def get_kline_data(bar: str = "1H", limit: int = 24) -> list[dict] | None:
                     candles.append(
                         {
                             "ts": int(c.get("ts", 0)),
-                            "open": float(c.get("open", 0)),
-                            "high": float(c.get("high", 0)),
-                            "low": float(c.get("low", 0)),
-                            "close": float(c.get("close", 0)),
-                            "volume": float(c.get("volume", 0)),
+                            "open": float(c.get("o", 0) or c.get("open", 0)),
+                            "high": float(c.get("h", 0) or c.get("high", 0)),
+                            "low": float(c.get("l", 0) or c.get("low", 0)),
+                            "close": float(c.get("c", 0) or c.get("close", 0)),
+                            "volume": float(c.get("vol", 0) or c.get("volume", 0)),
                         }
                     )
             except (ValueError, TypeError, IndexError):
