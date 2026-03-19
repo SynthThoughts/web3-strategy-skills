@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# 一键安装 {{NAME}} 策略 Skill
+# 幂等：重复执行安全
+
+set -euo pipefail
+
+SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NAME=$(jq -r '.name' "$SKILL_DIR/manifest.json")
+VER=$(jq -r '.version' "$SKILL_DIR/manifest.json")
+
+echo "=== 安装 $NAME v$VER ==="
+
+# 检测平台
+detect() {
+  command -v claude &>/dev/null && echo "claude-code" && return
+  [ -n "${CODEX_ENV:-}" ] && echo "codex" && return
+  [ -n "${OPENCLAW_ENV:-}" ] && echo "openclaw" && return
+  echo "claude-code"
+}
+PLATFORM=$(detect)
+echo "平台: $PLATFORM"
+
+# 安装到平台 Skill 目录
+case "$PLATFORM" in
+  claude-code) TARGET="${CLAUDE_SKILL_DIR:-$HOME/.claude/skills}/$NAME" ;;
+  codex)       TARGET=".codex/skills/$NAME" ;;
+  openclaw)    TARGET=".openclaw/skills/$NAME" ;;
+esac
+
+mkdir -p "$TARGET"
+cp -r "$SKILL_DIR"/* "$TARGET/" 2>/dev/null || true
+chmod +x "$TARGET/install.sh" 2>/dev/null || true
+
+# 安装依赖
+for dep in $(jq -r '.dependencies.npm // [] | .[]' "$SKILL_DIR/manifest.json" 2>/dev/null); do
+  npm install "$dep" --save 2>/dev/null || echo "  WARN: $dep 安装失败"
+done
+for dep in $(jq -r '.dependencies.pip // [] | .[]' "$SKILL_DIR/manifest.json" 2>/dev/null); do
+  pip install "$dep" 2>/dev/null || echo "  WARN: $dep 安装失败"
+done
+
+echo ""
+echo "=== 安装完成 ==="
+echo "  Skill: $NAME v$VER"
+echo "  平台:  $PLATFORM"
+echo "  路径:  $TARGET"

@@ -1,0 +1,44 @@
+# Deploy via OpenClaw (Discord / Telegram)
+
+消费者通过 OpenClaw agent 在 Discord 或 Telegram 中触发部署。
+
+## 命令
+
+```
+/deploy {{NAME}} v{{VERSION}} to {vps-alias}
+```
+
+或附带 zip 包：
+```
+/deploy [attached: {{NAME}}-v{{VERSION}}.zip] to {vps-alias}
+```
+
+## OpenClaw 执行流程
+
+1. 验证策略包完整性（strategy.js + config.json + risk-profile.json）
+2. 连接目标 VPS（凭证在 OpenClaw 安全保险库中管理）
+3. 备份当前版本 → 上传 → 安装依赖 → 启动
+4. 60s 内 Health Check
+5. 通过 → 通知部署成功 / 失败 → 自动回滚 + 通知
+
+## 回滚
+
+```
+/rollback {vps-alias}
+```
+
+## 状态通知
+
+部署成功：
+```
+✅ 部署完成
+  策略: {{NAME}} v{{VERSION}}
+  VPS: {vps-alias}
+  状态: LIVE
+```
+
+部署失败：
+```
+❌ 部署失败 — 已回滚到 v{prev}
+  错误: {error}
+```

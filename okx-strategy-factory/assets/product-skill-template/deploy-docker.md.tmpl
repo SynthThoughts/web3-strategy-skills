@@ -1,0 +1,52 @@
+# Deploy via Docker Compose
+
+自建 VPS 上的容器化部署方案。
+
+## 前提
+
+- 目标机器已安装 Docker + Docker Compose
+- SSH 访问权限
+
+## 部署
+
+```bash
+# 构建镜像
+docker build -t {{NAME}}:{{VERSION}} .
+
+# 启动
+docker compose up -d strategy-bot
+
+# 健康检查
+docker compose ps strategy-bot
+docker compose logs strategy-bot --tail 50
+```
+
+## docker-compose.yml 示例
+
+```yaml
+services:
+  strategy-bot:
+    image: {{NAME}}:{{VERSION}}
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config.json:/app/config.json
+      - ./risk-profile.json:/app/risk-profile.json
+      - strategy-data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "process.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  strategy-data:
+```
+
+## 回滚
+
+```bash
+docker compose down strategy-bot
+# 修改 image tag 为上一版本
+docker compose up -d strategy-bot
+```

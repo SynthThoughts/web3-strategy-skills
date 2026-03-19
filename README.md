@@ -10,6 +10,7 @@ Each skill is a self-contained `SKILL.md` that teaches an AI agent how to build,
 |-------|---------|---------|-------------|
 | [grid-trading](./grid-trading/) | v4.0.0 | Pipeline + Tool Wrapper | Dynamic grid trading on EVM L2 chains via OKX DEX API. v4 adds multi-timeframe trend analysis, trend-adaptive sizing, smart money signals, sell trailing optimization, and HODL Alpha tracking. Sharpe 4.45. |
 | [polymarket-arb-scanner](./polymarket-arb-scanner/) | v1.0.0 | Tool Wrapper | Three-layer arbitrage detection on Polymarket CLOB: single-condition, neg-risk multi-outcome, and cross-market logical implication. |
+| [okx-strategy-factory](./okx-strategy-factory/) | v1.0.0 | Pipeline | Agent Team factory: coordinates 5 AI agents (Strategy/Backtest/Infra/Publish/Iteration) for full lifecycle of OKX OnchainOS trading strategies. |
 
 ## How to Use
 

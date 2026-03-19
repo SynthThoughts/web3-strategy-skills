@@ -1,0 +1,87 @@
+---
+name: {{NAME}}
+description: "{{DESCRIPTION}} 链上交易策略。通过 OKX OnchainOS 执行。支持 Claude Code / Codex / OpenClaw 三平台部署。触发词：{{NAME}}、交易策略、部署、运行。"
+license: Apache-2.0
+metadata:
+  author: {{AUTHOR}}
+  version: "{{VERSION}}"
+  pattern: "pipeline, tool-wrapper"
+  steps: "4"
+---
+
+# {{NAME}} Trading Strategy
+
+{{STRATEGY_DESCRIPTION}}
+
+**这是独立的产品 Skill**，不依赖 okx-strategy-factory。消费者可直接安装使用。
+
+## Architecture
+
+```
+install.sh → 检测平台 → 安装策略 + 依赖
+    ↓
+Cron / 手动 → 策略脚本 → onchainos CLI → OKX Web3 API → 链上执行
+    ↓
+监控 + Discord 通知
+```
+
+## Pipeline: 使用步骤
+
+### Step 1: 安装
+
+```bash
+bash install.sh
+```
+
+自动检测平台（Claude Code / Codex / OpenClaw），安装策略文件和依赖。
+
+**Gate**: `manifest.json` 中依赖全部安装成功
+
+### Step 2: 配置
+
+编辑 `config.json` 设置交易参数。检查 `risk-profile.json` 确认风控约束。
+
+**Gate**: 所有必填字段已设置，风控参数合理
+
+### Step 3: 部署
+
+根据你的环境选择部署方式：
+
+| 方式 | 文档 | 适用 |
+|------|------|------|
+| OpenClaw (Discord/Telegram) | `deploy/openclaw.md` | 消费者，通过聊天命令部署 |
+| Docker Compose | `deploy/docker.md` | 自建 VPS，容器化部署 |
+| 手动 | README.md | 高级用户，自定义部署 |
+
+**Gate**: Health check 通过（进程存活 + 无错误 + RPC 连接正常）
+
+### Step 4: 监控
+
+策略运行后，定期检查：
+- Discord 通知（交易执行 + 异常告警）
+- `status` 命令查看当前状态
+- `analyze` 命令输出 AI 可解析的 JSON
+
+## 参数
+
+参见 `config.json`。
+
+{{PARAMETER_TABLE}}
+
+## 风控约束
+
+参见 `risk-profile.json`。**硬约束，运行时强制执行。**
+
+{{RISK_TABLE}}
+
+## Gotchas
+
+<!-- 从真实运行中积累。Publish agent 每次迭代后更新。 -->
+
+## Anti-Patterns
+
+| Pattern | Problem |
+|---|---|
+| 修改 risk-profile 放宽限制而不回测 | 可能导致未验证的风险敞口 |
+| 直接修改策略代码而不更新 config | 参数不一致 |
+| 忽略 Discord 告警 | 可能错过止损触发 |
