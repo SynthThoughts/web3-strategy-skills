@@ -125,12 +125,12 @@ else:
 ### Trend-Adaptive Volatility Multiplier
 
 ```python
-vol_mult = VOLATILITY_MULTIPLIER_BASE  # 2.5
+vol_mult = VOLATILITY_MULTIPLIER_BASE  # 2.0
 
 if mtf and mtf["strength"] > 0.3:
     blend_factor = (mtf["strength"] - 0.3) / 0.7  # normalize 0.3-1.0 to 0-1
     vol_mult = BASE + (TREND - BASE) * blend_factor
-    # Range: 2.5 to 3.5
+    # Range: 2.0 to 3.0
 ```
 
 **Effect**: In strong trends, the grid becomes wider -> fewer trades -> bot holds position longer -> captures trend moves instead of selling too early.

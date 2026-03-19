@@ -89,9 +89,9 @@ SLIPPAGE_PCT = 1  # 1% slippage for DEX aggregator swaps
 EMA_PERIOD = 20  # periods for EMA center (v4.1: applied to 1H kline = 20h)
 
 # v4: Trend-adaptive volatility multiplier
-VOLATILITY_MULTIPLIER_BASE = 2.5  # base multiplier
+VOLATILITY_MULTIPLIER_BASE = 2.0  # base multiplier
 VOLATILITY_MULTIPLIER_TREND = (
-    3.5  # wider grid in trending markets (less trading, more holding)
+    3.0  # wider grid in trending markets (less trading, more holding)
 )
 
 # Sizing strategy (v4: trend-adaptive, see below)

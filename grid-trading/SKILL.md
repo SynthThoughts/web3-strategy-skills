@@ -22,7 +22,7 @@ Six core improvements based on v3 production data (229 trades over 10 days):
 | # | Feature | Problem Solved | Key Config |
 |---|---------|----------------|------------|
 | 1 | **Multi-Timeframe Analysis** | No trend awareness — over-traded in trending markets | `MTF_SHORT/MEDIUM/LONG/STRUCTURE_PERIOD` |
-| 2 | **Trend-Adaptive Strategy** | Fixed grid width in all markets → poor alpha | `VOLATILITY_MULTIPLIER_TREND=3.5`, `SIZING_STRATEGY="trend_adaptive"` |
+| 2 | **Trend-Adaptive Strategy** | Fixed grid width in all markets → poor alpha | `VOLATILITY_MULTIPLIER_TREND=3.0`, `SIZING_STRATEGY="trend_adaptive"` |
 | 3 | **K-line/ATR Volatility** | Price history stddev less accurate than OHLC true range | `onchainos market kline` integration |
 | 4 | **Smart Money Signals** | No external confirmation for trade decisions | `SIGNAL_WEIGHT=0.15`, `SIGNAL_MIN_TRIGGER_WALLETS=3` |
 | 5 | **Sell Trailing Optimization** | Sold too early in uptrends (84.3% sell success vs 100% buy) | `SELL_TRAIL_TICKS=2`, `SELL_MOMENTUM_THRESHOLD=0.005` |
@@ -106,8 +106,8 @@ def analyze_multi_timeframe(history, price) -> dict:
 **Actions**:
 1. Calculate dynamic grid with trend-adaptive volatility multiplier:
    - **v4.1**: Grid center = EMA(20) on **1H kline** (20-hour EMA, fetched via `onchainos market kline`). Falls back to 5min tick history if kline unavailable.
-   - Base: `VOLATILITY_MULTIPLIER_BASE=2.5`
-   - In trend (strength > 0.3): blend toward `VOLATILITY_MULTIPLIER_TREND=3.5`
+   - Base: `VOLATILITY_MULTIPLIER_BASE=2.0`
+   - In trend (strength > 0.3): blend toward `VOLATILITY_MULTIPLIER_TREND=3.0`
    - Wider grid in trends → fewer trades → more holding
 2. Check recalibration triggers (breakout / vol shift / age)
 3. Map price → grid level
@@ -195,8 +195,8 @@ Auto-retry policy: 1 retry for `retriable=True` with 3s delay and fresh quote.
 | `GRID_LEVELS` | `6` | Number of grid levels. More = finer, more trades |
 | `GRID_TYPE` | `"arithmetic"` | `"arithmetic"` (fixed $ step) or `"geometric"` (fixed % step) |
 | `EMA_PERIOD` | `20` | EMA lookback for grid center (v4.1: applied to 1H kline = 20h) |
-| `VOLATILITY_MULTIPLIER_BASE` | `2.5` | Base grid width = multiplier x stddev |
-| `VOLATILITY_MULTIPLIER_TREND` | `3.5` | Wider grid in trending markets (v4) |
+| `VOLATILITY_MULTIPLIER_BASE` | `2.0` | Base grid width = multiplier x stddev |
+| `VOLATILITY_MULTIPLIER_TREND` | `3.0` | Wider grid in trending markets (v4) |
 | `GRID_RECALIBRATE_HOURS` | `12` | Max hours before forced recalibration |
 
 ### Multi-Timeframe (v4 New)
@@ -256,7 +256,7 @@ Both modes store `level_prices` in the grid dict for unified level lookup via `b
 Step scales with real-time volatility, modulated by trend strength (v4):
 
 ```
-vol_mult = VOLATILITY_MULTIPLIER_BASE  (2.5)
+vol_mult = VOLATILITY_MULTIPLIER_BASE  (2.0)
 if trend_strength > 0.3:
     vol_mult = blend(BASE, TREND, strength)  (up to 3.5)
 
@@ -410,9 +410,9 @@ def calc_dynamic_grid(price, price_history, mtf=None):
     vol = stddev(price_history)
 
     # v4: trend-adaptive multiplier
-    vol_mult = VOLATILITY_MULTIPLIER_BASE  # 2.5
+    vol_mult = VOLATILITY_MULTIPLIER_BASE  # 2.0
     if mtf and mtf["strength"] > 0.3:
-        vol_mult = blend(BASE=2.5, TREND=3.5, factor=strength)
+        vol_mult = blend(BASE=2.0, TREND=3.0, factor=strength)
 
     step = (vol_mult * vol) / (GRID_LEVELS / 2)
     step = clamp(step, price * STEP_MIN_PCT, price * STEP_MAX_PCT)
