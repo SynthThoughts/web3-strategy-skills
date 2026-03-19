@@ -5,9 +5,8 @@ Improvements over v3:
   1. Multi-timeframe analysis (5min tick + 1h trend + 4h structure)
   2. Trend-adaptive grid: asymmetric sizing in trending markets
   3. K-line/OHLC volatility via onchainos market kline
-  4. Smart money / whale signal integration as trade confirmation
-  5. Improved sell logic with trailing grid profit locking
-  6. HODL-alpha tracking with trend-follow overlay
+  4. Improved sell logic with trailing grid profit locking
+  5. HODL-alpha tracking with trend-follow overlay
 
 Uses OKX DEX API (via onchainos CLI) + OnchainOS Agentic Wallet (TEE signing).
 Designed for OpenClaw cron integration.
@@ -138,12 +137,6 @@ MTF_SHORT_PERIOD = 5  # 5-bar EMA (25min @ 5min tick)
 MTF_MEDIUM_PERIOD = 12  # 12-bar EMA (1h @ 5min tick)
 MTF_LONG_PERIOD = 48  # 48-bar EMA (4h @ 5min tick)
 MTF_STRUCTURE_PERIOD = 96  # 96-bar (8h @ 5min tick) for structure detection
-
-# v4: Signal integration
-SIGNAL_ENABLED = True  # fetch smart money signals
-SIGNAL_WEIGHT = 0.15  # signal influence on sizing (0-1)
-SIGNAL_COOLDOWN_SEC = 900  # 15min between signal checks
-SIGNAL_MIN_TRIGGER_WALLETS = 3  # minimum trigger wallet count to consider signal
 
 # v4: Sell improvement — trailing grid lock
 SELL_TRAIL_TICKS = 2  # wait 2 ticks (10min) of price stability before selling
@@ -323,85 +316,6 @@ def calc_kline_volatility(candles: list[dict]) -> float:
     atr = sum(true_ranges) / len(true_ranges)
     avg_price = sum(c["close"] for c in candles) / len(candles)
     return (atr / avg_price) * 100 if avg_price > 0 else 0.0
-
-
-# ── v4: Smart Money Signal Integration ──────────────────────────────────────
-
-
-def get_smart_money_signals() -> dict:
-    """Fetch aggregate smart money/whale activity as market sentiment proxy.
-
-    Smart money signals track small-cap token buying — ETH itself never appears.
-    Instead, we use overall activity as a risk-on/risk-off indicator:
-      - High buy activity + low sold ratios = risk-on sentiment → bullish for ETH
-      - Low activity + high sold ratios = risk-off → bearish
-
-    Queries both Ethereum and Base for broader coverage.
-    Returns {bullish_score: float, signal_count: int, avg_sold_pct: float, fetched_at: str}.
-    """
-    result = {
-        "bullish_score": 0.0,
-        "signal_count": 0,
-        "avg_sold_pct": 100.0,
-        "fetched_at": datetime.now().isoformat(),
-    }
-
-    all_signals = []
-    for chain in ["1", "8453"]:  # Ethereum + Base
-        data = onchainos_cmd(
-            [
-                "signal",
-                "list",
-                "--chain",
-                chain,
-                "--wallet-type",
-                "1,2,3",  # smart money + KOL + whale
-                "--min-amount-usd",
-                "1000",  # filter noise
-            ],
-            timeout=15,
-        )
-        if data and data.get("ok") and data.get("data"):
-            sigs = data["data"] if isinstance(data["data"], list) else [data["data"]]
-            all_signals.extend(sigs)
-
-    if not all_signals:
-        return result
-
-    # Aggregate metrics
-    total_amount_usd = 0.0
-    sold_ratios = []
-    type_counts = {"1": 0, "2": 0, "3": 0}  # smart money, KOL, whale
-
-    for sig in all_signals:
-        amount = float(sig.get("amountUsd", 0))
-        sold_pct = float(sig.get("soldRatioPercent", "100"))
-        wtype = sig.get("walletType", "")
-
-        total_amount_usd += amount
-        sold_ratios.append(sold_pct)
-        if wtype in type_counts:
-            type_counts[wtype] += 1
-
-    avg_sold = sum(sold_ratios) / len(sold_ratios) if sold_ratios else 100.0
-
-    # Bullish score components:
-    # 1. Activity level: more signals = more active market (0-1)
-    activity_score = min(len(all_signals) / 20, 1.0)
-    # 2. Holding conviction: lower avg sold ratio = stronger hands (0-1)
-    hold_score = 1.0 - (avg_sold / 100.0)
-    # 3. Volume weight: higher total USD = stronger signal (0-1)
-    volume_score = min(total_amount_usd / 50000, 1.0)
-    # 4. Smart money premium: weight smart money signals higher
-    sm_ratio = type_counts["1"] / max(len(all_signals), 1)
-    sm_bonus = sm_ratio * 0.2  # up to 0.2 bonus
-
-    raw_score = (activity_score * 0.3 + hold_score * 0.4 + volume_score * 0.3) + sm_bonus
-    result["bullish_score"] = round(min(raw_score, 1.0), 3)
-    result["signal_count"] = len(all_signals)
-    result["avg_sold_pct"] = round(avg_sold, 1)
-
-    return result
 
 
 # ── v4: Multi-Timeframe Analysis ────────────────────────────────────────────
@@ -673,12 +587,10 @@ def _calc_sizing_multiplier(
     grid_levels: int,
     direction: str,
     mtf: dict | None = None,
-    signal: dict | None = None,
 ) -> float:
     """v4: Trend-adaptive sizing.
     - In bullish trend: buy more (larger buys), sell less (smaller sells) → hold more ETH
     - In bearish trend: buy less, sell more → hold more USDC
-    - Signal boost: if smart money is bullish, slight increase in buy size
     """
     base_mult = 1.0
 
@@ -711,14 +623,6 @@ def _calc_sizing_multiplier(
             base_mult = mx - (mx - mn) * dist
         elif SIZING_STRATEGY == "pyramid":
             base_mult = mx - (mx - mn) * dist
-
-    # v4: Signal boost
-    if signal and SIGNAL_ENABLED:
-        bull_score = signal.get("bullish_score", 0)
-        if bull_score > 0.3 and direction == "BUY":
-            base_mult *= 1.0 + SIGNAL_WEIGHT * bull_score
-        elif bull_score > 0.3 and direction == "SELL":
-            base_mult *= 1.0 - SIGNAL_WEIGHT * bull_score * 0.5  # slight sell reduction
 
     return max(SIZING_MULTIPLIER_MIN, min(SIZING_MULTIPLIER_MAX, base_mult))
 
@@ -761,7 +665,6 @@ def calc_trade_amount(
     current_level: int | None = None,
     grid_levels: int | None = None,
     mtf: dict | None = None,
-    signal: dict | None = None,
 ) -> tuple[int | None, dict | None]:
     """Calculate trade amount. Returns (amount, failure_info)."""
     available_eth = eth_bal - GAS_RESERVE_ETH
@@ -774,7 +677,7 @@ def calc_trade_amount(
     # Apply sizing strategy multiplier
     if current_level is not None and grid_levels is not None:
         multiplier = _calc_sizing_multiplier(
-            current_level, grid_levels, direction, mtf, signal
+            current_level, grid_levels, direction, mtf
         )
         max_usd *= multiplier
         log(f"  Sizing: {direction} mult={multiplier:.2f} -> max_usd=${max_usd:.2f}")
@@ -1094,7 +997,6 @@ def load_state() -> dict:
         "errors": {"consecutive": 0, "cooldown_until": None},
         # v4 new fields
         "mtf_cache": None,
-        "signal_cache": None,
         "kline_cache": None,
         "sell_trail_counter": {},  # {level: tick_count}
     }
@@ -1115,7 +1017,6 @@ def _calc_market_data(
     history: list[float],
     grid: dict,
     mtf: dict | None = None,
-    signal: dict | None = None,
     kline_vol: float | None = None,
 ) -> dict:
     """Calculate market analysis data for JSON output (v4 enriched)."""
@@ -1158,10 +1059,6 @@ def _calc_market_data(
             )
         else:
             result["trend"] = "neutral"
-
-    # v4: Signal data
-    if signal:
-        result["signal_bullish_score"] = signal.get("bullish_score", 0)
 
     # v4: K-line ATR volatility
     if kline_vol is not None:
@@ -1422,7 +1319,7 @@ def _should_delay_sell(
 
 def tick():
     """Main tick: check price, execute trade if grid crossing detected.
-    v4: multi-timeframe, signal-enhanced, sell-optimized."""
+    v4: multi-timeframe, sell-optimized."""
     state = load_state()
 
     # Circuit breaker check
@@ -1531,27 +1428,6 @@ def tick():
             kline_vol = kline_cache.get("atr_pct") if kline_cache else None
     else:
         kline_vol = kline_cache.get("atr_pct") if kline_cache else None
-
-    # ── v4: Smart money signals (fetch every 15min) ──
-    signal = None
-    if SIGNAL_ENABLED:
-        sig_cache = state.get("signal_cache")
-        sig_stale = True
-        if sig_cache and sig_cache.get("fetched_at"):
-            elapsed = (
-                datetime.now() - datetime.fromisoformat(sig_cache["fetched_at"])
-            ).total_seconds()
-            sig_stale = elapsed > SIGNAL_COOLDOWN_SEC
-        if sig_stale:
-            signal = get_smart_money_signals()
-            state["signal_cache"] = signal
-            if signal.get("signal_count", 0) > 0:
-                log(
-                    f"v4 Signal: bullish_score={signal['bullish_score']:.2f}, "
-                    f"{signal['signal_count']} signals, avg_sold={signal['avg_sold_pct']:.0f}%"
-                )
-        else:
-            signal = sig_cache
 
     # ── Stop-loss / trailing-stop / take-profit guard ──
     if state.get("stop_triggered"):
@@ -1721,7 +1597,7 @@ def tick():
     state["stats"]["last_check"] = datetime.now().isoformat()
 
     # Prepare output data
-    market_data = _calc_market_data(price, history, grid, mtf, signal, kline_vol)
+    market_data = _calc_market_data(price, history, grid, mtf, kline_vol)
     eth_pct = round((eth_bal * price / total_usd) * 100, 1) if total_usd > 0 else 0
     portfolio_data = {
         "eth": round(eth_bal, 6),
@@ -1828,7 +1704,7 @@ def tick():
             trail.pop(level_key, None)
             state["sell_trail_counter"] = trail
 
-            # Calculate trade amount (v4: with MTF and signal)
+            # Calculate trade amount (v4: with MTF)
             amount, calc_fail = calc_trade_amount(
                 direction,
                 eth_bal,
@@ -1837,7 +1713,6 @@ def tick():
                 current_level=current_level,
                 grid_levels=GRID_LEVELS,
                 mtf=mtf,
-                signal=signal,
             )
 
             if amount:
@@ -1877,7 +1752,7 @@ def tick():
                         "grid_from": prev_level,
                         "grid_to": current_level,
                         "trend": mtf.get("trend", "neutral"),
-                        "signal_score": signal.get("bullish_score", 0) if signal else 0,
+                        "trend_strength": mtf.get("strength", 0),
                     }
                     state["trades"].append(trade_record)
                     if len(state["trades"]) > 50:
@@ -2234,14 +2109,6 @@ def status():
         if deposits != 0:
             print(f"> 资金调整: `${deposits:+.2f}` | 成本基准 `${cost_basis:.0f}`")
 
-    # Signal info
-    sig = state.get("signal_cache")
-    if sig and sig.get("signals"):
-        print("\n**智能信号**")
-        print(
-            f"> 看涨评分: `{sig['bullish_score']:.2f}` | 信号数: `{len(sig['signals'])}`"
-        )
-
     # Success rate
     print(f"\n> 成功率: `{_success_rate_str(state)}`")
 
@@ -2540,7 +2407,6 @@ def reset():
         "grid_set_at": None,
         "last_trade_times": {},
         "mtf_cache": None,
-        "signal_cache": None,
         "kline_cache": None,
         "sell_trail_counter": {},
     }
@@ -2674,9 +2540,6 @@ def analyze():
     candles = get_kline_data("1H", 24)
     kline_vol = calc_kline_volatility(candles) if candles else None
 
-    # Signal
-    signal = get_smart_money_signals() if SIGNAL_ENABLED else None
-
     # Price changes
     def pct_change(window):
         if len(history) < window:
@@ -2778,11 +2641,6 @@ def analyze():
             "kline_atr_pct": round(kline_vol, 2) if kline_vol else None,
         },
         "multi_timeframe": mtf,
-        "signal": {
-            "bullish_score": signal.get("bullish_score", 0) if signal else 0,
-            "signal_count": len(signal.get("signals", [])) if signal else 0,
-            "signals": signal.get("signals", []) if signal else [],
-        },
         "portfolio": {
             "eth": round(eth_bal, 6),
             "usdc": round(usdc_bal, 2),
