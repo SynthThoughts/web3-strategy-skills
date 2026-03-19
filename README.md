@@ -6,20 +6,40 @@ Each skill is a self-contained `SKILL.md` that teaches an AI agent how to build,
 
 ## Skills
 
-| Skill | Description |
-|-------|-------------|
-| [grid-trading](./grid-trading/) | Dynamic grid trading on EVM L2 chains via OKX DEX API. Volatility-adaptive step sizing, position limits, circuit breakers. |
-| [polymarket-arb-scanner](./polymarket-arb-scanner/) | Three-layer arbitrage detection on Polymarket CLOB: single-condition, neg-risk multi-outcome, and cross-market logical implication. |
+| Skill | Version | Pattern | Description |
+|-------|---------|---------|-------------|
+| [grid-trading](./grid-trading/) | v4.0.0 | Pipeline + Tool Wrapper | Dynamic grid trading on EVM L2 chains via OKX DEX API. v4 adds multi-timeframe trend analysis, trend-adaptive sizing, smart money signals, sell trailing optimization, and HODL Alpha tracking. Sharpe 4.45. |
+| [polymarket-arb-scanner](./polymarket-arb-scanner/) | v1.0.0 | Tool Wrapper | Three-layer arbitrage detection on Polymarket CLOB: single-condition, neg-risk multi-outcome, and cross-market logical implication. |
 
 ## How to Use
 
-### Claude Code
-
-Add a skill to your project by copying its folder into your workspace, or reference it in your `.claude/settings.json`:
+### Quick Install (any skill with install.sh)
 
 ```bash
-# Copy a skill into your project
+cd grid-trading
+./install.sh                          # Auto-detect platform
+./install.sh --platform claude        # Claude Code
+./install.sh --platform cursor        # Cursor
+./install.sh --platform gemini        # Gemini CLI
+./install.sh --global                 # Install to ~/.<platform>/skills/
+```
+
+### Claude Code
+
+```bash
 cp -r grid-trading /path/to/your/project/.claude/skills/
+```
+
+### Cursor
+
+```bash
+cp -r grid-trading /path/to/your/project/.cursor/skills/
+```
+
+### Gemini CLI
+
+```bash
+cp -r grid-trading /path/to/your/project/.gemini/skills/
 ```
 
 ### Other AI Agents
@@ -30,7 +50,11 @@ Each `SKILL.md` is plain Markdown — paste it into any AI agent's system prompt
 
 ```
 skill-name/
-└── SKILL.md     # Complete knowledge document with YAML frontmatter
+├── SKILL.md              # Complete knowledge document with YAML frontmatter
+├── references/           # Detailed reference docs (tool-wrapper pattern)
+├── assets/               # Templates and resources (generator pattern)
+├── install.sh            # One-click installer for all platforms
+└── README.md             # User-facing documentation
 ```
 
 A `SKILL.md` contains:
