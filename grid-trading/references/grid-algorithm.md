@@ -1,6 +1,6 @@
 # Grid Algorithm Reference
 
-Detailed explanation of the core algorithms in Grid Trading v4.
+Detailed explanation of the core algorithms in Grid Trading v4.1.
 
 ## 1. Multi-Timeframe Analysis (MTF)
 
@@ -112,8 +112,15 @@ Cache TTL: 1 hour.
 ### Grid Center
 
 ```python
-center = EMA(price_history, EMA_PERIOD)  # default: 20-bar EMA
+# v4.1: Prefer 1H kline for grid center (more robust than 5min ticks)
+candles = get_kline_data(bar="1H", limit=EMA_PERIOD)  # 20 hourly candles
+if candles:
+    center = EMA([c.close for c in candles], EMA_PERIOD)  # 20-hour EMA
+else:
+    center = EMA(price_history, EMA_PERIOD)  # fallback: 5min tick history
 ```
+
+**v4.1 change**: Grid center now uses 1H kline EMA (20h lookback) instead of 5min tick EMA (100min lookback). This produces a more stable center that doesn't drift on short-term noise, better matching the 12-hour recalibration cycle.
 
 ### Trend-Adaptive Volatility Multiplier
 

@@ -86,7 +86,7 @@ MAX_TRADE_PCT = 0.12  # max 12% of total portfolio per trade
 MIN_TRADE_USD = 5.0  # minimum trade size in USD
 GAS_RESERVE_ETH = 0.003  # Reserve for gas (Base L2 gas is <$0.01)
 SLIPPAGE_PCT = 1  # 1% slippage for DEX aggregator swaps
-EMA_PERIOD = 20  # periods for EMA center
+EMA_PERIOD = 20  # periods for EMA center (v4.1: applied to 1H kline = 20h)
 
 # v4: Trend-adaptive volatility multiplier
 VOLATILITY_MULTIPLIER_BASE = 2.5  # base multiplier
@@ -490,22 +490,42 @@ def calc_dynamic_grid(
     current_price: float, price_history: list[float], mtf: dict | None = None
 ) -> dict:
     """Calculate dynamic grid with trend-adaptive parameters.
-    v4: In trending markets, use wider grid (hold more, trade less).
+    v4.1: Use 1H kline for grid center (more robust than 5min tick history).
+    In trending markets, use wider grid (hold more, trade less).
     """
-    if len(price_history) < 5:
-        step = current_price * 0.01
+    # v4.1: Prefer 1H kline for center price — more stable than 5min ticks
+    hourly_closes: list[float] = []
+    candles = get_kline_data(bar="1H", limit=max(EMA_PERIOD, 24))
+    if candles and len(candles) >= 5:
+        hourly_closes = [c["close"] for c in candles]
+
+    if hourly_closes:
+        center = calc_ema(hourly_closes, min(EMA_PERIOD, len(hourly_closes)))
+        log(f"Grid center: EMA({min(EMA_PERIOD, len(hourly_closes))}) on 1H kline = ${center:.2f}")
+    elif len(price_history) >= 5:
+        center = calc_ema(price_history, min(EMA_PERIOD, len(price_history)))
+        log(f"Grid center: EMA({min(EMA_PERIOD, len(price_history))}) on 5min fallback = ${center:.2f}")
+    else:
         center = current_price
         vol_pct = 0.0
-    else:
-        center = calc_ema(price_history, min(EMA_PERIOD, len(price_history)))
-        volatility = calc_volatility(price_history)
-        avg_price = sum(price_history) / len(price_history)
-        vol_pct = (volatility / avg_price) * 100 if avg_price > 0 else 0
+        step = current_price * 0.01
+        log(f"Grid center: cold start, using current price ${center:.2f}")
+
+    # Calculate volatility and step size (skip if cold start already set step)
+    if hourly_closes or len(price_history) >= 5:
+        # Use 5min history for volatility (captures recent micro-structure)
+        if len(price_history) >= 5:
+            volatility = calc_volatility(price_history)
+            avg_price = sum(price_history) / len(price_history)
+            vol_pct = (volatility / avg_price) * 100 if avg_price > 0 else 0
+        else:
+            volatility = calc_volatility(hourly_closes)
+            avg_price = sum(hourly_closes) / len(hourly_closes)
+            vol_pct = (volatility / avg_price) * 100 if avg_price > 0 else 0
 
         # v4: Trend-adaptive multiplier — wider grid in trends to reduce over-trading
         vol_mult = VOLATILITY_MULTIPLIER_BASE
         if mtf and mtf.get("strength", 0) > 0.3:
-            # Blend toward trend multiplier based on strength
             blend = mtf["strength"]
             vol_mult = (
                 VOLATILITY_MULTIPLIER_BASE

@@ -4,7 +4,7 @@ description: "Dynamic grid trading strategy for any token pair on EVM L2 chains 
 license: Apache-2.0
 metadata:
   author: SynthThoughts
-  version: "4.0.0"
+  version: "4.1.0"
   pattern: "pipeline, tool-wrapper"
   steps: "5"
 ---
@@ -105,6 +105,7 @@ def analyze_multi_timeframe(history, price) -> dict:
 
 **Actions**:
 1. Calculate dynamic grid with trend-adaptive volatility multiplier:
+   - **v4.1**: Grid center = EMA(20) on **1H kline** (20-hour EMA, fetched via `onchainos market kline`). Falls back to 5min tick history if kline unavailable.
    - Base: `VOLATILITY_MULTIPLIER_BASE=2.5`
    - In trend (strength > 0.3): blend toward `VOLATILITY_MULTIPLIER_TREND=3.5`
    - Wider grid in trends → fewer trades → more holding
@@ -193,7 +194,7 @@ Auto-retry policy: 1 retry for `retriable=True` with 3s delay and fresh quote.
 |---|---|---|
 | `GRID_LEVELS` | `6` | Number of grid levels. More = finer, more trades |
 | `GRID_TYPE` | `"arithmetic"` | `"arithmetic"` (fixed $ step) or `"geometric"` (fixed % step) |
-| `EMA_PERIOD` | `20` | EMA lookback for grid center |
+| `EMA_PERIOD` | `20` | EMA lookback for grid center (v4.1: applied to 1H kline = 20h) |
 | `VOLATILITY_MULTIPLIER_BASE` | `2.5` | Base grid width = multiplier x stddev |
 | `VOLATILITY_MULTIPLIER_TREND` | `3.5` | Wider grid in trending markets (v4) |
 | `GRID_RECALIBRATE_HOURS` | `12` | Max hours before forced recalibration |
