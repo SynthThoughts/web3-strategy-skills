@@ -1,10 +1,16 @@
 # Strategy Agent
 
-编写 OKX OnchainOS 链上交易策略。只写策略逻辑，不做回测/部署/发布。
+编写基于 **onchainos CLI** 的 OKX OnchainOS 链上交易策略。只写策略逻辑，不做回测/部署/发布。
+
+## 核心约束
+
+所有链上操作（查价、swap、转账、签名）**必须通过 `onchainos` CLI 执行**。不存在 Python SDK，不直接调用 OKX API。策略代码本质是：Python 逻辑 + `subprocess.run(["onchainos", ...])` 调用。
 
 ## 启动前必读
 
-**先读 `references/strategy-lessons.md`**（策略经验库），从已有策略的风控模式、MTF 趋势分析、波动率自适应、成本管理、常见陷阱中学习，避免重复踩坑。
+1. **`references/api-interfaces.md`**（onchainos CLI 命令速查 + 标准 wrapper + 关键陷阱）— 这是你写代码的接口参考
+2. **`references/strategy-lessons.md`**（策略经验库）— 风控模式、MTF、波动率、成本管理、常见陷阱
+3. **`grid-trading/references/eth_grid_v1.py`**（实盘参考）— 经过验证的 onchainos 调用模式，复用其 wrapper
 
 ## 输入
 
@@ -29,18 +35,23 @@
 ```
 4. **README.md** — 逻辑概述、信号描述、收益预期（乐观/中性/悲观）、适用市场条件、参数说明
 
-## Adapter 接口
+## onchainos CLI 调用
 
-策略代码只调用这些抽象接口（完整规范见 `references/api-interfaces.md`）：
+策略代码通过 `subprocess` 调用 onchainos CLI。完整命令表见 `references/api-interfaces.md`，核心操作：
 
+```bash
+onchainos wallet balance --chain <chainId>                    # 查余额（UI 单位）
+onchainos swap quote --from <addr> --to <addr> --amount <wei> # 询价（最小单位!）
+onchainos swap approve --token <addr> --amount <wei> --chain <chainId>  # EVM 授权
+onchainos swap swap --from <addr> --to <addr> --amount <wei> --chain <chainId> --wallet <addr>
+onchainos wallet contract-call --to <addr> --chain <chainId> --input-data <hex>  # TEE 签名+广播
+onchainos market kline --address <addr> --chain <chainId> --bar <1H> --limit 24  # K线
+onchainos gateway simulate --from <addr> --to <addr> --data <hex> --chain <chainId>  # 预检
 ```
-wallet.getBalance(token)    dex.swap(tokenIn, tokenOut, amount, slippage)
-wallet.approve(...)         dex.getPrice(pair)
-position.open({...})        position.close(id)
-position.checkRiskTriggers()
-```
 
-实际实现通过 `onchainos` CLI 调用 OKX Web3 API。参考 `grid-trading/SKILL.md` 的 Tool Wrapper 部分了解具体命令。
+**必须复用** `grid-trading/references/eth_grid_v1.py` 中的 `onchainos_cmd()` wrapper，不要重新发明。
+
+**⚠️ 单位陷阱**: `wallet send/balance` 用 UI 单位（"0.1" ETH），`swap` 系列用最小单位（wei）。混用必出错。
 
 ## 修订请求
 
