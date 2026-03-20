@@ -1,6 +1,6 @@
 # Grid Algorithm Reference
 
-Detailed explanation of the core algorithms in Grid Trading v4.2.
+Detailed explanation of the core algorithms in Grid Trading v1.0.
 
 ## 1. Multi-Timeframe Analysis (MTF)
 
@@ -112,7 +112,7 @@ Cache TTL: 1 hour.
 ### Grid Center
 
 ```python
-# v4.1: Prefer 1H kline for grid center (more robust than 5min ticks)
+# Prefer 1H kline for grid center (more robust than 5min ticks)
 candles = get_kline_data(bar="1H", limit=EMA_PERIOD)  # 20 hourly candles
 if candles:
     center = EMA([c.close for c in candles], EMA_PERIOD)  # 20-hour EMA
@@ -120,7 +120,7 @@ else:
     center = EMA(price_history, EMA_PERIOD)  # fallback: 5min tick history
 ```
 
-**v4.1 change**: Grid center now uses 1H kline EMA (20h lookback) instead of 5min tick EMA (100min lookback). This produces a more stable center that doesn't drift on short-term noise, better matching the 12-hour recalibration cycle.
+Grid center uses 1H kline EMA (20h lookback) instead of 5min tick EMA (100min lookback). This produces a more stable center that doesn't drift on short-term noise, better matching the 12-hour recalibration cycle.
 
 ### Trend-Adaptive Volatility Multiplier
 
@@ -134,7 +134,7 @@ if mtf and mtf["strength"] > 0.3:
 
 **Effect**: In strong trends, the grid becomes wider -> fewer trades -> bot holds position longer -> captures trend moves instead of selling too early.
 
-### v4.2: Asymmetric Buy/Sell Steps
+### Asymmetric Buy/Sell Steps
 
 ```python
 # Asymmetry scales with trend strength (only active when strength > 0.3)
@@ -159,11 +159,11 @@ else:
 ### Step Calculation
 
 ```python
-# v4.1: Use 1H ATR for step sizing (more robust than stddev for extreme moves)
+# Use 1H ATR for step sizing (more robust than stddev for extreme moves)
 atr_pct = calc_kline_volatility(candles)  # ATR as % of price
 atr_dollar = atr_pct / 100 * current_price
 
-# v4.2: Directional steps
+# Directional steps
 buy_step  = (buy_mult * atr_dollar) / (GRID_LEVELS / 2)
 sell_step = (sell_mult * atr_dollar) / (GRID_LEVELS / 2)
 
@@ -177,7 +177,7 @@ step = (buy_step + sell_step) / 2  # backward-compatible average
 
 ### Level Construction
 
-v4.2 uses `_build_level_prices()` to construct non-uniform grids:
+`_build_level_prices()` constructs non-uniform grids:
 
 ```python
 def _build_level_prices(center, buy_step, sell_step, half, grid_type):
@@ -250,7 +250,7 @@ For upside breakouts:
 
 ### Strategy: `trend_adaptive`
 
-The default v4 sizing strategy adjusts trade amounts based on trend direction:
+The default sizing strategy adjusts trade amounts based on trend direction:
 
 ```
 BULLISH trend:
@@ -308,7 +308,7 @@ else:  # BUY
 
 ## 6. Sell Trailing Optimization
 
-v4 introduces sell delay in strong uptrends to avoid premature profit-taking.
+Sell delay is applied in strong uptrends to avoid premature profit-taking.
 
 ### Logic Flow
 
@@ -326,7 +326,7 @@ Is momentum_1h > SELL_MOMENTUM_THRESHOLD (0.5%) AND trend == "bullish"?
             |-- No  -> Counter satisfied, EXECUTE sell
 ```
 
-v4.1 change: Removed `structure == "uptrend"` from momentum protection condition.
+The `structure == "uptrend"` condition was removed from momentum protection.
 The 8h strict monotonic structure detection was never satisfied in production (always "ranging"),
 making the momentum protection dead code. Now only requires bullish trend + strong momentum.
 
@@ -358,4 +358,4 @@ alpha = current_portfolio_usd - hodl_value
 **Interpretation**:
 - `alpha > 0`: Grid is outperforming HODL (good in ranging/declining markets)
 - `alpha < 0`: HODL would have been better (expected in strong uptrends)
-- In a +9% uptrend backtest, alpha was -5.05% — the v4 trend-adaptive features aim to minimize this gap
+- In a +9% uptrend backtest, alpha was -5.05% — the trend-adaptive features aim to minimize this gap

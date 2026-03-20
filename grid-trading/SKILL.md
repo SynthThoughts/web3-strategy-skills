@@ -1,52 +1,40 @@
 ---
 name: grid-trading
-description: "Dynamic grid trading strategy for any token pair on EVM L2 chains via OKX DEX API. v4.2 adds asymmetric grid steps (buy-dense/sell-wide in bullish, reverse in bearish). v4 adds multi-timeframe trend analysis, trend-adaptive grid sizing, ATR-based volatility, sell trailing optimization, and HODL Alpha tracking. Covers grid modes (arithmetic/geometric), asymmetric buy/sell grid spacing, position sizing strategies (equal/martingale/anti-martingale/pyramid/trend-adaptive), comprehensive risk controls (stop-loss, take-profit, drawdown protection, circuit breakers), trade execution via OKX DEX aggregator, PnL calculation, and Discord notification. Use when creating, modifying, debugging, or tuning a grid trading bot."
+description: "Dynamic grid trading strategy for any token pair on EVM L2 chains via OKX DEX API. Features asymmetric grid steps (buy-dense/sell-wide in bullish, reverse in bearish), multi-timeframe trend analysis, trend-adaptive grid sizing, ATR-based volatility, sell trailing optimization, and HODL Alpha tracking. Covers grid modes (arithmetic/geometric), asymmetric buy/sell grid spacing, position sizing strategies (equal/martingale/anti-martingale/pyramid/trend-adaptive), comprehensive risk controls (stop-loss, take-profit, drawdown protection, circuit breakers), trade execution via OKX DEX aggregator, PnL calculation, and Discord notification. Use when creating, modifying, debugging, or tuning a grid trading bot."
 license: Apache-2.0
 metadata:
   author: SynthThoughts
-  version: "4.2.1"
+  version: "1.0.0"
   pattern: "pipeline, tool-wrapper"
   steps: "5"
 ---
 
-# Dynamic Grid Trading Strategy v4.2.1
+# Dynamic Grid Trading Strategy v1.0
 
-Cron-driven grid bot for EVM L2 chains via `onchainos` CLI. v4.2 adds asymmetric grid steps — different spacing for buy vs sell sides based on trend direction. v4 adds trend intelligence: multi-timeframe analysis, sell optimization, and HODL Alpha tracking.
+Cron-driven grid bot for EVM L2 chains via `onchainos` CLI. Features asymmetric grid steps — different spacing for buy vs sell sides based on trend direction, trend intelligence with multi-timeframe analysis, sell optimization, and HODL Alpha tracking.
 
 Every tick: fetch price → MTF analysis → compute grid level → trend-adaptive decision → execute swap → report to Discord.
 
-## What's New in v4.2
+## Asymmetric Grid Steps
 
-Asymmetric grid steps — buy and sell sides use different spacing based on trend direction:
+Buy and sell sides use different spacing based on trend direction:
 
 | Trend | Buy Side | Sell Side | Effect |
 |-------|----------|-----------|--------|
 | Bullish | Tighter (accumulate fast) | Wider (hold longer) | Buy dense, sell sparse → captures uptrend |
 | Bearish | Wider (wait for dip) | Tighter (exit fast) | Sell dense, buy sparse → reduces downside exposure |
-| Neutral/Weak | Symmetric | Symmetric | Same as v4.1 |
+| Neutral/Weak | Symmetric | Symmetric | Symmetric (default) |
 
 Key config: `ASYM_FACTOR=0.4` (max asymmetry ratio). Asymmetry scales with trend strength and only activates when `strength > 0.3`.
 
 New grid dict fields: `buy_step`, `sell_step` (backward-compatible `step` = average). Level prices are now non-uniform: below center spaced by `buy_step`, above center by `sell_step`.
-
-## What's New in v4
-
-Five core improvements based on v3 production data (229 trades over 10 days):
-
-| # | Feature | Problem Solved | Key Config |
-|---|---------|----------------|------------|
-| 1 | **Multi-Timeframe Analysis** | No trend awareness — over-traded in trending markets | `MTF_SHORT/MEDIUM/LONG/STRUCTURE_PERIOD` |
-| 2 | **Trend-Adaptive Strategy** | Fixed grid width in all markets → poor alpha | `VOLATILITY_MULTIPLIER_TREND=3.0`, `SIZING_STRATEGY="trend_adaptive"` |
-| 3 | **K-line/ATR Volatility** | Price history stddev less accurate than OHLC true range | `onchainos market kline` integration |
-| 4 | **Sell Trailing Optimization** | Sold too early in uptrends (84.3% sell success vs 100% buy) | `SELL_TRAIL_TICKS=2`, `SELL_MOMENTUM_THRESHOLD=0.005` |
-| 5 | **HODL Alpha Tracking** | Could not measure grid vs pure hold performance | `initial_eth_price` in state, alpha in every tick output |
 
 ## Architecture
 
 ```
 Cron (5min) → Python script → onchainos CLI → OKX Web3 API → Chain
                   ↓                ↓
-            state_v4.json    Wallet (TEE signing)
+            state_v1.json    Wallet (TEE signing)
                   ↓
             ┌─────────────┐
             │ MTF Analysis │ ← price_history (288 bars = 24h)
@@ -86,7 +74,7 @@ Cron (5min) → Python script → onchainos CLI → OKX Web3 API → Chain
 - [ ] Circuit breaker not active (`consecutive_errors < 5`)
 - [ ] Stop not triggered (`stop_triggered == null`)
 
-### Step 2: Multi-Timeframe Analysis (v4 New)
+### Step 2: Multi-Timeframe Analysis
 
 **Actions**:
 1. Compute short EMA (25min / 5-bar), medium EMA (1h / 12-bar), long EMA (4h / 48-bar)
@@ -115,7 +103,7 @@ def analyze_multi_timeframe(history, price) -> dict:
 
 **Actions**:
 1. Calculate dynamic grid with trend-adaptive volatility multiplier:
-   - **v4.1**: Grid center = EMA(20) on **1H kline** (20-hour EMA, fetched via `onchainos market kline`). Falls back to 5min tick history if kline unavailable.
+   - Grid center = EMA(20) on **1H kline** (20-hour EMA, fetched via `onchainos market kline`). Falls back to 5min tick history if kline unavailable.
    - Base: `VOLATILITY_MULTIPLIER_BASE=2.0`
    - In trend (strength > 0.3): blend toward `VOLATILITY_MULTIPLIER_TREND=3.0`
    - Wider grid in trends → fewer trades → more holding
@@ -123,7 +111,7 @@ def analyze_multi_timeframe(history, price) -> dict:
 3. Map price → grid level
 4. If level changed: determine direction (BUY if level dropped, SELL if rose)
 5. Safety checks: cooldown, trend-adaptive position limits, repeat guard, consecutive limit
-6. **v4 Sell optimization**: if SELL in strong uptrend, delay via `_should_delay_sell()`
+6. Sell optimization: if SELL in strong uptrend, delay via `_should_delay_sell()`
 7. Calculate trade size with trend-adaptive sizing
 
 **Gate**:
@@ -152,7 +140,7 @@ def analyze_multi_timeframe(history, price) -> dict:
 2. Calculate HODL Alpha: `current_portfolio - (initial_eth × current_price)`
 3. Build structured JSON output for AI agent parsing
 4. Send Discord embed (green=SELL, blue=BUY, grey=no-trade, red=stop)
-5. Emit `---JSON---` block with v4 enriched fields
+5. Emit `---JSON---` block with enriched fields
 
 **Output**: Discord notification + structured JSON
 
@@ -203,13 +191,13 @@ Auto-retry policy: 1 retry for `retriable=True` with 3s delay and fresh quote.
 |---|---|---|
 | `GRID_LEVELS` | `6` | Number of grid levels. More = finer, more trades |
 | `GRID_TYPE` | `"arithmetic"` | `"arithmetic"` (fixed $ step) or `"geometric"` (fixed % step) |
-| `EMA_PERIOD` | `20` | EMA lookback for grid center (v4.1: applied to 1H kline = 20h) |
+| `EMA_PERIOD` | `20` | EMA lookback for grid center (applied to 1H kline = 20h) |
 | `VOLATILITY_MULTIPLIER_BASE` | `2.0` | Base grid width = multiplier x stddev |
-| `VOLATILITY_MULTIPLIER_TREND` | `3.0` | Wider grid in trending markets (v4) |
-| `ASYM_FACTOR` | `0.4` | **(v4.2)** Max buy/sell asymmetry ratio. 0=symmetric, 1=fully asymmetric |
+| `VOLATILITY_MULTIPLIER_TREND` | `3.0` | Wider grid in trending markets |
+| `ASYM_FACTOR` | `0.4` | Max buy/sell asymmetry ratio. 0=symmetric, 1=fully asymmetric |
 | `GRID_RECALIBRATE_HOURS` | `12` | Max hours before forced recalibration |
 
-### Multi-Timeframe (v4 New)
+### Multi-Timeframe
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -218,7 +206,7 @@ Auto-retry policy: 1 retry for `retriable=True` with 3s delay and fresh quote.
 | `MTF_LONG_PERIOD` | `48` | 48-bar EMA (4h @ 5min tick) |
 | `MTF_STRUCTURE_PERIOD` | `96` | 96-bar (8h @ 5min tick) for structure detection |
 
-### Sell Optimization (v4 New)
+### Sell Optimization
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -241,7 +229,7 @@ ratio = 1 + (step / center)
 level_prices = [center * (ratio ** (i - half)) for i in range(GRID_LEVELS + 1)]
 ```
 
-Both modes store `level_prices` in the grid dict for unified level lookup via `bisect_right`. v4.2 adds asymmetric spacing: levels below center use `buy_step`, levels above use `sell_step`. The `_build_level_prices()` helper handles both symmetric and asymmetric construction.
+Both modes store `level_prices` in the grid dict for unified level lookup via `bisect_right`. Asymmetric spacing uses levels below center spaced by `buy_step`, levels above by `sell_step`. The `_build_level_prices()` helper handles both symmetric and asymmetric construction.
 
 **Choosing a mode:**
 
@@ -254,14 +242,14 @@ Both modes store `level_prices` in the grid dict for unified level lookup via `b
 
 ### Adaptive Step Sizing
 
-Step scales with real-time volatility, modulated by trend strength (v4). v4.2 splits into directional buy/sell steps:
+Step scales with real-time volatility, modulated by trend strength. Splits into directional buy/sell steps:
 
 ```
 vol_mult = VOLATILITY_MULTIPLIER_BASE  (2.0)
 if trend_strength > 0.3:
     vol_mult = blend(BASE, TREND, strength)  (up to 3.0)
 
-# v4.2: Asymmetric steps based on trend direction
+# Asymmetric steps based on trend direction
 asym = ASYM_FACTOR × strength  (if strength > 0.3, else 0)
 if bullish:
     buy_mult  = vol_mult × (1 - asym)   # tighter buy
@@ -278,7 +266,7 @@ step = (buy_step + sell_step) / 2  # backward-compatible average
 
 | Parameter | Default | Description |
 |---|---|---|
-| `STEP_MIN_PCT` | `0.010` | Step floor as fraction of price (1.0%) — raised from v3's 0.8% |
+| `STEP_MIN_PCT` | `0.010` | Step floor as fraction of price (1.0%) |
 | `STEP_MAX_PCT` | `0.060` | Step cap as fraction of price (6%) |
 | `VOL_RECALIBRATE_RATIO` | `0.3` | Recalibrate if kline ATR shifts >30% from grid's stored ATR |
 
@@ -300,7 +288,7 @@ step = (buy_step + sell_step) / 2  # backward-compatible average
 
 ### Position Sizing Strategies
 
-v4 adds `trend_adaptive` strategy. Controls how much to trade at each grid level.
+Controls how much to trade at each grid level.
 
 | Strategy | Description |
 |---|---|
@@ -308,7 +296,7 @@ v4 adds `trend_adaptive` strategy. Controls how much to trade at each grid level
 | `"martingale"` | BUY more at lower levels, SELL more at higher levels |
 | `"anti_martingale"` | Reduces exposure as price moves further from center |
 | `"pyramid"` | Largest position at grid center, tapering toward edges |
-| `"trend_adaptive"` | **(v4 default)** In bullish: buy more + sell less. In bearish: sell more + buy less |
+| `"trend_adaptive"` | **(default)** In bullish: buy more + sell less. In bearish: sell more + buy less |
 
 ```python
 def _calc_sizing_multiplier(level, grid_levels, direction, mtf=None):
@@ -348,14 +336,14 @@ def _calc_sizing_multiplier(level, grid_levels, direction, mtf=None):
 | `COOLDOWN_AFTER_ERRORS` | `3600` | Cooldown after circuit breaker trips |
 | `POSITION_MAX_PCT_DEFAULT` | `70` | Block BUY when ETH > this % |
 | `POSITION_MIN_PCT_DEFAULT` | `30` | Block SELL when ETH < this % |
-| `POSITION_MAX_PCT_BULLISH` | `80` | **(v4)** Allow more ETH in bullish trend |
-| `POSITION_MIN_PCT_BEARISH` | `25` | **(v4)** Allow less ETH in bearish trend |
+| `POSITION_MAX_PCT_BULLISH` | `80` | Allow more ETH in bullish trend |
+| `POSITION_MIN_PCT_BEARISH` | `25` | Allow less ETH in bearish trend |
 
 Additional safety guards:
 - **Rapid drop protection**: skip BUY if price dropped >2% in last 30min (6 ticks)
 - **Consecutive same-direction reset**: limit resets if grid was recalibrated or >1h since last trade
 - **Anti-repeat**: skip if same direction + same level boundary as last trade
-- **v4 Trend-adaptive position limits**: limits shift based on trend direction and strength
+- **Trend-adaptive position limits**: limits shift based on trend direction and strength
 
 #### Stop-Loss, Trailing Stop & Take-Profit
 
@@ -379,9 +367,9 @@ def _check_stop_conditions(state, total_usd, price):
 ```
 1. If stop_triggered is set → log + Discord red alert + refuse trading + return
 2. Check _check_stop_conditions → if triggered, set stop_triggered + alert + return
-3. v4: Multi-timeframe analysis → get trend context
+3. Multi-timeframe analysis → get trend context
 4. Normal grid logic (cooldown, trend-adaptive position limits, etc.)
-5. v4: If SELL in strong uptrend → _should_delay_sell() check
+5. If SELL in strong uptrend → _should_delay_sell() check
 ```
 
 ## Core Algorithm
@@ -389,20 +377,20 @@ def _check_stop_conditions(state, total_usd, price):
 ```
 1. Fetch token price
 2. Read on-chain balances (ETH + USDC)
-3. v4: Multi-timeframe analysis → trend/strength/momentum/structure
-4. v4: Fetch K-line ATR volatility (hourly cache)
+3. Multi-timeframe analysis → trend/strength/momentum/structure
+4. Fetch K-line ATR volatility (hourly cache)
 5. Check if grid needs recalibration (breakout / vol shift / age)
-   → v4: calc_dynamic_grid() uses trend-adaptive volatility multiplier
-   → v4.2: asymmetric buy_step/sell_step based on trend direction
+   → calc_dynamic_grid() uses trend-adaptive volatility multiplier
+   → asymmetric buy_step/sell_step based on trend direction
 6. Map price → grid level
 7. If level changed:
    a. Direction: BUY if level dropped, SELL if rose
-   b. v4: If SELL in strong uptrend → delay check (trailing + momentum protection)
+   b. If SELL in strong uptrend → delay check (trailing + momentum protection)
    c. Safety checks (cooldown, trend-adaptive position limits, repeat guard, consecutive limit)
    d. Calculate trade size (trend-adaptive sizing)
    e. Execute swap via DEX aggregator
    f. Record trade, update level ONLY on success
-8. v4: Calculate HODL Alpha
+8. Calculate HODL Alpha
 9. Report status (JSON + Discord)
 ```
 
@@ -413,12 +401,12 @@ def calc_dynamic_grid(price, price_history, mtf=None):
     center = EMA(1H_kline, EMA_PERIOD)  # 20-hour EMA on 1H candles
     atr = calc_kline_volatility(candles)
 
-    # v4: trend-adaptive multiplier
+    # Trend-adaptive multiplier
     vol_mult = VOLATILITY_MULTIPLIER_BASE  # 2.0
     if mtf and mtf["strength"] > 0.3:
         vol_mult = blend(BASE=2.0, TREND=3.0, factor=strength)
 
-    # v4.2: asymmetric buy/sell multipliers
+    # Asymmetric buy/sell multipliers
     asym = ASYM_FACTOR * strength if strength > 0.3 else 0
     if bullish:
         buy_mult = vol_mult * (1 - asym)   # tighter buy grid
@@ -446,7 +434,7 @@ def calc_dynamic_grid(price, price_history, mtf=None):
 | Bearish | 0.6 | $54 | $33 | $1838-$2000 | $2000-$2099 | Buy wide + sell dense |
 | Strong Bull | 0.9 | $24 | $66 | $1928-$2000 | $2000-$2198 | Max asymmetry |
 
-## v4: Sell Optimization Logic
+## Sell Optimization Logic
 
 ```python
 def _should_delay_sell(state, current_level, prev_level, mtf, history):
@@ -468,7 +456,7 @@ def _should_delay_sell(state, current_level, prev_level, mtf, history):
     return None
 ```
 
-## v4: Trend-Adaptive Position Limits
+## Trend-Adaptive Position Limits
 
 ```python
 def _get_position_limits(mtf):
@@ -495,7 +483,7 @@ def calc_trade_amount(direction, eth_bal, usdc_bal, price,
     total_usd = available_eth * price + usdc_bal
     max_usd = total_usd * MAX_TRADE_PCT
 
-    # v4: Apply trend-adaptive sizing
+    # Apply trend-adaptive sizing
     multiplier = _calc_sizing_multiplier(level, grid_levels, direction, mtf)
     max_usd *= multiplier
 
@@ -512,9 +500,9 @@ def calc_trade_amount(direction, eth_bal, usdc_bal, price,
 | Trade succeeded | Yes | Grid crossing consumed |
 | Trade failed | No | Retry on next tick |
 | Trade skipped (cooldown/limit) | No | Don't lose the crossing |
-| v4: Sell delayed (trailing/momentum) | No | Will retry next tick |
+| Sell delayed (trailing/momentum) | No | Will retry next tick |
 
-## PnL Tracking (v2+ dual-denominated)
+## PnL Tracking (dual-denominated)
 
 ```
 # USD-denominated
@@ -528,7 +516,7 @@ initial_eth_equivalent = cost_basis / initial_price
 total_pnl_eth = current_eth_equivalent - initial_eth_equivalent
 ```
 
-**HODL Alpha** (v4 key metric): `grid_alpha_usd > 0` means grid outperforms pure ETH holding.
+**HODL Alpha** (key metric): `grid_alpha_usd > 0` means grid outperforms pure ETH holding.
 
 ## State Schema
 
@@ -576,17 +564,17 @@ total_pnl_eth = current_eth_equivalent - initial_eth_equivalent
 ```
 
 Key fields:
-- `grid.type` + `grid.level_prices`: geometric/arithmetic grid support (v4.2: asymmetric spacing)
-- `grid.buy_step` / `grid.sell_step`: v4.2 — directional step sizes; `grid.step` = average for backward compat
-- `stats.initial_eth_price`: v4 — records ETH price at bot start for HODL Alpha calculation
+- `grid.type` + `grid.level_prices`: geometric/arithmetic grid support (asymmetric spacing)
+- `grid.buy_step` / `grid.sell_step`: directional step sizes; `grid.step` = average for backward compat
+- `stats.initial_eth_price`: records ETH price at bot start for HODL Alpha calculation
 - `stats.portfolio_peak_usd`: highest portfolio value (for trailing stop)
 - `stop_triggered`: string describing trigger condition, or null
 - `last_failed_trade`: cached for `retry` command (expires after 10min)
 - `upside_breakout_ticks`: confirmation counter for upside recalibration
 - `approved_routers`: USDC approval cache to avoid redundant approvals
-- `mtf_cache`: v4 — cached multi-timeframe analysis result
-- `kline_cache`: v4 — cached K-line data (1h TTL)
-- `sell_trail_counter`: v4 — tracks sell delay tick counts per level transition
+- `mtf_cache`: cached multi-timeframe analysis result
+- `kline_cache`: cached K-line data (1h TTL)
+- `sell_trail_counter`: tracks sell delay tick counts per level transition
 
 ## Operational Interface
 
@@ -623,7 +611,7 @@ The `tick` command outputs a structured JSON block for AI agent parsing:
 ```
 ---JSON---
 {
-  "version": "4.0",
+  "version": "1.0",
   "status": "trade_executed" | "no_trade" | "cooldown" | "trade_failed" | ...,
   "market": {
     "price": 2090.45, "ema": 2085.3, "volatility_pct": 1.2,
@@ -643,7 +631,7 @@ The `tick` command outputs a structured JSON block for AI agent parsing:
 }
 ```
 
-The `analyze` command outputs additional v4 fields:
+The `analyze` command outputs additional fields:
 - `multi_timeframe`: full MTF data (EMA short/medium/long, momentum, structure)
 - `round_trips`: trade pair analysis (good / micro / loss classification)
 
@@ -671,7 +659,7 @@ if abs(unexplained_change) > $100:
 
 ### Logging
 
-- File: `grid_bot_v4.log` in script directory
+- File: `grid_bot_v1.log` in script directory
 - Rotation: simple half-file rotation at 1MB
 - Format: `[YYYY-MM-DD HH:MM:SS] message`
 
@@ -697,11 +685,11 @@ Based on 10-day backtest (2026-03-06 to 2026-03-16, ETH +9.00%):
 
 | Strategy | Return | Final Value |
 |---|---|---|
-| Grid (v4) | +0.43% | $513.66 |
+| Grid | +0.43% | $513.66 |
 | HODL | +5.48% | $539.47 |
 | Alpha | -5.05% | -$25.81 |
 
-Note: In a +9% uptrend, grid strategies naturally underperform HODL because they sell into the rise. The v4 trend-adaptive features (wider grid, sell delay, momentum protection) aim to reduce this gap.
+Note: In a +9% uptrend, grid strategies naturally underperform HODL because they sell into the rise. The trend-adaptive features (wider grid, sell delay, momentum protection) aim to reduce this gap.
 
 ### Parameter Scan Key Findings
 
@@ -800,7 +788,7 @@ Simulate new parameters against historical data, then: backup → patch → reca
 ### Review Checklist (AI Agent Prompt)
 
 ```
-1. Read grid_state_v4.json and grid_bot_v4.log
+1. Read grid_state_v1.json and grid_bot_v1.log
 2. Filter trades to review window (default: last 48h)
 3. Pair trades into round trips
 4. Compute: win_rate, avg_spread, loss_count, micro_count, total_pnl, hodl_alpha
@@ -815,7 +803,7 @@ Simulate new parameters against historical data, then: backup → patch → reca
 
 ```
 IF Step N fails:
-  1. Log failure reason to grid_bot_v4.log
+  1. Log failure reason to grid_bot_v1.log
   2. Increment errors.consecutive
   3. If errors.consecutive >= 5: trigger circuit breaker (1h cooldown)
   4. Cache failed trade for retry command (10min expiry)
@@ -840,6 +828,6 @@ IF Step N fails:
 | Step floor too low | Micro-profit trades only feed DEX fees, net negative after costs |
 | No center shift cap | Single spike can drag grid center 5%+, creating losing positions |
 | Fixed sizing in trends | Selling same size in uptrend = giving away alpha to the market |
-| Selling immediately in uptrend | v4 sell delay exists for a reason — let trends play out |
-| Symmetric grid in strong trends | v4.2: asymmetric grids accumulate faster on the favorable side |
+| Selling immediately in uptrend | Sell delay exists for a reason — let trends play out |
+| Symmetric grid in strong trends | Asymmetric grids accumulate faster on the favorable side |
 | Ignoring `buy_step`/`sell_step` in profit calc | Use actual `level_prices` differences, not average `step` |

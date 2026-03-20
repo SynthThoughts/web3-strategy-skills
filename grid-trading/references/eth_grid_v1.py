@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ETH/USDC Dynamic Grid Trading Bot v4 — Base Chain
+ETH/USDC Dynamic Grid Trading Bot v1.0 — Base Chain
 Improvements over v3:
   1. Multi-timeframe analysis (5min tick + 1h trend + 4h structure)
   2. Trend-adaptive grid: asymmetric sizing in trending markets
@@ -82,7 +82,7 @@ if not WALLET_ADDR:
         file=sys.stderr,
     )
 
-# ── Grid Parameters (v4 tuned) ─────────────────────────────────────────────
+# ── Grid Parameters ─────────────────────────────────────────────
 
 GRID_LEVELS = 6  # 6 levels
 GRID_TYPE = "arithmetic"  # "arithmetic" | "geometric"
@@ -90,18 +90,18 @@ MAX_TRADE_PCT = 0.12  # max 12% of total portfolio per trade
 MIN_TRADE_USD = 5.0  # minimum trade size in USD
 GAS_RESERVE_ETH = 0.003  # Reserve for gas (Base L2 gas is <$0.01)
 SLIPPAGE_PCT = 1  # 1% slippage for DEX aggregator swaps
-EMA_PERIOD = 20  # periods for EMA center (v4.1: applied to 1H kline = 20h)
+EMA_PERIOD = 20  # periods for EMA center (applied to 1H kline = 20h)
 
-# v4: Trend-adaptive volatility multiplier (v4.2: directional)
+# Trend-adaptive volatility multiplier (directional)
 VOLATILITY_MULTIPLIER_BASE = 1.5  # base multiplier (neutral/weak trend)
 VOLATILITY_MULTIPLIER_BULL = 3.0  # bullish: wider grid → hold position, trade less
 VOLATILITY_MULTIPLIER_BEAR = 1.0  # bearish: tighter grid → exit faster, trade more
-# v4.2: Asymmetric grid — different step sizes for buy vs sell side
+# Asymmetric grid — different step sizes for buy vs sell side
 # Bullish: tighter buy (accumulate fast) + wider sell (hold longer)
 # Bearish: tighter sell (exit fast) + wider buy (wait for dip)
 ASYM_FACTOR = 0.4  # max asymmetry ratio (0 = symmetric, 1 = fully asymmetric)
 
-# Sizing strategy (v4: trend-adaptive, see below)
+# Sizing strategy (trend-adaptive)
 SIZING_STRATEGY = "trend_adaptive"  # "equal" | "martingale" | "anti_martingale" | "pyramid" | "trend_adaptive"
 SIZING_MULTIPLIER_MIN = 0.5
 SIZING_MULTIPLIER_MAX = 2.0
@@ -111,14 +111,14 @@ STOP_LOSS_PCT = 0.15  # stop at 15% loss from cost basis
 TRAILING_STOP_PCT = 0.10  # stop at 10% drawdown from peak
 
 
-# Position limits (v4: trend-asymmetric)
+# Position limits (trend-asymmetric)
 POSITION_MAX_PCT_DEFAULT = 70  # Block BUY when ETH > this %
 POSITION_MIN_PCT_DEFAULT = 30  # Block SELL when ETH < this %
 POSITION_MAX_PCT_BULLISH = 80  # Allow more ETH in bullish trend
 POSITION_MIN_PCT_BEARISH = 25  # Allow less ETH in bearish trend
 
 # Adaptive step bounds (as fraction of price)
-STEP_MIN_PCT = 0.010  # v4: raised from 0.008 to 1.0% (covers DEX costs better)
+STEP_MIN_PCT = 0.010  # 1.0% (covers DEX costs)
 STEP_MAX_PCT = 0.060  # cap: 6%
 VOL_RECALIBRATE_RATIO = 0.3  # recalibrate if vol changes >30% from last grid
 MAX_CONSECUTIVE_ERRORS = 5  # circuit breaker threshold
@@ -132,20 +132,20 @@ UPSIDE_CONFIRM_TICKS = (
 )
 MAX_CENTER_SHIFT_PCT = 0.03  # max 3% grid center shift per recalibration (anti-chase)
 
-# v4: Multi-timeframe settings
+# Multi-timeframe settings
 MTF_SHORT_PERIOD = 5  # 5-bar EMA (25min @ 5min tick)
 MTF_MEDIUM_PERIOD = 12  # 12-bar EMA (1h @ 5min tick)
 MTF_LONG_PERIOD = 48  # 48-bar EMA (4h @ 5min tick)
 MTF_STRUCTURE_PERIOD = 96  # 96-bar (8h @ 5min tick) for structure detection
 
-# v4: Sell improvement — trailing grid lock
+# Sell improvement — trailing grid lock
 SELL_TRAIL_TICKS = 2  # wait 2 ticks (10min) of price stability before selling
 SELL_MOMENTUM_THRESHOLD = 0.005  # skip sell if 1h momentum > 0.5% (strong uptrend)
 
 # Paths
 SCRIPT_DIR = Path(__file__).parent
-STATE_FILE = SCRIPT_DIR / "grid_state_v4.json"
-LOG_FILE = SCRIPT_DIR / "grid_bot_v4.log"
+STATE_FILE = SCRIPT_DIR / "grid_state_v1.json"
+LOG_FILE = SCRIPT_DIR / "grid_bot_v1.log"
 MAX_LOG_BYTES = 1_000_000  # 1MB log rotation
 
 # ── Logging ─────────────────────────────────────────────────────────────────
@@ -247,7 +247,7 @@ def get_balances() -> tuple[float, float]:
     return eth, usdc
 
 
-# ── v4: K-line / OHLC Data ────────────────────────────────────────────────
+# ── K-line / OHLC Data ────────────────────────────────────────────────
 
 
 def get_kline_data(bar: str = "1H", limit: int = 24) -> list[dict] | None:
@@ -318,7 +318,7 @@ def calc_kline_volatility(candles: list[dict]) -> float:
     return (atr / avg_price) * 100 if avg_price > 0 else 0.0
 
 
-# ── v4: Multi-Timeframe Analysis ────────────────────────────────────────────
+# ── Multi-Timeframe Analysis ────────────────────────────────────────────
 
 
 def calc_ema(prices: list[float], period: int) -> float:
@@ -415,7 +415,7 @@ def analyze_multi_timeframe(history: list[float], price: float) -> dict:
     return result
 
 
-# ── v4: Trend-Adaptive Grid Calculation ─────────────────────────────────────
+# ── Trend-Adaptive Grid Calculation ─────────────────────────────────────
 
 
 def _build_level_prices(
@@ -442,10 +442,10 @@ def calc_dynamic_grid(
     current_price: float, price_history: list[float], mtf: dict | None = None
 ) -> dict:
     """Calculate dynamic grid with trend-adaptive parameters.
-    v4.1: Use 1H kline for grid center (more robust than 5min tick history).
+    Uses 1H kline for grid center (more robust than 5min tick history).
     In trending markets, use wider grid (hold more, trade less).
     """
-    # v4.1: Prefer 1H kline for center price — more stable than 5min ticks
+    # Prefer 1H kline for center price — more stable than 5min ticks
     hourly_closes: list[float] = []
     candles = get_kline_data(bar="1H", limit=max(EMA_PERIOD, 24))
     if candles and len(candles) >= 5:
@@ -471,7 +471,7 @@ def calc_dynamic_grid(
 
     # Calculate volatility and step size (skip if cold start already set step)
     if candles and len(candles) >= 2:
-        # v4.1: Use 1H ATR for step sizing (more robust than stddev)
+        # Use 1H ATR for step sizing (more robust than stddev)
         vol_pct = calc_kline_volatility(candles)  # ATR as % of price
         atr_dollar = vol_pct / 100 * current_price
         log(f"ATR(1H, {len(candles)} bars): {vol_pct:.2f}% = ${atr_dollar:.1f}")
@@ -494,7 +494,7 @@ def calc_dynamic_grid(
                     * strength
                 )  # 2.0 → 1.5: tighten to exit
 
-        # v4.2: Asymmetric buy/sell multipliers based on trend direction
+        # Asymmetric buy/sell multipliers based on trend direction
         # Bullish: tighter buy (accumulate fast) + wider sell (hold longer)
         # Bearish: tighter sell (exit fast) + wider buy (wait for dip)
         asym = ASYM_FACTOR * strength if strength > 0.3 else 0
@@ -588,7 +588,7 @@ def _calc_sizing_multiplier(
     direction: str,
     mtf: dict | None = None,
 ) -> float:
-    """v4: Trend-adaptive sizing.
+    """Trend-adaptive sizing.
     - In bullish trend: buy more (larger buys), sell less (smaller sells) → hold more ETH
     - In bearish trend: buy less, sell more → hold more USDC
     """
@@ -995,7 +995,6 @@ def load_state() -> dict:
             "deposit_history": [],
         },
         "errors": {"consecutive": 0, "cooldown_until": None},
-        # v4 new fields
         "mtf_cache": None,
         "kline_cache": None,
         "sell_trail_counter": {},  # {level: tick_count}
@@ -1019,7 +1018,7 @@ def _calc_market_data(
     mtf: dict | None = None,
     kline_vol: float | None = None,
 ) -> dict:
-    """Calculate market analysis data for JSON output (v4 enriched)."""
+    """Calculate market analysis data for JSON output."""
     ema = calc_ema(history, min(EMA_PERIOD, len(history))) if history else price
     vol = calc_volatility(history) if len(history) >= 2 else 0
     avg = sum(history) / len(history) if history else price
@@ -1039,7 +1038,7 @@ def _calc_market_data(
         "grid_utilization": grid_util,
     }
 
-    # v4: MTF data
+    # MTF data
     if mtf:
         result["trend"] = mtf.get("trend", "neutral")
         result["trend_strength"] = mtf.get("strength", 0)
@@ -1060,7 +1059,7 @@ def _calc_market_data(
         else:
             result["trend"] = "neutral"
 
-    # v4: K-line ATR volatility
+    # K-line ATR volatility
     if kline_vol is not None:
         result["kline_atr_pct"] = round(kline_vol, 2)
 
@@ -1241,7 +1240,7 @@ def _detect_deposits(
     return None
 
 
-# ── v4: Trend-Adaptive Position Limits ──────────────────────────────────────
+# ── Trend-Adaptive Position Limits ──────────────────────────────────────
 
 
 def _get_position_limits(mtf: dict | None) -> tuple[int, int]:
@@ -1269,7 +1268,7 @@ def _get_position_limits(mtf: dict | None) -> tuple[int, int]:
     return POSITION_MAX_PCT_DEFAULT, POSITION_MIN_PCT_DEFAULT
 
 
-# ── v4: Sell Optimization ───────────────────────────────────────────────────
+# ── Sell Optimization ───────────────────────────────────────────────────
 
 
 def _should_delay_sell(
@@ -1279,7 +1278,7 @@ def _should_delay_sell(
     mtf: dict | None,
     history: list[float],
 ) -> str | None:
-    """v4: Check if we should delay sell in strong uptrend.
+    """Check if we should delay sell in strong uptrend.
     Returns skip reason or None."""
     if not mtf:
         return None
@@ -1292,7 +1291,7 @@ def _should_delay_sell(
             # Bullish trend + strong momentum: skip this sell, let it ride
             structure = mtf.get("structure", "ranging")
             log(
-                f"  v4 sell delay: bullish momentum (1h momentum {momentum_1h:.2f}%, "
+                f"  sell delay: bullish momentum (1h momentum {momentum_1h:.2f}%, "
                 f"structure={structure})"
             )
             return f"trend_hold (momentum +{momentum_1h:.1f}%)"
@@ -1305,7 +1304,7 @@ def _should_delay_sell(
         trail[level_key] = count + 1
         state["sell_trail_counter"] = trail
         remaining = SELL_TRAIL_TICKS - count - 1
-        log(f"  v4 sell trail: waiting {remaining} more ticks for level {level_key}")
+        log(f"  sell trail: waiting {remaining} more ticks for level {level_key}")
         return f"sell_trail ({count + 1}/{SELL_TRAIL_TICKS})"
 
     # Clear trail counter after triggering
@@ -1319,7 +1318,7 @@ def _should_delay_sell(
 
 def tick():
     """Main tick: check price, execute trade if grid crossing detected.
-    v4: multi-timeframe, sell-optimized."""
+    Multi-timeframe, sell-optimized."""
     state = load_state()
 
     # Circuit breaker check
@@ -1401,11 +1400,11 @@ def tick():
     # Detect external deposits/withdrawals
     detected_deposit = _detect_deposits(state, eth_bal, usdc_bal, price)
 
-    # ── v4: Multi-timeframe analysis ──
+    # ── Multi-timeframe analysis ──
     mtf = analyze_multi_timeframe(history, price)
     state["mtf_cache"] = mtf
 
-    # ── v4: K-line volatility (fetch every 1h) ──
+    # ── K-line volatility (fetch every 1h) ──
     kline_vol = None
     kline_cache = state.get("kline_cache")
     kline_stale = True
@@ -1423,7 +1422,7 @@ def tick():
                 "candles_count": len(candles),
                 "fetched_at": datetime.now().isoformat(),
             }
-            log(f"v4 K-line ATR: {kline_vol:.2f}%")
+            log(f"K-line ATR: {kline_vol:.2f}%")
         else:
             kline_vol = kline_cache.get("atr_pct") if kline_cache else None
     else:
@@ -1624,7 +1623,7 @@ def tick():
                 skip_reason = f"cooldown ({int(MIN_TRADE_INTERVAL - elapsed)}s left)"
                 tick_status = "cooldown"
 
-        # ── v4: Trend-adaptive position limits ──
+        # ── Trend-adaptive position limits ──
         if not skip_reason:
             pos_max, pos_min = _get_position_limits(mtf)
             if direction == "BUY" and eth_pct > pos_max:
@@ -1682,7 +1681,7 @@ def tick():
                     skip_reason = f"rapid drop ({drop_pct:.1f}% in 30min)"
                     tick_status = "rapid_drop"
 
-        # ── v4: Sell delay in strong uptrend ──
+        # ── Sell delay in strong uptrend ──
         if not skip_reason and direction == "SELL":
             sell_delay = _should_delay_sell(
                 state, current_level, prev_level, mtf, history
@@ -1701,7 +1700,7 @@ def tick():
             trail.pop(level_key, None)
             state["sell_trail_counter"] = trail
 
-            # Calculate trade amount (v4: with MTF)
+            # Calculate trade amount
             amount, calc_fail = calc_trade_amount(
                 direction,
                 eth_bal,
@@ -1967,7 +1966,7 @@ def tick():
             if deposits != 0:
                 desc += f" | 资金调整 ${deposits:+.0f}"
             embed = {
-                "title": "\u23f3 ETH 网格 v4.1 -- 运行中",
+                "title": "\u23f3 ETH 网格 v1.0 -- 运行中",
                 "color": 0x9E9E9E,
                 "description": desc,
                 "footer": {"text": grid_footer},
@@ -1999,7 +1998,7 @@ def tick():
     if should_print:
         json_data = {
             "status": tick_status,
-            "version": "4.1",
+            "version": "1.0",
             "market": market_data,
             "portfolio": portfolio_data,
             "grid_level": display_level,
@@ -2033,7 +2032,7 @@ def tick():
 
 
 def status():
-    """Print current status (v4 enriched)."""
+    """Print current status."""
     state = load_state()
     price = get_eth_price()
     eth_bal, usdc_bal = get_balances()
@@ -2043,7 +2042,7 @@ def status():
     stats = state.get("stats", {})
     history = state.get("price_history", [])
 
-    print("**ETH 网格机器人 v4 -- 状态**")
+    print("**ETH 网格机器人 v1.0 -- 状态**")
     print(f"> 价格: `${price:.2f}`" if price else "> 价格: 不可用")
     print(
         f"> 余额: `{eth_bal:.6f}` ETH + `${usdc_bal:.2f}` USDC = **`${total_usd:.0f}`**"
@@ -2116,7 +2115,7 @@ def status():
         print("> 使用 `resume-trading` 恢复交易")
 
     # Strategy info
-    print("\n**策略配置 v4**")
+    print("\n**策略配置 v1.0**")
     print(f"> 资金策略: `{SIZING_STRATEGY}` | 网格类型: `{GRID_TYPE}`")
     print(
         f"> 步长范围: `{STEP_MIN_PCT * 100:.1f}%`-`{STEP_MAX_PCT * 100:.1f}%` | 卖出追踪: `{SELL_TRAIL_TICKS}` ticks"
@@ -2133,7 +2132,7 @@ def status():
 
 
 def report():
-    """Generate daily report (v4 enriched with trend + alpha)."""
+    """Generate daily report."""
     state = load_state()
     price = get_eth_price()
     eth_bal, usdc_bal = get_balances()
@@ -2265,7 +2264,7 @@ def report():
         footer_text = f"趋势 {mtf['trend']} ({mtf['strength']:.0%}) | 结构 {mtf['structure']} | {footer_text}"
 
     embed = {
-        "title": "\U0001f4ca ETH 网格 v4.1 — 每日报告",
+        "title": "\U0001f4ca ETH 网格 v1.0 — 每日报告",
         "color": 0x2196F3,
         "fields": fields,
         "footer": {"text": footer_text},
@@ -2275,7 +2274,7 @@ def report():
     sent = _send_discord_embed([embed])
     if not sent:
         # Fallback to print output
-        print("**ETH 网格机器人 v4.1 -- 每日报告**")
+        print("**ETH 网格机器人 v1.0 -- 每日报告**")
         print(f"> 当前价格: `${price:.2f}`" if price else "> 当前价格: N/A")
         print(
             f"> 24h 范围: `${price_low:.2f}` - `${price_high:.2f}` | 波动率: `{vol_pct:.1f}%`"
@@ -2410,7 +2409,7 @@ def reset():
     save_state(new_state)
 
     total = eth_bal * (price or 0) + usdc_bal
-    print(f"网格已重置 (v4)。价格: `${price:.2f}`, 余额: `${total:.0f}`")
+    print(f"网格已重置 (v1.0)。价格: `${price:.2f}`, 余额: `${total:.0f}`")
     print("计数器已重置。下次 tick 时将重新校准网格。")
 
 
@@ -2515,7 +2514,7 @@ def retry():
 
 
 def analyze():
-    """Output detailed market analysis JSON for AI agent (v4 enriched)."""
+    """Output detailed market analysis JSON for AI agent."""
     state = load_state()
     price = get_eth_price()
     eth_bal, usdc_bal = get_balances()
@@ -2621,7 +2620,7 @@ def analyze():
                     break
 
     analysis = {
-        "version": "4.1",
+        "version": "1.0",
         "timestamp": datetime.now().isoformat(),
         "market": {
             "price": round(price, 2),
@@ -2680,7 +2679,7 @@ def analyze():
 def deposit():
     """Manually record deposit/withdrawal."""
     if len(sys.argv) < 3:
-        print("用法: eth_grid_v4.py deposit <金额USD>")
+        print("用法: eth_grid_v1.py deposit <金额USD>")
         print("正数=存入, 负数=取出. 例: deposit 100 或 deposit -50")
         return
 
