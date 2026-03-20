@@ -741,6 +741,8 @@ def defi_calculate_entry(
             "calculate-entry",
             "--id",
             INVESTMENT_ID,
+            "--address",
+            WALLET_ADDR,
             "--input-token",
             input_token,
             "--input-amount",
@@ -1043,12 +1045,12 @@ def execute_rebalance(
         tick_upper=new_tick_upper,
     )
 
-    user_input_json = "{}"
+    user_input_json = "[]"
     if entry_data:
         if isinstance(entry_data, list) and entry_data:
-            user_input_json = json.dumps(entry_data[0])
-        elif isinstance(entry_data, dict):
             user_input_json = json.dumps(entry_data)
+        elif isinstance(entry_data, dict):
+            user_input_json = json.dumps([entry_data])
         log(f"  Entry calculated: {user_input_json[:200]}")
 
         # Check if swap is needed for token ratio adjustment
@@ -1096,9 +1098,9 @@ def execute_rebalance(
         )
         if entry_data:
             if isinstance(entry_data, list) and entry_data:
-                user_input_json = json.dumps(entry_data[0])
-            elif isinstance(entry_data, dict):
                 user_input_json = json.dumps(entry_data)
+            elif isinstance(entry_data, dict):
+                user_input_json = json.dumps([entry_data])
 
     # Step 5: Deposit at new range
     deposit_result = defi_deposit(user_input_json, new_tick_lower, new_tick_upper)
@@ -1175,12 +1177,12 @@ def _emergency_deposit(state: dict, price: float, trigger: dict) -> bool:
     entry_data = defi_calculate_entry(
         USDC_ADDR, usdc_amount_str, TOKEN1["decimals"], tick_lower, tick_upper
     )
-    user_input = "{}"
+    user_input = "[]"
     if entry_data:
         if isinstance(entry_data, list) and entry_data:
-            user_input = json.dumps(entry_data[0])
-        elif isinstance(entry_data, dict):
             user_input = json.dumps(entry_data)
+        elif isinstance(entry_data, dict):
+            user_input = json.dumps([entry_data])
 
     deposit_result = defi_deposit(user_input, tick_lower, tick_upper)
     if deposit_result:
