@@ -1,5 +1,7 @@
 # 网格交易
 
+[English](./README.md)
+
 基于 OKX DEX API 的 EVM L2 链上动态网格交易策略，适用于任意交易对。
 
 ## 特性

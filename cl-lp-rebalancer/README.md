@@ -1,5 +1,7 @@
 # CL LP Rebalancer
 
+[中文](./README_CN.md)
+
 Concentrated liquidity LP auto-rebalancer for Uniswap V3 positions on EVM L2 chains via OKX DEX API.
 
 ## Features

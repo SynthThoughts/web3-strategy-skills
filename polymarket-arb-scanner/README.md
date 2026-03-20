@@ -1,5 +1,7 @@
 # Polymarket Arb Scanner
 
+[中文](./README_CN.md)
+
 Three-layer arbitrage detection framework for Polymarket's CLOB (Central Limit Order Book).
 
 ## Features

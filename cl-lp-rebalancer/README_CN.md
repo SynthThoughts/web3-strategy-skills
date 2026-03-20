@@ -1,5 +1,7 @@
 # CL LP 自动调仓器
 
+[English](./README.md)
+
 基于 OKX DEX API 的 EVM L2 链上 Uniswap V3 集中流动性 LP 自动调仓策略。
 
 ## 特性

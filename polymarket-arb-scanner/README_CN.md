@@ -1,5 +1,7 @@
 # Polymarket 套利扫描器
 
+[English](./README.md)
+
 Polymarket CLOB（中央限价订单簿）三层套利检测框架。
 
 ## 特性

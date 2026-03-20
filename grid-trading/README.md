@@ -1,5 +1,7 @@
 # Grid Trading
 
+[中文](./README_CN.md)
+
 Dynamic grid trading strategy for any token pair on EVM L2 chains via OKX DEX API.
 
 ## Features

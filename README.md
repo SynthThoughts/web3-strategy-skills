@@ -1,5 +1,7 @@
 # Web3 Strategy Skills
 
+[中文](./README_CN.md)
+
 Reusable Web3 trading skills for AI coding agents. Each skill is a self-contained `SKILL.md` that teaches an AI agent how to build, deploy, and operate a specific trading strategy.
 
 ## Skills

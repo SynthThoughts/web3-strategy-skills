@@ -1,5 +1,7 @@
 # OKX Strategy Factory
 
+[中文](./README_CN.md)
+
 A meta-skill that coordinates 5 specialized AI agents to handle the full lifecycle of on-chain trading strategies on OKX OnchainOS: development, backtesting, deployment, publishing, and iteration.
 
 ## What is this?
