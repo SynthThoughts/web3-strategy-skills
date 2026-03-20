@@ -32,8 +32,8 @@ SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_REL"
 SCRIPT_PARENT="$(dirname "$SCRIPT_PATH")"
 
 # ── VPS 配置 ──────────────────────────────────────────────────────────────────
-VPS_HOST="VPS_HOST_REDACTED"
-VPS_USER="ubuntu"
+VPS_HOST="${VPS_HOST:?请设置 VPS_HOST 环境变量}"
+VPS_USER="${VPS_USER:-ubuntu}"
 VPS_SSH_KEY_ITEM="OpenClaw"
 VPS_DEPLOY_DIR="/opt/strategy/$STRATEGY"
 

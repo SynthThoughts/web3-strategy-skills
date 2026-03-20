@@ -55,7 +55,7 @@ dashboard (可视化)
 | 环境 | 用途 | onchainos |
 |------|------|-----------|
 | 本地 Mac | 开发 + 回测 | `Agentic Wallet/onchainos` (arm64) |
-| VPS `VPS_HOST_REDACTED` | 实盘 + 看板 | `/usr/local/bin/onchainos` (amd64) |
+| VPS (见 1Password "OpenClaw") | 实盘 + 看板 | `/usr/local/bin/onchainos` (amd64) |
 
 VPS 通过 SSH 部署，pm2 管理进程，OpenClaw 推送 Discord 通知。
 
