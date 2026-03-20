@@ -37,30 +37,16 @@ def _load_env():
 
 _load_env()
 
-# ── Load Config ─────────────────────────────────────────────────────────────
-
-SCRIPT_DIR = Path(__file__).parent
-CONFIG_FILE = SCRIPT_DIR / "config.json"
-
-if CONFIG_FILE.exists():
-    CFG = json.loads(CONFIG_FILE.read_text())
-else:
-    CFG = {}
-
-# ── API Keys ───────────────────────────────────────────────────────────────
+# ── Config ──────────────────────────────────────────────────────────────────
 
 OKX_API_KEY = os.environ.get("OKX_API_KEY", "")
 OKX_SECRET = os.environ.get("OKX_SECRET_KEY", "")
 OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
 
-# ── Token & Chain ──────────────────────────────────────────────────────────
-
-TOKEN0 = CFG.get("token0", {})
-TOKEN1 = CFG.get("token1", {})
-ETH_ADDR = TOKEN0.get("address", "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
-USDC_ADDR = TOKEN1.get("address", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913")
-CHAIN_ID = CFG.get("chain_id", "8453")
-CHAIN_NAME = CFG.get("chain_name", "base")
+# Token addresses (Base chain)
+ETH_ADDR = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+USDC_ADDR = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+CHAIN_ID = "8453"
 
 
 def _resolve_wallet_addr() -> str:
@@ -96,76 +82,86 @@ if not WALLET_ADDR:
         file=sys.stderr,
     )
 
-# ── Grid Parameters (from config with defaults) ───────────────────────────
+# ── Grid Parameters ─────────────────────────────────────────────
 
-GRID_LEVELS = CFG.get("grid_levels", 6)
-GRID_TYPE = CFG.get("grid_type", "arithmetic")
-MAX_TRADE_PCT = CFG.get("max_trade_pct", 0.12)
-MIN_TRADE_USD = CFG.get("min_trade_usd", 5.0)
-GAS_RESERVE_ETH = CFG.get("gas_reserve_eth", 0.003)
-SLIPPAGE_PCT = CFG.get("slippage_pct", 1)
-EMA_PERIOD = CFG.get("ema_period", 20)
+GRID_LEVELS = 6  # 6 levels
+GRID_TYPE = "arithmetic"  # "arithmetic" | "geometric"
+MAX_TRADE_PCT = 0.12  # max 12% of total portfolio per trade
+MIN_TRADE_USD = 5.0  # minimum trade size in USD
+GAS_RESERVE_ETH = 0.003  # Reserve for gas (Base L2 gas is <$0.01)
+SLIPPAGE_PCT = 1  # 1% slippage for DEX aggregator swaps
+EMA_PERIOD = 20  # periods for EMA center (applied to 1H kline = 20h)
 
 # Trend-adaptive volatility multiplier (directional)
-VOLATILITY_MULTIPLIER_BASE = CFG.get("volatility_multiplier_base", 1.5)
-VOLATILITY_MULTIPLIER_BULL = CFG.get("volatility_multiplier_bull", 3.0)
-VOLATILITY_MULTIPLIER_BEAR = CFG.get("volatility_multiplier_bear", 1.0)
-ASYM_FACTOR = CFG.get("asym_factor", 0.4)
+VOLATILITY_MULTIPLIER_BASE = 1.5  # base multiplier (neutral/weak trend)
+VOLATILITY_MULTIPLIER_BULL = 3.0  # bullish: wider grid → hold position, trade less
+VOLATILITY_MULTIPLIER_BEAR = 1.0  # bearish: tighter grid → exit faster, trade more
+# Asymmetric grid — different step sizes for buy vs sell side
+# Bullish: tighter buy (accumulate fast) + wider sell (hold longer)
+# Bearish: tighter sell (exit fast) + wider buy (wait for dip)
+ASYM_FACTOR = 0.4  # max asymmetry ratio (0 = symmetric, 1 = fully asymmetric)
 
 # Sizing strategy (trend-adaptive)
-SIZING_STRATEGY = CFG.get("sizing_strategy", "trend_adaptive")
-SIZING_MULTIPLIER_MIN = CFG.get("sizing_multiplier_min", 0.5)
-SIZING_MULTIPLIER_MAX = CFG.get("sizing_multiplier_max", 2.0)
+SIZING_STRATEGY = "trend_adaptive"  # "equal" | "martingale" | "anti_martingale" | "pyramid" | "trend_adaptive"
+SIZING_MULTIPLIER_MIN = 0.5
+SIZING_MULTIPLIER_MAX = 2.0
 
 # Stop-loss / take-profit protection
-STOP_LOSS_PCT = CFG.get("stop_loss_pct", 0.15)
-TRAILING_STOP_PCT = CFG.get("trailing_stop_pct", 0.10)
+STOP_LOSS_PCT = 0.15  # stop at 15% loss from cost basis
+TRAILING_STOP_PCT = 0.10  # stop at 10% drawdown from peak
+
 
 # Position limits (trend-asymmetric)
-POSITION_MAX_PCT_DEFAULT = CFG.get("position_max_pct_default", 70)
-POSITION_MIN_PCT_DEFAULT = CFG.get("position_min_pct_default", 30)
-POSITION_MAX_PCT_BULLISH = CFG.get("position_max_pct_bullish", 80)
-POSITION_MIN_PCT_BEARISH = CFG.get("position_min_pct_bearish", 25)
+POSITION_MAX_PCT_DEFAULT = 70  # Block BUY when ETH > this %
+POSITION_MIN_PCT_DEFAULT = 30  # Block SELL when ETH < this %
+POSITION_MAX_PCT_BULLISH = 80  # Allow more ETH in bullish trend
+POSITION_MIN_PCT_BEARISH = 25  # Allow less ETH in bearish trend
 
 # Adaptive step bounds (as fraction of price)
-STEP_MIN_PCT = CFG.get("step_min_pct", 0.010)
-STEP_MAX_PCT = CFG.get("step_max_pct", 0.060)
-VOL_RECALIBRATE_RATIO = CFG.get("vol_recalibrate_ratio", 0.3)
-MAX_CONSECUTIVE_ERRORS = CFG.get("max_consecutive_errors", 5)
-MAX_SAME_DIR_TRADES = CFG.get("max_same_dir_trades", 3)
-COOLDOWN_AFTER_ERRORS = CFG.get("cooldown_after_errors", 3600)
-QUIET_INTERVAL = CFG.get("quiet_interval", 3600)
-MIN_TRADE_INTERVAL = CFG.get("min_trade_interval", 1800)
-GRID_RECALIBRATE_HOURS = CFG.get("grid_recalibrate_hours", 12)
-UPSIDE_CONFIRM_TICKS = CFG.get("upside_confirm_ticks", 6)
-MAX_CENTER_SHIFT_PCT = CFG.get("max_center_shift_pct", 0.03)
+STEP_MIN_PCT = 0.010  # 1.0% (covers DEX costs)
+STEP_MAX_PCT = 0.060  # cap: 6%
+VOL_RECALIBRATE_RATIO = 0.3  # recalibrate if vol changes >30% from last grid
+MAX_CONSECUTIVE_ERRORS = 5  # circuit breaker threshold
+MAX_SAME_DIR_TRADES = 3  # max consecutive same-direction trades before pause
+COOLDOWN_AFTER_ERRORS = 3600  # 1 hour cooldown after circuit break
+QUIET_INTERVAL = 3600  # seconds between no-trade status reports (1 hour)
+MIN_TRADE_INTERVAL = 1800  # 30min cooldown between same-direction trades
+GRID_RECALIBRATE_HOURS = 12  # Keep grid fixed; recalibrate only when needed
+UPSIDE_CONFIRM_TICKS = (
+    6  # 30min: price must hold above grid before upside recalibration
+)
+MAX_CENTER_SHIFT_PCT = 0.03  # max 3% grid center shift per recalibration (anti-chase)
 
 # Multi-timeframe settings
-MTF_SHORT_PERIOD = CFG.get("mtf_short_period", 5)
-MTF_MEDIUM_PERIOD = CFG.get("mtf_medium_period", 12)
-MTF_LONG_PERIOD = CFG.get("mtf_long_period", 48)
-MTF_STRUCTURE_PERIOD = CFG.get("mtf_structure_period", 96)
+MTF_SHORT_PERIOD = 5  # 5-bar EMA (25min @ 5min tick)
+MTF_MEDIUM_PERIOD = 12  # 12-bar EMA (1h @ 5min tick)
+MTF_LONG_PERIOD = 48  # 48-bar EMA (4h @ 5min tick)
+MTF_STRUCTURE_PERIOD = 96  # 96-bar (8h @ 5min tick) for structure detection
 
 # Sell improvement — trailing grid lock
-SELL_TRAIL_TICKS = CFG.get("sell_trail_ticks", 2)
-SELL_MOMENTUM_THRESHOLD = CFG.get("sell_momentum_threshold", 0.005)
+SELL_TRAIL_TICKS = 2  # wait 2 ticks (10min) of price stability before selling
+SELL_MOMENTUM_THRESHOLD = 0.005  # skip sell if 1h momentum > 0.5% (strong uptrend)
 
 # Dip-buy accumulation (buy-only mode when sell is blocked)
-DIP_BUY_LOOKBACK = CFG.get("dip_buy_lookback", 12)
-DIP_BUY_MIN_DRAWDOWN = CFG.get("dip_buy_min_drawdown", 0.005)
-DIP_BUY_COOLDOWN = CFG.get("dip_buy_cooldown", 1800)
-_dip_tiers_raw = CFG.get(
-    "dip_buy_tiers",
-    [(0.03, 2.0), (0.02, 1.5), (0.01, 1.0), (0.005, 0.5)],
+DIP_BUY_LOOKBACK = 12  # 1 hour of 5min bars for recent-high detection
+DIP_BUY_MIN_DRAWDOWN = 0.005  # 0.5% minimum pullback from recent high
+DIP_BUY_COOLDOWN = 1800  # 30min cooldown between dip buys
+DIP_BUY_TIERS = [  # (drawdown_threshold, sizing_multiplier)
+    (0.03, 2.0),  # ≥3% drop: 200% size
+    (0.02, 1.5),  # ≥2% drop: 150% size
+    (0.01, 1.0),  # ≥1% drop: 100% size
+    (0.005, 0.5),  # ≥0.5% drop: 50% size
+]
+DIP_BUY_MOMENTUM_FLOOR = -0.5  # skip if 1h momentum < -0.5% (still falling hard)
+DIP_BUY_REVERSAL_TICKS = (
+    2  # price must rise for N consecutive ticks to confirm reversal
 )
-DIP_BUY_TIERS = [tuple(t) for t in _dip_tiers_raw]
-DIP_BUY_MOMENTUM_FLOOR = CFG.get("dip_buy_momentum_floor", -0.5)
-DIP_BUY_REVERSAL_TICKS = CFG.get("dip_buy_reversal_ticks", 2)
 
 # Paths
+SCRIPT_DIR = Path(__file__).parent
 STATE_FILE = SCRIPT_DIR / "grid_state_v1.json"
 LOG_FILE = SCRIPT_DIR / "grid_bot_v1.log"
-MAX_LOG_BYTES = CFG.get("max_log_bytes", 1_000_000)
+MAX_LOG_BYTES = 1_000_000  # 1MB log rotation
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 
@@ -239,7 +235,7 @@ def get_eth_price() -> float | None:
             "--amount",
             "1000000000000000000",
             "--chain",
-            CHAIN_NAME,
+            "base",
         ]
     )
     if data and data.get("ok") and data.get("data"):
@@ -279,7 +275,7 @@ def get_kline_data(bar: str = "1H", limit: int = 24) -> list[dict] | None:
             "--address",
             ETH_ADDR,
             "--chain",
-            CHAIN_NAME,
+            "base",
             "--bar",
             bar,
             "--limit",
@@ -750,7 +746,7 @@ def ensure_approval(spender: str, amount: int) -> bool:
             "--amount",
             max_approval,
             "--chain",
-            CHAIN_NAME,
+            "base",
         ]
     )
 
@@ -858,7 +854,7 @@ def simulate_tx(tx: dict) -> dict | None:
             "--amount",
             tx.get("value", "0"),
             "--chain",
-            CHAIN_NAME,
+            "base",
         ],
         timeout=15,
     )
@@ -878,7 +874,7 @@ def simulate_tx(tx: dict) -> dict | None:
 
 
 def execute_swap(
-    direction: str, amount: int, price: float, chain: str = CHAIN_NAME
+    direction: str, amount: int, price: float, chain: str = "base"
 ) -> tuple[str | None, dict | None]:
     """Execute swap via onchainos CLI + Agentic Wallet (TEE signing)."""
     if direction == "SELL":
@@ -1709,6 +1705,21 @@ def tick():
             if elapsed < MIN_TRADE_INTERVAL:
                 skip_reason = f"cooldown ({int(MIN_TRADE_INTERVAL - elapsed)}s left)"
                 tick_status = "cooldown"
+
+        # ── Cross-direction cooldown: prevent instant reversal after trade ──
+        if not skip_reason:
+            opposite = "SELL" if direction == "BUY" else "BUY"
+            opp_time_str = last_trade_times.get(opposite)
+            if opp_time_str:
+                opp_elapsed = (
+                    datetime.now() - datetime.fromisoformat(opp_time_str)
+                ).total_seconds()
+                if opp_elapsed < MIN_TRADE_INTERVAL:
+                    skip_reason = (
+                        f"cross-cooldown (last {opposite} {int(opp_elapsed)}s ago, "
+                        f"need {MIN_TRADE_INTERVAL}s)"
+                    )
+                    tick_status = "cooldown"
 
         # ── Trend-adaptive position limits ──
         if not skip_reason:
@@ -2635,6 +2646,10 @@ def retry():
         _initial = state["stats"].get("initial_portfolio_usd") or 0
         _deposits = state["stats"].get("total_deposits_usd", 0)
         state["stats"]["realized_pnl"] = round(_total_usd - _initial - _deposits, 2)
+        # Update trade time to enforce cross-direction cooldown
+        if "last_trade_times" not in state:
+            state["last_trade_times"] = {}
+        state["last_trade_times"][direction] = datetime.now().isoformat()
         state.pop("last_failed_trade", None)
         save_state(state)
         print(f"**重试成功**: {dir_cn} `${trade_usd:.2f}` @ `${price:.2f}`")
