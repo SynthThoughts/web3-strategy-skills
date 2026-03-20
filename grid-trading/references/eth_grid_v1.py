@@ -973,7 +973,6 @@ def load_state() -> dict:
         "trades": [],
         "last_balances": None,
         "stats": {
-            "total_trades": 0,
             "total_sell_usdc": 0.0,
             "total_buy_usdc": 0.0,
             "realized_pnl": 0.0,
@@ -1753,7 +1752,6 @@ def tick():
                     state["trades"].append(trade_record)
                     if len(state["trades"]) > 50:
                         state["trades"] = state["trades"][-50:]
-                    state["stats"]["total_trades"] += 1
                     if direction == "SELL":
                         state["stats"]["total_sell_usdc"] = round(
                             state["stats"].get("total_sell_usdc", 0) + trade_usd, 2
@@ -1860,7 +1858,7 @@ def tick():
     cost_basis = (initial or 0) + deposits
     total_pnl = round(total_usd - cost_basis, 2) if initial else 0
     grid_profit = state["stats"].get("grid_profit", 0)
-    trades_count = state["stats"].get("total_trades", 0)
+    trades_count = state["stats"].get("trade_successes", 0)
     has_event = bool(action or detected_deposit)
 
     # HODL comparison
@@ -2232,7 +2230,7 @@ def report():
     fields.append(
         {
             "name": "累计交易",
-            "value": f"{stats.get('total_trades', 0)} 笔",
+            "value": f"{stats.get('trade_successes', 0)} 笔",
             "inline": True,
         }
     )
@@ -2334,7 +2332,7 @@ def report():
             print("> 今日暂无交易")
 
         print(
-            f"\n> 累计交易: `{stats.get('total_trades', 0)}` 笔 | 运行自: `{stats.get('started_at', '未知')[:10]}`"
+            f"\n> 累计交易: `{stats.get('trade_successes', 0)}` 笔 | 运行自: `{stats.get('started_at', '未知')[:10]}`"
         )
 
 
@@ -2376,7 +2374,6 @@ def reset():
         "price_history": [price] if price else [],
         "trades": old_trades,
         "stats": {
-            "total_trades": old_stats.get("total_trades", 0),
             "total_sell_usdc": old_stats.get("total_sell_usdc", 0.0),
             "total_buy_usdc": old_stats.get("total_buy_usdc", 0.0),
             "realized_pnl": old_stats.get("realized_pnl", 0.0),
@@ -2470,7 +2467,6 @@ def retry():
         state["trades"].append(trade_record)
         if len(state["trades"]) > 50:
             state["trades"] = state["trades"][-50:]
-        state["stats"]["total_trades"] += 1
         if direction == "SELL":
             state["stats"]["total_sell_usdc"] = round(
                 state["stats"].get("total_sell_usdc", 0) + trade_usd, 2
