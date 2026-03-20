@@ -31,20 +31,18 @@ User Request
                     Lead Agent (coordinator, never writes code)
 ```
 
+## Platform Compatibility
+
+> **Recommended**: Claude Code, Cursor, Gemini CLI — AI coding IDEs with subagent/teammate spawning.
+>
+> **Not recommended**: OpenClaw — OpenClaw is a runtime for executing strategies, not for multi-agent development pipelines. Use the individual strategy skills (e.g. `grid-trading`) on OpenClaw instead.
+
 ## Installation
 
-### ClawHub
-
+**Claude Code** (recommended):
 ```bash
 npx clawhub install okx-strategy-factory
-```
-
-### Manual Install
-
-**Claude Code**:
-```bash
-cp -r okx-strategy-factory /path/to/project/.claude/skills/
-# Or global:
+# Or manual:
 cp -r okx-strategy-factory ~/.claude/skills/
 ```
 

@@ -30,20 +30,18 @@
                     Lead Agent（协调者，不写代码）
 ```
 
+## 平台兼容性
+
+> **推荐**: Claude Code、Cursor、Gemini CLI —— 支持子智能体/队友生成的 AI 编程 IDE。
+>
+> **不推荐**: OpenClaw —— OpenClaw 是策略执行运行时，不适合多智能体开发流水线。请在 OpenClaw 上使用独立策略技能（如 `grid-trading`）。
+
 ## 安装
 
-### ClawHub
-
+**Claude Code**（推荐）:
 ```bash
 npx clawhub install okx-strategy-factory
-```
-
-### 手动安装
-
-**Claude Code**:
-```bash
-cp -r okx-strategy-factory /path/to/project/.claude/skills/
-# 或全局安装:
+# 或手动安装:
 cp -r okx-strategy-factory ~/.claude/skills/
 ```
 
