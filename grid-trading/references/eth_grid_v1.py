@@ -1691,6 +1691,7 @@ def tick():
 
         if skip_reason:
             log(f"SKIP {direction} L{prev_level}-L{current_level}: {skip_reason}")
+            state["current_level"] = current_level
             direction = None
         else:
             # Clear sell trail counter on execution
