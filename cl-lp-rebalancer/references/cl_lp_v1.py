@@ -1004,11 +1004,14 @@ def execute_rebalance(
         f"ticks [{old_tick_lower},{old_tick_upper}] -> [{new_tick_lower},{new_tick_upper}]"
     )
 
-    # Step 1: Claim fees
-    if token_id:
+    # Step 1: Claim fees (skip if unclaimed < $5 to save gas)
+    unclaimed = state.get("stats", {}).get("unclaimed_fee_usd", 0)
+    if token_id and unclaimed >= MIN_TRADE_USD:
         claimed = defi_claim_fees(token_id)
         if claimed:
             log(f"  Fees claimed: {json.dumps(claimed)[:200]}")
+    elif token_id:
+        log(f"  Skip claim: unclaimed ${unclaimed:.2f} < ${MIN_TRADE_USD:.0f}")
 
     # Step 2: Remove liquidity
     if token_id:
