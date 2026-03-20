@@ -1529,18 +1529,15 @@ def tick():
             log(f"Price ${price:.2f} back in grid range - reset upside counter")
             state.pop("upside_breakout_ticks", None)
 
-    # Volatility shift detection
-    if not need_recalibrate and grid and len(history) >= 5:
-        cur_vol = calc_volatility(history)
-        avg_p = sum(history) / len(history)
-        cur_vol_pct = (cur_vol / avg_p) * 100 if avg_p > 0 else 0
+    # Volatility shift detection (compare kline ATR to grid ATR, same source)
+    if not need_recalibrate and grid and kline_vol is not None:
         grid_vol_pct = grid.get("vol_pct", 0)
         if grid_vol_pct > 0:
-            vol_change_ratio = abs(cur_vol_pct - grid_vol_pct) / grid_vol_pct
+            vol_change_ratio = abs(kline_vol - grid_vol_pct) / grid_vol_pct
             if vol_change_ratio > VOL_RECALIBRATE_RATIO:
                 need_recalibrate = True
                 log(
-                    f"Volatility shift: {grid_vol_pct:.2f}% -> {cur_vol_pct:.2f}% "
+                    f"Volatility shift: {grid_vol_pct:.2f}% -> {kline_vol:.2f}% "
                     f"(delta {vol_change_ratio * 100:.0f}%) - recalibrating"
                 )
 
