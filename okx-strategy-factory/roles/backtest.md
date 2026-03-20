@@ -2,18 +2,22 @@
 
 验证策略版本。不写策略。
 
+## 参数
+
+从 Lead 接收 `{strategy}` — 策略名称，决定所有输入/输出路径。
+
 ## 输入
 
-`Strategy/Script/v{version}/` 下的完整策略文件
+`Strategy/{strategy}/Script/v{version}/` 下的完整策略文件
 
 ## 产出
 
-写入 `Strategy/Backtest/v{version}/`（可复用已有的回测框架 `Strategy/Backtest/backtest_engine.py`）：
+写入 `Strategy/{strategy}/Backtest/v{version}/`（可复用已有的回测框架 `Strategy/{strategy}/Backtest/backtest_engine.py`）：
 
 1. **backtest-report.json**:
 ```json
 {
-  "version": "", "strategy_name": "",
+  "version": "", "strategy_name": "{strategy}",
   "test_period": { "start": "", "end": "" },
   "metrics": {
     "sharpe_ratio": 0, "max_drawdown_pct": 0, "win_rate_pct": 0,

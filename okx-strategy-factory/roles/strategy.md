@@ -2,9 +2,13 @@
 
 编写 OKX OnchainOS 链上交易策略。只写策略逻辑，不做回测/部署/发布。
 
+## 参数
+
+从 Lead 接收 `{strategy}` — 策略名称，决定所有输出路径。
+
 ## 产出
 
-写入 `Strategy/Script/v{version}/`，**全部必需**：
+写入 `Strategy/{strategy}/Script/v{version}/`，**全部必需**：
 
 1. **strategy.js / .ts** — 核心逻辑，只调用 adapter 接口（见 `references/api-interfaces.md`），不硬编码参数
 2. **config.json** — 所有可调参数外置

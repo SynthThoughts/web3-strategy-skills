@@ -2,14 +2,18 @@
 
 把策略抽象为独立的、跨平台可复用的产品 Skill。不写策略。
 
+## 参数
+
+从 Lead 接收 `{strategy}` — 策略名称，决定所有输入/输出路径。
+
 ## 职责
 
-从 `Strategy/Script/v{version}/` 读取策略，用 `assets/product-skill-template/` 模板生成独立 Skill 包，输出到 `Skills/{strategy-name}/`。
+从 `Strategy/{strategy}/Script/v{version}/` 读取策略，用 `assets/product-skill-template/` 模板生成独立 Skill 包，输出到 `{strategy}/`。
 
 ## 产出结构
 
 ```
-Skills/{strategy-name}/
+{strategy}/
 ├── SKILL.md              ← 主文件（从 product-skill-template/SKILL.md.tmpl 生成）
 ├── references/
 │   └── api-interfaces.md ← 从工厂 references/ 复制
@@ -21,7 +25,7 @@ Skills/{strategy-name}/
 └── README.md
 ```
 
-注意：策略代码本身（strategy.js, config.json, risk-profile.json）已在 `Strategy/Script/v{version}/`，产品 Skill 的 SKILL.md 引用它们而非复制。发布到 GitHub 时打包在一起。
+注意：策略代码本身（strategy.js, config.json, risk-profile.json）已在 `Strategy/{strategy}/Script/v{version}/`，产品 Skill 的 SKILL.md 引用它们而非复制。发布到 GitHub 时打包在一起。
 
 ## manifest.json（SSOT）
 
@@ -29,7 +33,7 @@ Skills/{strategy-name}/
 
 ```json
 {
-  "name": "", "version": "", "description": "",
+  "name": "{strategy}", "version": "", "description": "",
   "platforms": ["claude-code", "codex", "openclaw"],
   "dependencies": { "npm": [], "pip": [] },
   "entry_point": "strategy.js",
@@ -49,9 +53,9 @@ Skills/{strategy-name}/
 1. **Skill 抽象**（Backtest PASS 后开始，可与 Infra 并行）
 2. **GitHub Release**（等 Infra Deploy 成功后执行）：
 ```bash
-git tag -a "v{ver}" -m "{name} v{ver}"
+git tag -a "v{ver}" -m "{strategy} v{ver}"
 git push origin main --tags
-gh release create "v{ver}" --title "{name} v{ver}" --notes-file CHANGELOG_ENTRY.md
+gh release create "v{ver}" --title "{strategy} v{ver}" --notes-file CHANGELOG_ENTRY.md
 ```
 
 ## 迭代更新

@@ -67,7 +67,7 @@ Use the okx-strategy-factory skill to develop a grid trading strategy for ETH/US
 Or trigger a specific phase:
 
 ```
-Use okx-strategy-factory to backtest the strategy in Strategy/Script/v1.0.0/.
+Use okx-strategy-factory to backtest the grid-trading strategy in Strategy/grid-trading/Script/v1.0.0/.
 ```
 
 ```
@@ -103,11 +103,11 @@ okx-strategy-factory/
 | Role | Responsibility | Input | Output |
 |------|---------------|-------|--------|
 | **Lead** | Coordinate pipeline, enforce quality gates, manage state | User request | Spawn prompts, state.json updates |
-| **Strategy** | Write strategy logic + config + risk profile | Trading pair, direction, signal source | `Strategy/Script/v{ver}/` (strategy.js, config.json, risk-profile.json, README.md) |
-| **Backtest** | Validate strategy against historical data | Strategy script directory | `Strategy/Backtest/v{ver}/` (backtest-report.json, equity-curve.csv) |
+| **Strategy** | Write strategy logic + config + risk profile | Trading pair, direction, signal source | `Strategy/{strategy}/Script/v{ver}/` (strategy.js, config.json, risk-profile.json, README.md) |
+| **Backtest** | Validate strategy against historical data | Strategy script directory | `Strategy/{strategy}/Backtest/v{ver}/` (backtest-report.json, equity-curve.csv) |
 | **Infra** | Deploy to VPS (SSH, pm2, health check, rollback) | Backtest-passed strategy version | Running process on VPS, VERSION file |
-| **Publish** | Package strategy as cross-platform Skill + GitHub release | Backtest-passed strategy + deploy confirmation | `Skills/{name}/` (manifest.json, install.sh, SKILL.md) |
-| **Iteration** | Analyze live performance, propose optimizations | On-chain trade history + market data | `Strategy/Iteration/v{ver}-review-{date}.md` |
+| **Publish** | Package strategy as cross-platform Skill + GitHub release | Backtest-passed strategy + deploy confirmation | `{strategy}/` (manifest.json, install.sh, SKILL.md) |
+| **Iteration** | Analyze live performance, propose optimizations | On-chain trade history + market data | `Strategy/{strategy}/Iteration/v{ver}-review-{date}.md` |
 
 ## Pipeline
 

@@ -2,9 +2,13 @@
 
 复盘线上策略表现，提取因果关系，输出优化方案。不直接改代码。
 
+## 参数
+
+从 Lead 接收 `{strategy}` — 策略名称，决定所有输入/输出路径。
+
 ## 产出
 
-写入 `Strategy/Iteration/v{ver}-review-{YYYY-MM-DD}.md`
+写入 `Strategy/{strategy}/Iteration/v{ver}-review-{YYYY-MM-DD}.md`
 
 ## 分析框架（全部必填）
 
@@ -42,7 +46,7 @@
 ## 数据来源
 
 参考 `grid-trading/SKILL.md` 的 AI Review & Optimization 部分：
-- 从 `state.json` 读取交易记录
+- 从 `Strategy/{strategy}/state.json` 读取交易记录
 - 配对 round trips（BUY-SELL 匹配）
 - 分析 win rate、avg spread、loss/micro/good 分类
 - 检查 MTF 数据在亏损时的趋势对齐
