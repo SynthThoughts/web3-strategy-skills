@@ -281,6 +281,39 @@ def get_position_value(token_id: str) -> float:
     return get_position_detail(token_id)["value"]
 
 
+def find_latest_token_id() -> str:
+    """Query position-detail to find the latest LP token ID for this pool."""
+    if not WALLET_ADDR:
+        return ""
+    data = onchainos_cmd(
+        [
+            "defi",
+            "position-detail",
+            "--address",
+            WALLET_ADDR,
+            "--chain",
+            POOL_CHAIN,
+            "--platform-id",
+            "68",  # Uniswap V3
+        ],
+        timeout=20,
+    )
+    if not data or not data.get("ok") or not data.get("data"):
+        return ""
+    try:
+        for platform in data["data"]:
+            for wallet in platform.get("walletIdPlatformDetailList", []):
+                for network in wallet.get("networkHoldVoList", []):
+                    for invest in network.get("investTokenBalanceVoList", []):
+                        positions = invest.get("positionList", [])
+                        if positions:
+                            # Return the last (newest) position's tokenId
+                            return str(positions[-1].get("tokenId", ""))
+    except (KeyError, ValueError, TypeError):
+        pass
+    return ""
+
+
 # ── K-line / OHLC Data ──────────────────────────────────────────────────────
 
 
@@ -685,6 +718,8 @@ def defi_claim_fees(token_id: str) -> dict | None:
             "claim",
             "--address",
             WALLET_ADDR,
+            "--chain",
+            POOL_CHAIN,
             "--reward-type",
             "V3_FEE",
             "--id",
@@ -713,6 +748,8 @@ def defi_redeem(token_id: str) -> dict | None:
             INVESTMENT_ID,
             "--address",
             WALLET_ADDR,
+            "--chain",
+            POOL_CHAIN,
             "--token-id",
             token_id,
             "--percent",
@@ -743,6 +780,8 @@ def defi_calculate_entry(
             INVESTMENT_ID,
             "--address",
             WALLET_ADDR,
+            "--chain",
+            POOL_CHAIN,
             "--input-token",
             input_token,
             "--input-amount",
@@ -774,6 +813,8 @@ def defi_deposit(user_input: str, tick_lower: int, tick_upper: int) -> dict | No
             INVESTMENT_ID,
             "--address",
             WALLET_ADDR,
+            "--chain",
+            POOL_CHAIN,
             "--user-input",
             user_input,
             f"--tick-lower={tick_lower}",
@@ -1040,7 +1081,7 @@ def execute_rebalance(
 
     # Step 4: Calculate entry to determine token ratio
     # Use USDC as input token for calculate-entry
-    usdc_amount_str = str(int(usdc_bal * 1e6))
+    usdc_amount_str = str(int(usdc_bal))
     entry_data = defi_calculate_entry(
         input_token=USDC_ADDR,
         input_amount=usdc_amount_str,
@@ -1106,7 +1147,7 @@ def execute_rebalance(
         # Recalculate entry only if swap changed balances
         if did_swap:
             time.sleep(3)  # avoid rate limit
-            usdc_amount_str = str(int(usdc_bal * 0.95 * 1e6))  # 95% to leave buffer
+            usdc_amount_str = str(int(usdc_bal * 0.95))  # 95% to leave buffer
             entry_data = defi_calculate_entry(
                 input_token=USDC_ADDR,
                 input_amount=usdc_amount_str,
@@ -1126,7 +1167,7 @@ def execute_rebalance(
         log("  Deposit failed — attempting emergency wide deposit")
         return _emergency_deposit(state, price, trigger)
 
-    # Extract new token_id
+    # Extract new token_id from deposit result or position-detail query
     new_token_id = ""
     if isinstance(deposit_result, dict):
         new_token_id = str(
@@ -1136,6 +1177,11 @@ def execute_rebalance(
         new_token_id = str(
             deposit_result[0].get("tokenId") or deposit_result[0].get("token_id") or ""
         )
+    if not new_token_id:
+        time.sleep(5)  # wait for chain confirmation
+        new_token_id = find_latest_token_id()
+        if new_token_id:
+            log(f"  Found token_id from position-detail: {new_token_id}")
 
     # Update state
     now_iso = datetime.now().isoformat()
@@ -1190,7 +1236,7 @@ def _emergency_deposit(state: dict, price: float, trigger: dict) -> bool:
     tick_upper = price_to_tick(upper_price)
 
     eth_bal, usdc_bal = get_balances()
-    usdc_amount_str = str(int(usdc_bal * 0.9 * 1e6))
+    usdc_amount_str = str(int(usdc_bal * 0.9))
 
     entry_data = defi_calculate_entry(
         USDC_ADDR, usdc_amount_str, TOKEN1["decimals"], tick_lower, tick_upper
@@ -1220,6 +1266,11 @@ def _emergency_deposit(state: dict, price: float, trigger: dict) -> bool:
                 or deposit_result[0].get("token_id")
                 or ""
             )
+        if not new_token_id:
+            time.sleep(5)
+            new_token_id = find_latest_token_id()
+            if new_token_id:
+                log(f"  Found token_id from position-detail: {new_token_id}")
 
         state["position"] = {
             "token_id": new_token_id,
@@ -1433,6 +1484,12 @@ def tick():
     position = state.get("position")
     lp_value = 0.0
     unclaimed_fee = 0.0
+    # Recover token_id if missing but position exists
+    if position and not position.get("token_id") and position.get("tick_lower"):
+        recovered_id = find_latest_token_id()
+        if recovered_id:
+            position["token_id"] = recovered_id
+            log(f"Recovered token_id: {recovered_id}")
     if position and position.get("token_id"):
         pos_detail = get_position_detail(position["token_id"])
         lp_value = pos_detail["value"]
