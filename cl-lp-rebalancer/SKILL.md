@@ -133,7 +133,6 @@ Cron (5min) → Python script → onchainos CLI → OKX Web3 API → Chain
 1. If no existing position → always deploy (first run)
 2. Check rebalance triggers (in priority order):
    - **Out of range**: price < lower or price > upper → MUST rebalance
-   - **Edge proximity**: distance to nearest edge < 15% of range → preventive rebalance
    - **Volatility shift**: ATR changed >30% from position creation → adaptive rebalance
    - **Time decay**: position age > 24h → maintenance rebalance
 3. Anti-churn checks:
@@ -238,7 +237,6 @@ Rebalance failure fallback: if deposit fails after remove, emergency deploy at 3
 
 | Parameter | Default | Description |
 |---|---|---|
-| `EDGE_PROXIMITY` | `0.15` | Trigger rebalance when price within 15% of range edge |
 | `VOL_SHIFT_THRESHOLD` | `0.30` | Trigger if ATR changed >30% from position creation |
 | `MAX_POSITION_AGE_H` | `24` | Force rebalance after 24 hours |
 | `MIN_RANGE_CHANGE_PCT` | `0.05` | Skip rebalance if new range <5% different |
@@ -344,14 +342,14 @@ The `tick` command outputs a structured JSON block for AI agent parsing:
     "price_upper": 2150.0,
     "age_hours": 4.5,
     "in_range": true,
-    "edge_proximity": 0.35
+    "distance_to_edge": 0.35
   },
   "range": {
     "current_width_pct": 9.8,
     "optimal_width_pct": 10.2,
     "capital_efficiency": 10.2
   },
-  "trigger": "none" | "out_of_range" | "edge_proximity" | "vol_shift" | "time_decay",
+  "trigger": "none" | "out_of_range" | "vol_shift" | "time_decay",
   "rebalance": {
     "executed": false,
     "fees_claimed_usd": 1.25,
@@ -467,9 +465,8 @@ Key fields:
    c. Convert to ticks, align to tick_spacing
 8. Check rebalance triggers:
    a. Out of range → must rebalance
-   b. Edge proximity < 15% → preventive
-   c. ATR shift > 30% → adaptive
-   d. Position age > 24h → maintenance
+   b. ATR shift > 30% → adaptive
+   c. Position age > 24h → maintenance
 9. Anti-churn gates (position age, frequency, gas cost, range change)
 10. If rebalancing:
     a. Claim fees → remove liquidity → swap to ratio → deposit at new range

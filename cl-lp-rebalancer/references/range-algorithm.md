@@ -256,22 +256,7 @@ def check_out_of_range(price, position):
     return price < position["price_lower"] or price > position["price_upper"]
 ```
 
-### Trigger 2: Edge Proximity (priority: PREVENTIVE)
-
-价格接近范围边缘，预防性调仓避免完全出范围。
-
-```python
-EDGE_PROXIMITY = 0.15  # 15%
-
-def check_edge_proximity(price, position):
-    range_width = position["price_upper"] - position["price_lower"]
-    dist_to_lower = (price - position["price_lower"]) / range_width
-    dist_to_upper = (position["price_upper"] - price) / range_width
-    min_dist = min(dist_to_lower, dist_to_upper)
-    return min_dist < EDGE_PROXIMITY, min_dist
-```
-
-### Trigger 3: Volatility Shift (priority: ADAPTIVE)
+### Trigger 2: Volatility Shift (priority: ADAPTIVE)
 
 波动率显著变化，当前范围不再最优。
 
@@ -289,7 +274,7 @@ def check_vol_shift(current_atr_pct, position_atr_pct):
 - 波动率增大 30%+：当前范围太窄，出范围风险增加 → 放宽
 - 波动率减小 30%+：当前范围太宽，资本效率浪费 → 收紧
 
-### Trigger 4: Time Decay (priority: MAINTENANCE)
+### Trigger 3: Time Decay (priority: MAINTENANCE)
 
 头寸持有超过最大时间，即使没有其他触发条件也进行维护性调仓。
 

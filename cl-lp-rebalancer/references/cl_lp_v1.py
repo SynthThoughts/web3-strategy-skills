@@ -72,7 +72,6 @@ MIN_POSITION_AGE = CFG["min_position_age_seconds"]
 MAX_REBALANCES_24H = CFG["max_rebalances_24h"]
 GAS_TO_FEE_RATIO = CFG["gas_to_fee_ratio"]
 MAX_IL_TOLERANCE_PCT = CFG["max_il_tolerance_pct"]
-EDGE_PROXIMITY_THRESHOLD = CFG["edge_proximity_threshold"]
 EMERGENCY_RANGE_MULT = CFG["emergency_range_mult"]
 
 STOP_LOSS_PCT = CFG["stop_loss_pct"]
@@ -234,6 +233,38 @@ def get_balances() -> tuple[float, float]:
     return eth, usdc
 
 
+def get_position_value(token_id: str) -> float:
+    """Get current LP position value in USD via defi position-detail."""
+    if not token_id or not WALLET_ADDR:
+        return 0.0
+    data = onchainos_cmd(
+        [
+            "defi",
+            "position-detail",
+            "--address",
+            WALLET_ADDR,
+            "--chain",
+            POOL_CHAIN,
+            "--platform-id",
+            "68",  # Uniswap V3
+        ],
+        timeout=20,
+    )
+    if not data or not data.get("ok") or not data.get("data"):
+        return 0.0
+    try:
+        for platform in data["data"]:
+            for wallet in platform.get("walletIdPlatformDetailList", []):
+                for network in wallet.get("networkHoldVoList", []):
+                    for invest in network.get("investTokenBalanceVoList", []):
+                        for pos in invest.get("positionList", []):
+                            if str(pos.get("tokenId")) == str(token_id):
+                                return float(pos.get("totalValue", 0))
+    except (KeyError, ValueError, TypeError):
+        pass
+    return 0.0
+
+
 # ── K-line / OHLC Data ──────────────────────────────────────────────────────
 
 
@@ -381,16 +412,23 @@ def analyze_multi_timeframe(history: list[float], price: float) -> dict:
 # ── Tick Math ───────────────────────────────────────────────────────────────
 
 
+def _decimal_adjustment() -> float:
+    """10^(token1_decimals - token0_decimals) for tick <-> human price conversion."""
+    return 10 ** (TOKEN1["decimals"] - TOKEN0["decimals"])
+
+
 def price_to_tick(price: float, tick_spacing: int = TICK_SPACING) -> int:
-    """Convert price to nearest valid tick (rounded down to tick_spacing)."""
+    """Convert human-readable price (token1/token0, e.g. USDC/WETH) to nearest valid tick."""
     if price <= 0:
         return 0
-    raw = math.floor(math.log(price) / math.log(1.0001))
+    raw_price = price * _decimal_adjustment()  # Adjust for decimal difference
+    raw = math.floor(math.log(raw_price) / math.log(1.0001))
     return (raw // tick_spacing) * tick_spacing
 
 
 def tick_to_price(tick: int) -> float:
-    return 1.0001**tick
+    """Convert tick to human-readable price (token1/token0)."""
+    return 1.0001**tick / _decimal_adjustment()
 
 
 # ── Volatility Regime → Range Calculation ───────────────────────────────────
@@ -482,20 +520,7 @@ def check_rebalance_triggers(
         side = "below" if price < lower_price else "above"
         return {"trigger": "out_of_range", "priority": "mandatory", "detail": side}
 
-    # [2] Edge proximity — preventive
-    if range_width > 0:
-        dist_to_lower = (price - lower_price) / range_width
-        dist_to_upper = (upper_price - price) / range_width
-        min_dist = min(dist_to_lower, dist_to_upper)
-        if min_dist < EDGE_PROXIMITY_THRESHOLD:
-            near = "lower" if dist_to_lower < dist_to_upper else "upper"
-            return {
-                "trigger": "edge_proximity",
-                "priority": "preventive",
-                "detail": f"near_{near} ({min_dist:.1%})",
-            }
-
-    # [3] Volatility regime change — adaptive
+    # [2] Volatility regime change — adaptive
     created_atr = position.get("created_atr_pct", 0)
     if created_atr > 0:
         vol_change = abs(atr_pct - created_atr) / created_atr
@@ -1363,9 +1388,14 @@ def tick():
         history = history[-288:]
     state["price_history"] = history
 
-    # Balances
+    # Balances (wallet + LP position)
     eth_bal, usdc_bal = get_balances()
-    total_usd = eth_bal * price + usdc_bal
+    wallet_usd = eth_bal * price + usdc_bal
+    position = state.get("position")
+    lp_value = 0.0
+    if position and position.get("token_id"):
+        lp_value = get_position_value(position["token_id"])
+    total_usd = wallet_usd + lp_value
 
     # Initial snapshot
     if state["stats"].get("initial_portfolio_usd") is None and total_usd > 0:
@@ -1711,15 +1741,20 @@ def status():
     state = load_state()
     price = get_eth_price()
     eth_bal, usdc_bal = get_balances()
-    total_usd = eth_bal * (price or 0) + usdc_bal
-    stats = state.get("stats", {})
+    wallet_usd = eth_bal * (price or 0) + usdc_bal
     position = state.get("position")
+    lp_value = 0.0
+    if position and position.get("token_id"):
+        lp_value = get_position_value(position["token_id"])
+    total_usd = wallet_usd + lp_value
+    stats = state.get("stats", {})
     history = state.get("price_history", [])
 
     print("**CL LP Auto-Rebalancer v1 -- 状态**")
     print(f"> 价格: `${price:.2f}`" if price else "> 价格: 不可用")
+    lp_str = f" + LP `${lp_value:.0f}`" if lp_value > 0 else ""
     print(
-        f"> 余额: `{eth_bal:.6f}` ETH + `${usdc_bal:.2f}` USDC = **`${total_usd:.0f}`**"
+        f"> 余额: `{eth_bal:.6f}` ETH + `${usdc_bal:.2f}` USDC{lp_str} = **`${total_usd:.0f}`**"
     )
 
     if position and position.get("tick_lower"):
