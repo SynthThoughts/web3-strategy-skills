@@ -755,7 +755,11 @@ def defi_calculate_entry(
         timeout=30,
     )
     if data and data.get("ok"):
-        return data.get("data")
+        result = data.get("data")
+        # Extract investWithTokenList for deposit --user-input
+        if isinstance(result, dict) and "investWithTokenList" in result:
+            return result["investWithTokenList"]
+        return result
     log(f"Calculate entry failed: {json.dumps(data)[:200] if data else 'no response'}")
     return None
 
@@ -1054,9 +1058,16 @@ def execute_rebalance(
         log(f"  Entry calculated: {user_input_json[:200]}")
 
         # Check if swap is needed for token ratio adjustment
-        needed = entry_data[0] if isinstance(entry_data, list) else entry_data
-        needed_eth = float(needed.get("token0Amount", 0)) / 10 ** TOKEN0["decimals"]
-        needed_usdc = float(needed.get("token1Amount", 0)) / 10 ** TOKEN1["decimals"]
+        # entry_data is investWithTokenList: [{"tokenAddress":..,"coinAmount":..},...]
+        needed_eth = 0.0
+        needed_usdc = 0.0
+        for item in (entry_data if isinstance(entry_data, list) else [entry_data]):
+            addr = item.get("tokenAddress", "").lower()
+            amt = float(item.get("coinAmount", 0))
+            if addr in (ETH_ADDR.lower(), "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"):
+                needed_eth = amt
+            elif addr == USDC_ADDR.lower():
+                needed_usdc = amt
 
         # Simple ratio swap if needed
         did_swap = False
