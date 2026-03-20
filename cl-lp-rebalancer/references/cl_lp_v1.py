@@ -61,9 +61,18 @@ TOKEN0 = CFG["token0"]
 TOKEN1 = CFG["token1"]
 ETH_ADDR = TOKEN0["address"]
 USDC_ADDR = TOKEN1["address"]
-CHAIN_ID = "8453"  # Base
+CHAIN_ID = CFG.get("chain_id", "8453")
+PLATFORM_ID = CFG.get("platform_id", "68")  # onchainos defi platform ID
+NATIVE_TOKEN = CFG.get(
+    "native_token", "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+)
 
-RANGE_MULT = CFG["range_mult"]
+_rm = CFG["range_mult"]
+RANGE_MULT = (
+    _rm
+    if isinstance(_rm, dict)
+    else {"low": _rm * 0.75, "medium": _rm, "high": _rm * 1.25, "extreme": _rm * 1.5}
+)
 MIN_RANGE_PCT = CFG["min_range_pct"]
 MAX_RANGE_PCT = CFG["max_range_pct"]
 ASYM_FACTOR = CFG["asym_factor"]
@@ -250,7 +259,7 @@ def get_position_detail(token_id: str) -> dict:
             "--chain",
             POOL_CHAIN,
             "--platform-id",
-            "68",  # Uniswap V3
+            PLATFORM_ID,
         ],
         timeout=20,
     )
@@ -294,7 +303,7 @@ def find_latest_token_id() -> str:
             "--chain",
             POOL_CHAIN,
             "--platform-id",
-            "68",  # Uniswap V3
+            PLATFORM_ID,
         ],
         timeout=20,
     )
@@ -1105,7 +1114,7 @@ def execute_rebalance(
         for item in (entry_data if isinstance(entry_data, list) else [entry_data]):
             addr = item.get("tokenAddress", "").lower()
             amt = float(item.get("coinAmount", 0))
-            if addr in (ETH_ADDR.lower(), "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"):
+            if addr in (ETH_ADDR.lower(), NATIVE_TOKEN):
                 needed_eth = amt
             elif addr == USDC_ADDR.lower():
                 needed_usdc = amt

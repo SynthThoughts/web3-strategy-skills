@@ -93,3 +93,28 @@ gh release create "v{ver}" --title "{strategy} v{ver}" --notes-file CHANGELOG_EN
 ## 迭代更新
 
 新版本时：更新 manifest.json 版本 → 重新生成所有适配文件 → 新 GitHub release。
+
+## 三处同步发布（必须）
+
+修改策略代码后，**三处必须全部同步**，缺一不可：
+
+1. **VPS 部署** — `scp` 脚本到 VPS 对应目录
+2. **GitHub 推送** — `git add` + `git commit` + `git push origin master`
+3. **ClawHub 发布** — `npx clawhub publish <skill-dir> --version <semver> --changelog "<描述>"`
+
+### ClawHub 发布命令
+
+```bash
+npx clawhub publish <skill-dir> --version <semver> --changelog "<变更描述>"
+```
+
+- `--version` 必须是有效 semver，每次递增
+- 发布目录是 skill 根目录（如 `cl-lp-rebalancer/`、`grid-trading/`）
+
+### 策略路径对照
+
+| 策略 | VPS 脚本路径 | Skill 目录 |
+|------|-------------|-----------|
+| grid-trading | `/home/ubuntu/.openclaw/scripts/eth_grid_v1.py` | `grid-trading/` |
+| cl-lp-rebalancer | `/home/ubuntu/scripts/cl-lp/cl_lp_v1.py` | `cl-lp-rebalancer/` |
+| dashboard | `/home/ubuntu/.openclaw/scripts/generate_dashboard.py` | `dashboard/` |
