@@ -649,13 +649,13 @@ def run_risk_checks(
             remaining = int(MIN_POSITION_AGE - age)
             return f"position_too_young ({remaining}s remaining)"
 
-    # [7] Gas cost check (skip for mandatory triggers)
-    if trigger and trigger.get("priority") != "mandatory":
+    # [7] Gas cost check (skip for mandatory/maintenance triggers)
+    if trigger and trigger.get("priority") not in ("mandatory", "maintenance"):
         # Estimate: Base L2 gas ~$0.01-0.05 per tx, rebalance = ~4 txs
         estimated_gas_usd = 0.15
         # Rough fee estimate: position_value * fee_rate * time_in_range
         position_value = total_usd
-        daily_fee_estimate = position_value * (FEE_TIER / 1e6) * 0.5  # 50% utilization
+        daily_fee_estimate = position_value * FEE_TIER * 0.5  # 50% utilization
         hourly_fee = daily_fee_estimate / 24
         expected_fee_until_next = hourly_fee * 4  # assume 4h until next rebalance
         if (
