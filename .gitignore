@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.DS_Store
+.ruff_cache/
+*.json.bak
+state.json
+grid_state_*.json
+cl_lp_state_*.json
+*.log
+.env
+
+# Non-skill directories
+Agentic Wallet/
+Strategy/
+.claude/
+Skill Templates/
+dashboard/

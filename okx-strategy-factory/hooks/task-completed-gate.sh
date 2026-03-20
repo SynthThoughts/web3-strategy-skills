@@ -27,10 +27,9 @@ if [[ "$TEAMMATE" == "backtest" ]]; then
 fi
 
 if [[ "$TEAMMATE" == "publish" ]]; then
-    for S in Skills/*/; do
-        [ "$S" = "Skills/okx-strategy-factory/" ] && continue
-        [ "$S" = "Skills/templates/" ] && continue
-        [ -d "$S" ] && [ ! -f "$S/manifest.json" ] && { echo "FEEDBACK: $S 缺少 manifest.json"; exit 2; }
+    for S in grid-trading/ polymarket-arb-scanner/ dashboard/; do
+        [ ! -d "$S" ] && continue
+        [ ! -f "$S/manifest.json" ] && { echo "FEEDBACK: $S 缺少 manifest.json"; exit 2; }
     done
 fi
 
