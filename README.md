@@ -1,4 +1,4 @@
-# Web3-Skills
+# Web3 Strategy Skills
 
 Reusable Web3 trading skills for AI coding agents. Each skill is a self-contained `SKILL.md` that teaches an AI agent how to build, deploy, and operate a specific trading strategy.
 
@@ -7,7 +7,8 @@ Reusable Web3 trading skills for AI coding agents. Each skill is a self-containe
 | Skill | Version | Runtime | Description |
 |-------|---------|---------|-------------|
 | [okx-strategy-factory](./okx-strategy-factory/) | v1.0.0 | Local (Claude Code / Cursor / Gemini CLI / Codex) | Meta-skill: coordinates 5 AI agents to develop, backtest, deploy, publish, and iterate OKX OnchainOS trading strategies. |
-| [grid-trading](./grid-trading/) | v4.0.0 | Server (OpenClaw / VPS cron) | Dynamic grid trading on EVM L2 chains. Multi-timeframe analysis, trend-adaptive sizing, smart money signals. Sharpe 4.45. |
+| [grid-trading](./grid-trading/) | v1.0.0 | Server (OpenClaw / VPS cron) | Dynamic grid trading on EVM L2 chains. Multi-timeframe analysis, trend-adaptive sizing, asymmetric grid steps. Sharpe 4.45. |
+| [cl-lp-rebalancer](./cl-lp-rebalancer/) | v1.0.0 | Server (OpenClaw / VPS cron) | Concentrated liquidity LP range rebalancer for DEX positions. |
 | [polymarket-arb-scanner](./polymarket-arb-scanner/) | v1.0.0 | Server (OpenClaw / VPS cron) | Three-layer arbitrage detection on Polymarket CLOB: single-condition, neg-risk multi-outcome, and cross-market implication. |
 
 ## How They Fit Together
@@ -85,27 +86,27 @@ npx clawhub install polymarket-arb-scanner
 cp -r grid-trading ~/.openclaw/skills/
 
 # Deploy strategy script
-cp grid-trading/references/eth_grid_v4.py ~/.openclaw/scripts/
+cp grid-trading/references/eth_grid_v1.py ~/.openclaw/scripts/
 
 # Register cron jobs
 openclaw cron add --name eth-grid-tick \
   --schedule "*/5 * * * *" \
-  --command "cd ~/.openclaw/scripts && python3 eth_grid_v4.py tick"
+  --command "cd ~/.openclaw/scripts && python3 eth_grid_v1.py tick"
 
 openclaw cron add --name eth-grid-daily \
   --schedule "0 0 * * *" \
-  --command "cd ~/.openclaw/scripts && python3 eth_grid_v4.py report"
+  --command "cd ~/.openclaw/scripts && python3 eth_grid_v1.py report"
 ```
 
 **System crontab** (without OpenClaw):
 ```bash
 # Copy script to server
-scp grid-trading/references/eth_grid_v4.py user@your-vps:~/scripts/
+scp grid-trading/references/eth_grid_v1.py user@your-vps:~/scripts/
 
 # Add to crontab
 crontab -e
-# */5 * * * * cd ~/scripts && python3 eth_grid_v4.py tick >> /tmp/grid.log 2>&1
-# 0 0 * * *   cd ~/scripts && python3 eth_grid_v4.py report >> /tmp/grid.log 2>&1
+# */5 * * * * cd ~/scripts && python3 eth_grid_v1.py tick >> /tmp/grid.log 2>&1
+# 0 0 * * *   cd ~/scripts && python3 eth_grid_v1.py report >> /tmp/grid.log 2>&1
 ```
 
 **One-click installer** (auto-detects platform):
