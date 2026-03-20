@@ -233,10 +233,14 @@ def get_balances() -> tuple[float, float]:
     return eth, usdc
 
 
-def get_position_value(token_id: str) -> float:
-    """Get current LP position value in USD via defi position-detail."""
+def get_position_detail(token_id: str) -> dict:
+    """Get LP position value and unclaimed fees via defi position-detail.
+
+    Returns {"value": float, "unclaimed_fee_usd": float, "assets": list}.
+    """
+    result = {"value": 0.0, "unclaimed_fee_usd": 0.0, "assets": []}
     if not token_id or not WALLET_ADDR:
-        return 0.0
+        return result
     data = onchainos_cmd(
         [
             "defi",
@@ -251,7 +255,7 @@ def get_position_value(token_id: str) -> float:
         timeout=20,
     )
     if not data or not data.get("ok") or not data.get("data"):
-        return 0.0
+        return result
     try:
         for platform in data["data"]:
             for wallet in platform.get("walletIdPlatformDetailList", []):
@@ -259,10 +263,22 @@ def get_position_value(token_id: str) -> float:
                     for invest in network.get("investTokenBalanceVoList", []):
                         for pos in invest.get("positionList", []):
                             if str(pos.get("tokenId")) == str(token_id):
-                                return float(pos.get("totalValue", 0))
+                                result["value"] = float(pos.get("totalValue", 0))
+                                result["assets"] = pos.get("assetsTokenList", [])
+                                # Sum unclaimed fees
+                                for fee_info in pos.get("unclaimFeesDefiTokenInfo", []):
+                                    result["unclaimed_fee_usd"] += float(
+                                        fee_info.get("currencyAmount", 0)
+                                    )
+                                return result
     except (KeyError, ValueError, TypeError):
         pass
-    return 0.0
+    return result
+
+
+def get_position_value(token_id: str) -> float:
+    """Get current LP position value in USD (backward compat wrapper)."""
+    return get_position_detail(token_id)["value"]
 
 
 # ── K-line / OHLC Data ──────────────────────────────────────────────────────
@@ -513,7 +529,6 @@ def check_rebalance_triggers(
     tick_upper = position["tick_upper"]
     lower_price = tick_to_price(tick_lower)
     upper_price = tick_to_price(tick_upper)
-    range_width = upper_price - lower_price
 
     # [1] Out of range — mandatory
     if price < lower_price or price > upper_price:
@@ -1393,9 +1408,13 @@ def tick():
     wallet_usd = eth_bal * price + usdc_bal
     position = state.get("position")
     lp_value = 0.0
+    unclaimed_fee = 0.0
     if position and position.get("token_id"):
-        lp_value = get_position_value(position["token_id"])
+        pos_detail = get_position_detail(position["token_id"])
+        lp_value = pos_detail["value"]
+        unclaimed_fee = pos_detail["unclaimed_fee_usd"]
     total_usd = wallet_usd + lp_value
+    state["stats"]["unclaimed_fee_usd"] = round(unclaimed_fee, 4)
 
     # Initial snapshot
     if state["stats"].get("initial_portfolio_usd") is None and total_usd > 0:

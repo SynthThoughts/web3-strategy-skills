@@ -6,13 +6,15 @@ Dynamic grid trading strategy for any token pair on EVM L2 chains via OKX DEX AP
 
 ## Features
 
-- **Asymmetric grid steps** — buy-dense/sell-wide in bullish trends, reverse in bearish
-- **Multi-timeframe trend analysis** — 5min price history + 1H K-line ATR
-- **Trend-adaptive position sizing** — equal, martingale, anti-martingale, pyramid modes
-- **Sell trailing optimization** — hold longer in strong uptrends
-- **HODL Alpha tracking** — measure strategy vs simple buy-and-hold
-- **Comprehensive risk controls** — stop-loss, take-profit, drawdown protection, circuit breakers
-- **Discord notifications** — trade alerts, daily reports
+- **Asymmetric Grid** — buy-dense/sell-wide in bullish trends, reverse in bearish
+- **Volatility-Adaptive** — ATR-based dynamic grid width adjustment
+- **Multi-Timeframe Analysis (MTF)** — 5min price + 1H/4H EMA + 8H structure detection
+- **Trend Following** — dynamic position sizing, scale in with trend, scale out against it
+- **Trailing Take-Profit** — delay selling in strong uptrends, let profits run
+- **Momentum Filter** — skip sell signals when trend momentum is strong
+- **HODL Alpha Tracking** — measure strategy vs simple buy-and-hold
+- **Risk Controls** — Stop Loss / Trailing Stop / Flash Crash Protection / Circuit Breaker
+- **Discord Notifications** — trade alerts, daily reports
 
 ## Architecture
 
