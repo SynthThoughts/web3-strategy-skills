@@ -225,7 +225,7 @@ The grid recalibrates when market conditions shift significantly. Recalibration 
 |---------|-----------|----------|
 | Downside breakout | `price < grid_lower - buy_step` | Recalibrate **immediately** |
 | Upside breakout | `price > grid_upper + sell_step` | Require `UPSIDE_CONFIRM_TICKS` (6) consecutive ticks above |
-| Volatility shift | `abs(current_vol - grid_vol) / grid_vol > 0.3` | Recalibrate |
+| Volatility shift | `abs(current_kline_atr - grid_atr) / grid_atr > 0.3` | Recalibrate |
 | Age | `hours_since_grid_set > GRID_RECALIBRATE_HOURS` (12h) | Recalibrate |
 
 ### Anti-Chase Mechanism
@@ -268,7 +268,7 @@ NEUTRAL:
 ### Multiplier Calculation
 
 ```python
-def _calc_sizing_multiplier(level, grid_levels, direction, mtf, signal):
+def _calc_sizing_multiplier(level, grid_levels, direction, mtf):
     base_mult = 1.0
 
     if mtf:
@@ -285,13 +285,6 @@ def _calc_sizing_multiplier(level, grid_levels, direction, mtf, signal):
                 base_mult = 1.0 + strength * (MAX - 1.0)
             else:  # BUY
                 base_mult = 1.0 - strength * (1.0 - MIN)
-
-    # Signal boost
-    if signal and signal["bullish_score"] > 0.3:
-        if direction == "BUY":
-            base_mult *= 1.0 + SIGNAL_WEIGHT * bullish_score
-        else:
-            base_mult *= 1.0 - SIGNAL_WEIGHT * bullish_score * 0.5
 
     return clamp(base_mult, SIZING_MULTIPLIER_MIN, SIZING_MULTIPLIER_MAX)
 ```

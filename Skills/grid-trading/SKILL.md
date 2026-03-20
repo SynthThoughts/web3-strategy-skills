@@ -1,17 +1,17 @@
 ---
 name: grid-trading
-description: "Dynamic grid trading strategy for any token pair on EVM L2 chains via OKX DEX API. v4.2 adds asymmetric grid steps (buy-dense/sell-wide in bullish, reverse in bearish). v4 adds multi-timeframe trend analysis, trend-adaptive grid sizing, ATR-based volatility, smart money signal integration, sell trailing optimization, and HODL Alpha tracking. Covers grid modes (arithmetic/geometric), asymmetric buy/sell grid spacing, position sizing strategies (equal/martingale/anti-martingale/pyramid/trend-adaptive), comprehensive risk controls (stop-loss, take-profit, drawdown protection, circuit breakers), trade execution via OKX DEX aggregator, PnL calculation, and Discord notification. Use when creating, modifying, debugging, or tuning a grid trading bot."
+description: "Dynamic grid trading strategy for any token pair on EVM L2 chains via OKX DEX API. v4.2 adds asymmetric grid steps (buy-dense/sell-wide in bullish, reverse in bearish). v4 adds multi-timeframe trend analysis, trend-adaptive grid sizing, ATR-based volatility, sell trailing optimization, and HODL Alpha tracking. Covers grid modes (arithmetic/geometric), asymmetric buy/sell grid spacing, position sizing strategies (equal/martingale/anti-martingale/pyramid/trend-adaptive), comprehensive risk controls (stop-loss, take-profit, drawdown protection, circuit breakers), trade execution via OKX DEX aggregator, PnL calculation, and Discord notification. Use when creating, modifying, debugging, or tuning a grid trading bot."
 license: Apache-2.0
 metadata:
   author: SynthThoughts
-  version: "4.2.0"
+  version: "4.2.1"
   pattern: "pipeline, tool-wrapper"
   steps: "5"
 ---
 
-# Dynamic Grid Trading Strategy v4.2
+# Dynamic Grid Trading Strategy v4.2.1
 
-Cron-driven grid bot for EVM L2 chains via `onchainos` CLI. v4.2 adds asymmetric grid steps — different spacing for buy vs sell sides based on trend direction. v4 adds trend intelligence: multi-timeframe analysis, signal-enhanced sizing, sell optimization, and HODL Alpha tracking.
+Cron-driven grid bot for EVM L2 chains via `onchainos` CLI. v4.2 adds asymmetric grid steps — different spacing for buy vs sell sides based on trend direction. v4 adds trend intelligence: multi-timeframe analysis, sell optimization, and HODL Alpha tracking.
 
 Every tick: fetch price → MTF analysis → compute grid level → trend-adaptive decision → execute swap → report to Discord.
 
@@ -31,16 +31,15 @@ New grid dict fields: `buy_step`, `sell_step` (backward-compatible `step` = aver
 
 ## What's New in v4
 
-Six core improvements based on v3 production data (229 trades over 10 days):
+Five core improvements based on v3 production data (229 trades over 10 days):
 
 | # | Feature | Problem Solved | Key Config |
 |---|---------|----------------|------------|
 | 1 | **Multi-Timeframe Analysis** | No trend awareness — over-traded in trending markets | `MTF_SHORT/MEDIUM/LONG/STRUCTURE_PERIOD` |
 | 2 | **Trend-Adaptive Strategy** | Fixed grid width in all markets → poor alpha | `VOLATILITY_MULTIPLIER_TREND=3.0`, `SIZING_STRATEGY="trend_adaptive"` |
 | 3 | **K-line/ATR Volatility** | Price history stddev less accurate than OHLC true range | `onchainos market kline` integration |
-| 4 | **Smart Money Signals** | No external confirmation for trade decisions | `SIGNAL_WEIGHT=0.15`, `SIGNAL_MIN_TRIGGER_WALLETS=3` |
-| 5 | **Sell Trailing Optimization** | Sold too early in uptrends (84.3% sell success vs 100% buy) | `SELL_TRAIL_TICKS=2`, `SELL_MOMENTUM_THRESHOLD=0.005` |
-| 6 | **HODL Alpha Tracking** | Could not measure grid vs pure hold performance | `initial_eth_price` in state, alpha in every tick output |
+| 4 | **Sell Trailing Optimization** | Sold too early in uptrends (84.3% sell success vs 100% buy) | `SELL_TRAIL_TICKS=2`, `SELL_MOMENTUM_THRESHOLD=0.005` |
+| 5 | **HODL Alpha Tracking** | Could not measure grid vs pure hold performance | `initial_eth_price` in state, alpha in every tick output |
 
 ## Architecture
 
@@ -52,7 +51,6 @@ Cron (5min) → Python script → onchainos CLI → OKX Web3 API → Chain
             ┌─────────────┐
             │ MTF Analysis │ ← price_history (288 bars = 24h)
             │ K-line ATR   │ ← onchainos market kline (1H × 24)
-            │ Smart Money  │ ← onchainos signal list (15min cache)
             └──────┬──────┘
                    ↓
             Trend-Adaptive Grid Decision
@@ -63,7 +61,6 @@ Cron (5min) → Python script → onchainos CLI → OKX Web3 API → Chain
 **OKX Skill Dependencies** (via `onchainos` CLI — handles auth, chain resolution, error retry):
 - Price: `okx-dex-market` → `onchainos swap quote --from <A> --to <B> --amount <amt> --chain <chain>`
 - K-line: `okx-dex-market` → `onchainos market kline --address <token> --chain <chain> --bar 1H --limit 24`
-- Signal: `okx-signal` → `onchainos signal list --chain <chain> --wallet-type 1,2,3 --token-address <addr>`
 - Quote: `okx-dex-swap` → `onchainos swap quote --from <A> --to <B> --amount <amt> --chain <chain>`
 - Swap: `okx-dex-swap` → `onchainos swap swap --from <A> --to <B> --amount <amt> --chain <chain> --wallet <addr> --slippage <pct>`
 - Approve: `okx-dex-swap` → `onchainos swap approve --token <addr> --amount <amt> --chain <chain>`
@@ -97,9 +94,8 @@ Cron (5min) → Python script → onchainos CLI → OKX Web3 API → Chain
 3. Detect 8h structure: split into 4 segments, check higher-highs/higher-lows → uptrend / downtrend / ranging
 4. Compute 1h and 4h momentum
 5. Fetch K-line data (1H candles, 24 bars) → compute ATR-based volatility (hourly cache)
-6. Fetch smart money signals (15min cache) → compute bullish score (0-1)
 
-**Output**: `mtf` dict, `signal` dict, `kline_vol` float
+**Output**: `mtf` dict, `kline_vol` float
 
 ```python
 def analyze_multi_timeframe(history, price) -> dict:
@@ -128,7 +124,7 @@ def analyze_multi_timeframe(history, price) -> dict:
 4. If level changed: determine direction (BUY if level dropped, SELL if rose)
 5. Safety checks: cooldown, trend-adaptive position limits, repeat guard, consecutive limit
 6. **v4 Sell optimization**: if SELL in strong uptrend, delay via `_should_delay_sell()`
-7. Calculate trade size with trend-adaptive sizing + signal boost
+7. Calculate trade size with trend-adaptive sizing
 
 **Gate**:
 - [ ] Grid is valid (step > 0, levels > 0)
@@ -178,7 +174,6 @@ OKX_PASSPHRASE=...
 |---|---|---|---|
 | Get Price | `onchainos swap quote --from $ETH --to $USDC --amount 1e18 --chain base` | Token addresses | `{"toTokenAmount": "2090450000"}` → parse / 1e6 |
 | Get K-line | `onchainos market kline --address $ETH --chain base --bar 1H --limit 24` | Token, bar size, limit | `[{ts, open, high, low, close, volume}]` |
-| Get Signals | `onchainos signal list --chain base --wallet-type 1,2,3 --token-address $ETH` | Chain, wallet types, token | `[{walletType, triggerWalletCount, soldRatioPercent}]` |
 | Get Balance | `onchainos wallet balance --chain 8453` | Chain ID | `{details: [{tokenAssets: [{symbol, balance}]}]}` |
 | Swap Quote+TX | `onchainos swap swap --from $A --to $B --amount $amt --chain base --wallet $addr --slippage 1` | Tokens, amount, wallet | `{data: [{tx: {to, data, value, gas}}]}` |
 | Approve ERC-20 | `onchainos swap approve --token $USDC --amount $max --chain base` | Token, amount | Approval TX data |
@@ -222,15 +217,6 @@ Auto-retry policy: 1 retry for `retriable=True` with 3s delay and fresh quote.
 | `MTF_MEDIUM_PERIOD` | `12` | 12-bar EMA (1h @ 5min tick) |
 | `MTF_LONG_PERIOD` | `48` | 48-bar EMA (4h @ 5min tick) |
 | `MTF_STRUCTURE_PERIOD` | `96` | 96-bar (8h @ 5min tick) for structure detection |
-
-### Signal Integration (v4 New)
-
-| Parameter | Default | Description |
-|---|---|---|
-| `SIGNAL_ENABLED` | `True` | Fetch smart money signals |
-| `SIGNAL_WEIGHT` | `0.15` | Signal influence on sizing (0-1) |
-| `SIGNAL_COOLDOWN_SEC` | `900` | 15min between signal fetches |
-| `SIGNAL_MIN_TRIGGER_WALLETS` | `3` | Minimum trigger wallet count to consider signal |
 
 ### Sell Optimization (v4 New)
 
@@ -294,13 +280,13 @@ step = (buy_step + sell_step) / 2  # backward-compatible average
 |---|---|---|
 | `STEP_MIN_PCT` | `0.010` | Step floor as fraction of price (1.0%) — raised from v3's 0.8% |
 | `STEP_MAX_PCT` | `0.060` | Step cap as fraction of price (6%) |
-| `VOL_RECALIBRATE_RATIO` | `0.3` | Recalibrate if vol shifts >30% from grid snapshot |
+| `VOL_RECALIBRATE_RATIO` | `0.3` | Recalibrate if kline ATR shifts >30% from grid's stored ATR |
 
 **Recalibration triggers (asymmetric):**
 1. **Downside breakout**: Price < grid lower - `buy_step` → recalibrate **immediately** (buying dips is grid's edge)
 2. **Upside breakout**: Price > grid upper + `sell_step` → require **N consecutive ticks** confirmation before recalibrating (anti-chase)
 3. Grid age exceeds `GRID_RECALIBRATE_HOURS`
-4. Current volatility deviates >30% from grid's recorded volatility
+4. Current kline ATR deviates >30% from grid's stored ATR
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -325,7 +311,7 @@ v4 adds `trend_adaptive` strategy. Controls how much to trade at each grid level
 | `"trend_adaptive"` | **(v4 default)** In bullish: buy more + sell less. In bearish: sell more + buy less |
 
 ```python
-def _calc_sizing_multiplier(level, grid_levels, direction, mtf=None, signal=None):
+def _calc_sizing_multiplier(level, grid_levels, direction, mtf=None):
     base_mult = 1.0
     if SIZING_STRATEGY == "trend_adaptive" and mtf:
         trend = mtf.get("trend", "neutral")
@@ -338,12 +324,6 @@ def _calc_sizing_multiplier(level, grid_levels, direction, mtf=None, signal=None
         elif trend == "bearish":
             # opposite
             ...
-    # Signal boost: bullish signal → +15% buy size, -7.5% sell size
-    if signal and signal["bullish_score"] > 0.3:
-        if direction == "BUY":
-            base_mult *= 1.0 + SIGNAL_WEIGHT * bull_score
-        else:
-            base_mult *= 1.0 - SIGNAL_WEIGHT * bull_score * 0.5
     return clamp(base_mult, SIZING_MULTIPLIER_MIN, SIZING_MULTIPLIER_MAX)
 ```
 
@@ -411,20 +391,19 @@ def _check_stop_conditions(state, total_usd, price):
 2. Read on-chain balances (ETH + USDC)
 3. v4: Multi-timeframe analysis → trend/strength/momentum/structure
 4. v4: Fetch K-line ATR volatility (hourly cache)
-5. v4: Fetch smart money signals (15min cache)
-6. Check if grid needs recalibration (breakout / vol shift / age)
+5. Check if grid needs recalibration (breakout / vol shift / age)
    → v4: calc_dynamic_grid() uses trend-adaptive volatility multiplier
    → v4.2: asymmetric buy_step/sell_step based on trend direction
-7. Map price → grid level
-8. If level changed:
+6. Map price → grid level
+7. If level changed:
    a. Direction: BUY if level dropped, SELL if rose
    b. v4: If SELL in strong uptrend → delay check (trailing + momentum protection)
    c. Safety checks (cooldown, trend-adaptive position limits, repeat guard, consecutive limit)
-   d. Calculate trade size (trend-adaptive sizing + signal boost)
+   d. Calculate trade size (trend-adaptive sizing)
    e. Execute swap via DEX aggregator
    f. Record trade, update level ONLY on success
-9. v4: Calculate HODL Alpha
-10. Report status (JSON + Discord)
+8. v4: Calculate HODL Alpha
+9. Report status (JSON + Discord)
 ```
 
 ## Grid Calculation
@@ -511,13 +490,13 @@ Returns `(amount_in_smallest_unit, failure_info)`. SELL returns wei (x1e18), BUY
 ```python
 def calc_trade_amount(direction, eth_bal, usdc_bal, price,
                       current_level=None, grid_levels=None,
-                      mtf=None, signal=None):
+                      mtf=None):
     available_eth = eth_bal - GAS_RESERVE_ETH
     total_usd = available_eth * price + usdc_bal
     max_usd = total_usd * MAX_TRADE_PCT
 
-    # v4: Apply trend-adaptive sizing + signal boost
-    multiplier = _calc_sizing_multiplier(level, grid_levels, direction, mtf, signal)
+    # v4: Apply trend-adaptive sizing
+    multiplier = _calc_sizing_multiplier(level, grid_levels, direction, mtf)
     max_usd *= multiplier
 
     if direction == "SELL":
@@ -591,7 +570,6 @@ total_pnl_eth = current_eth_equivalent - initial_eth_equivalent
   "approved_routers": ["0x..."],
   "errors": {"consecutive": 0, "cooldown_until": null},
   "mtf_cache": null,
-  "signal_cache": null,
   "kline_cache": null,
   "sell_trail_counter": {}
 }
@@ -607,7 +585,6 @@ Key fields:
 - `upside_breakout_ticks`: confirmation counter for upside recalibration
 - `approved_routers`: USDC approval cache to avoid redundant approvals
 - `mtf_cache`: v4 — cached multi-timeframe analysis result
-- `signal_cache`: v4 — cached smart money signals (15min TTL)
 - `kline_cache`: v4 — cached K-line data (1h TTL)
 - `sell_trail_counter`: v4 — tracks sell delay tick counts per level transition
 
@@ -623,7 +600,7 @@ Key fields:
 | `history` | Show recent trade history | On demand |
 | `reset` | Reset grid (recalibrate from scratch), keep trade history | Manual |
 | `retry` | Retry last failed trade with fresh quote (expires after 10min) | AI agent / manual |
-| `analyze` | Output detailed market + MTF + signal + round-trip analysis JSON | AI agent |
+| `analyze` | Output detailed market + MTF + round-trip analysis JSON | AI agent |
 | `deposit` | Manually record deposit/withdrawal for PnL tracking | Manual |
 | `resume-trading` | Clear stop_triggered flag and resume trading | Manual / AI agent |
 
@@ -653,7 +630,6 @@ The `tick` command outputs a structured JSON block for AI agent parsing:
     "trend": "bullish", "trend_strength": 0.65,
     "momentum_1h": 0.35, "momentum_4h": 1.2,
     "structure": "uptrend",
-    "signal_bullish_score": 0.45,
     "kline_atr_pct": 1.8
   },
   "portfolio": {"eth": 0.134, "usdc": 257.33, "total_usd": 538.0, "eth_pct": 52.1},
@@ -669,7 +645,6 @@ The `tick` command outputs a structured JSON block for AI agent parsing:
 
 The `analyze` command outputs additional v4 fields:
 - `multi_timeframe`: full MTF data (EMA short/medium/long, momentum, structure)
-- `signal`: smart money signal details
 - `round_trips`: trade pair analysis (good / micro / loss classification)
 
 ### Discord Notification
@@ -748,7 +723,6 @@ Note: In a +9% uptrend, grid strategies naturally underperform HODL because they
 | Gas costs | L1 vs L2: adjust `GAS_RESERVE` and `MIN_TRADE_USD` |
 | Stablecoin pair | TOKEN/USDC pair: `STEP_MIN_PCT` can be much tighter (0.2%) |
 | Rate limits | Add 300-500ms delay between consecutive OKX API calls |
-| Signal availability | Not all tokens have smart money signals — set `SIGNAL_ENABLED=False` |
 
 ## AI Review & Optimization
 
@@ -866,7 +840,6 @@ IF Step N fails:
 | Step floor too low | Micro-profit trades only feed DEX fees, net negative after costs |
 | No center shift cap | Single spike can drag grid center 5%+, creating losing positions |
 | Fixed sizing in trends | Selling same size in uptrend = giving away alpha to the market |
-| Ignoring smart money signals | Missing confirmation from on-chain intelligence |
 | Selling immediately in uptrend | v4 sell delay exists for a reason — let trends play out |
 | Symmetric grid in strong trends | v4.2: asymmetric grids accumulate faster on the favorable side |
 | Ignoring `buy_step`/`sell_step` in profit calc | Use actual `level_prices` differences, not average `step` |

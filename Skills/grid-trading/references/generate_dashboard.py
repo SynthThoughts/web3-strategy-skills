@@ -579,7 +579,11 @@ def generate_html(state: dict, json_blocks: list[dict], events: list[dict]) -> s
   <div class="panel" style="margin-bottom:20px;">
     <div class="grid-viz">{chart_svg}</div>
     <div style="margin-top:10px;display:flex;justify-content:space-between;align-items:center;font-size:11px;color:#aaa;">
-      <div style="display:flex;gap:16px;">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <span class="badge badge-{trend}" title="EMA(25m) ${ema_short:,.0f} / EMA(1h) ${ema_medium:,.0f} / EMA(4h) ${ema_long:,.0f}">{trend_cn}</span>
+        <span class="badge badge-{structure if structure != "ranging" else "ranging"}" title="8H 窗口结构检测">{structure_cn}</span>
+        <span title="趋势强度 = |EMA短-EMA长| / EMA长，归一化到 0-100%" style="color:{"#c8ff00" if trend == "bullish" else "#ff4c8b" if trend == "bearish" else "#aaa"};font-weight:600;">{strength:.0%}</span>
+        <span style="color:#555;">·</span>
         <span title="网格中心价格，基于 20H EMA">中心 <span style="color:#ccc;font-weight:600;">${grid_center:,.0f}</span></span>
         <span title="当前价格所在层级 / 总层数">层级 <span style="color:#ccc;font-weight:600;">L{current_level}/{grid.get("levels", 6)}</span></span>
         <span title="{grid_pos_tip}" style="color:{"#c8ff00" if current_level < grid.get("levels", 6) / 2 else "#ff4c8b" if current_level > grid.get("levels", 6) / 2 else "#aaa"};">{grid_pos_label}</span>
@@ -592,17 +596,6 @@ def generate_html(state: dict, json_blocks: list[dict], events: list[dict]) -> s
   <div class="main-grid">
     <div class="panel">
       <div class="panel-title">策略决策</div>
-      <!-- Trend badge row with strength bar -->
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
-        <span class="badge badge-{trend}" title="EMA(25m) ${ema_short:,.0f} / EMA(1h) ${ema_medium:,.0f} / EMA(4h) ${ema_long:,.0f}。{"短>中>长 看涨排列" if ema_short > ema_medium > ema_long else "短<中<长 看跌排列" if ema_short < ema_medium < ema_long else "交叉无序"}。影响仓位倍数和宽度倍数">{trend_cn}</span>
-        <span class="badge badge-{structure if structure != "ranging" else "ranging"}" title="8H 窗口分 4 段，高低点严格递增=上升、递减=下降、否则=震荡。影响卖出延迟策略">{structure_cn}</span>
-        <div style="flex:1;display:flex;align-items:center;gap:6px;" title="趋势强度 = |EMA短-EMA长| / EMA长 / 2% 归一化。> 30% 时触发宽度倍数上调和仓位倍数偏移">
-          <div style="flex:1;height:4px;background:rgba(255,255,255,0.06);border-radius:2px;overflow:hidden;">
-            <div style="width:{strength * 100:.0f}%;height:100%;background:{"#c8ff00" if trend == "bullish" else "#ff4c8b" if trend == "bearish" else "#555"};border-radius:2px;"></div>
-          </div>
-          <span style="font-size:11px;color:#aaa;font-weight:600;">{strength:.0%}</span>
-        </div>
-      </div>
       <!-- Decision variables grid -->
       <div class="mtf-grid">
         <div class="mtf-item" title="{step_tip}">
@@ -821,13 +814,16 @@ def _build_chart_svg(
                 if not t_time or not t_price:
                     continue
 
-                # Parse ISO timestamp
+                # Parse ISO timestamp (trades use local time without tz)
                 if t_time.endswith("Z"):
                     t_time = t_time[:-1] + "+00:00"
                 trade_dt = datetime.fromisoformat(t_time)
                 if trade_dt.tzinfo is None:
-                    trade_dt = trade_dt.replace(tzinfo=timezone.utc)
-                trade_ts = trade_dt.timestamp()
+                    # Naive datetime = local time, use mktime for correct UTC conversion
+                    import time as _time
+                    trade_ts = _time.mktime(trade_dt.timetuple())
+                else:
+                    trade_ts = trade_dt.timestamp()
 
                 # Skip trades outside the chart timespan
                 if trade_ts < start_ts or trade_ts > now_ts:
