@@ -1059,6 +1059,7 @@ def execute_rebalance(
         needed_usdc = float(needed.get("token1Amount", 0)) / 10 ** TOKEN1["decimals"]
 
         # Simple ratio swap if needed
+        did_swap = False
         if needed_eth > 0 and available_eth < needed_eth * 0.95:
             # Need more ETH — buy with USDC
             deficit_eth = needed_eth - available_eth
@@ -1070,6 +1071,8 @@ def execute_rebalance(
                 tx_hash, fail = execute_swap(USDC_ADDR, ETH_ADDR, swap_usdc, price)
                 if not tx_hash:
                     log(f"  Ratio swap failed: {fail}")
+                else:
+                    did_swap = True
                 time.sleep(3)
                 eth_bal, usdc_bal = get_balances()
 
@@ -1084,23 +1087,27 @@ def execute_rebalance(
                 tx_hash, fail = execute_swap(ETH_ADDR, USDC_ADDR, swap_eth, price)
                 if not tx_hash:
                     log(f"  Ratio swap failed: {fail}")
+                else:
+                    did_swap = True
                 time.sleep(3)
                 eth_bal, usdc_bal = get_balances()
 
-        # Recalculate entry with updated balances
-        usdc_amount_str = str(int(usdc_bal * 0.95 * 1e6))  # 95% to leave buffer
-        entry_data = defi_calculate_entry(
-            input_token=USDC_ADDR,
-            input_amount=usdc_amount_str,
-            token_decimal=TOKEN1["decimals"],
-            tick_lower=new_tick_lower,
-            tick_upper=new_tick_upper,
-        )
-        if entry_data:
-            if isinstance(entry_data, list) and entry_data:
-                user_input_json = json.dumps(entry_data)
-            elif isinstance(entry_data, dict):
-                user_input_json = json.dumps([entry_data])
+        # Recalculate entry only if swap changed balances
+        if did_swap:
+            time.sleep(3)  # avoid rate limit
+            usdc_amount_str = str(int(usdc_bal * 0.95 * 1e6))  # 95% to leave buffer
+            entry_data = defi_calculate_entry(
+                input_token=USDC_ADDR,
+                input_amount=usdc_amount_str,
+                token_decimal=TOKEN1["decimals"],
+                tick_lower=new_tick_lower,
+                tick_upper=new_tick_upper,
+            )
+            if entry_data:
+                if isinstance(entry_data, list) and entry_data:
+                    user_input_json = json.dumps(entry_data)
+                elif isinstance(entry_data, dict):
+                    user_input_json = json.dumps([entry_data])
 
     # Step 5: Deposit at new range
     deposit_result = defi_deposit(user_input_json, new_tick_lower, new_tick_upper)
@@ -1177,6 +1184,11 @@ def _emergency_deposit(state: dict, price: float, trigger: dict) -> bool:
     entry_data = defi_calculate_entry(
         USDC_ADDR, usdc_amount_str, TOKEN1["decimals"], tick_lower, tick_upper
     )
+    if not entry_data:
+        time.sleep(5)  # retry after rate limit
+        entry_data = defi_calculate_entry(
+            USDC_ADDR, usdc_amount_str, TOKEN1["decimals"], tick_lower, tick_upper
+        )
     user_input = "[]"
     if entry_data:
         if isinstance(entry_data, list) and entry_data:
