@@ -89,9 +89,12 @@ okx-strategy-factory/
 │   ├── infra.md          #   通过 SSH 部署到 VPS
 │   ├── publish.md        #   将策略打包为跨平台技能
 │   └── iteration.md      #   上线后复盘与优化建议
+├── templates/            # 结构化模板
+│   └── requirements.md   #   策略需求模板（Lead 在 spawn Strategy agent 前填写）
 ├── references/           # 共享技术参考
 │   ├── api-interfaces.md #   适配器接口规范（钱包、DEX、持仓）
-│   └── risk-schema.json  #   risk-profile.json 的 JSON Schema
+│   ├── risk-schema.json  #   risk-profile.json 的 JSON Schema
+│   └── strategy-lessons.md # 策略经验库（风控、MTF、成本、陷阱）
 ├── assets/               # 模板和工具
 │   ├── product-skill-template/  # 策略专用打包模板（.tmpl）
 │   ├── skill-templates/         # Skill 设计模式模板（pipeline、tool-wrapper 等）
@@ -106,7 +109,7 @@ okx-strategy-factory/
 | 角色 | 职责 | 输入 | 输出 |
 |------|------|------|------|
 | **Lead** | 协调流水线、执行质量门禁、管理状态 | 用户请求 | 生成提示词、更新 state.json |
-| **Strategy** | 编写策略逻辑 + 配置 + 风控档案 | 交易对、方向、信号源 | `Strategy/{strategy}/Script/v{ver}/`（strategy.js, config.json, risk-profile.json, README.md） |
+| **Strategy** | 编写策略逻辑 + 配置 + 风控档案 | `Strategy/{strategy}/requirements.md`（Lead 提炼的结构化需求） | `Strategy/{strategy}/Script/v{ver}/`（strategy.js, config.json, risk-profile.json, README.md） |
 | **Backtest** | 基于历史数据验证策略 | 策略脚本目录 | `Strategy/{strategy}/Backtest/v{ver}/`（backtest-report.json, equity-curve.csv） |
 | **Infra** | 部署到 VPS（SSH、pm2、健康检查、回滚） | 回测通过的策略版本 | VPS 上运行的进程、VERSION 文件 |
 | **Publish** | 将策略打包为跨平台技能 + GitHub 发布 | 回测通过的策略 + 部署确认 | `{strategy}/`（manifest.json, install.sh, SKILL.md） |
@@ -116,6 +119,7 @@ okx-strategy-factory/
 
 ```
 步骤 1: 策略开发
+  Lead 从讨论中提炼需求 → 写入 Strategy/{strategy}/requirements.md → 用户确认 → spawn Strategy agent
   门禁: strategy.js + config.json + risk-profile.json + README.md 全部就位
     │
     ▼

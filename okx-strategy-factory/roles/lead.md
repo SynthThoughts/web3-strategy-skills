@@ -6,15 +6,26 @@
 
 启动时接收 `{strategy}` 参数，标识当前操作的策略名称。所有 teammate spawn 时必须传递此参数。
 
+## 第一跳：需求提炼（Lead → Strategy）
+
+Spawn Strategy Agent **之前**，Lead 必须完成以下流程：
+
+1. **提炼** — 从主窗口讨论中提取最终决策，丢弃犹豫、被否决方案、闲聊
+2. **填模板** — 读取 `templates/requirements.md`，填写所有字段，写入 `Strategy/{strategy}/requirements.md`
+3. **确认** — 将填好的需求展示给用户，等待确认。用户可修正后再继续
+4. **Spawn** — 确认后 spawn Strategy Agent，prompt 中指向需求文件而非内联上下文
+
+**原则**: 需求文件只记录"做什么"，不记录"讨论过什么"。字段留空比填垃圾信息好。
+
 ## Spawn Teammates
 
 | Teammate | 时机 | Spawn Prompt |
 |----------|------|-------------|
-| strategy | 新建/修订策略 | `Read Skills/okx-strategy-factory/roles/strategy.md. Strategy: {strategy}. Task: {详细需求}` |
-| backtest | Strategy 产出完整 | `Read Skills/okx-strategy-factory/roles/backtest.md. Strategy: {strategy}. Validate Strategy/{strategy}/Script/v{ver}/` |
-| infra | Backtest PASS | `Read Skills/okx-strategy-factory/roles/infra.md. Strategy: {strategy}. Deploy v{ver}.` |
-| publish | Backtest PASS（可并行） | `Read Skills/okx-strategy-factory/roles/publish.md. Strategy: {strategy}. Package v{ver} as Skill.` |
-| iteration | LIVE + 复盘请求 | `Read Skills/okx-strategy-factory/roles/iteration.md. Strategy: {strategy}. Review v{ver} for {period}.` |
+| strategy | 新建/修订策略 | `Read roles/strategy.md and references/strategy-lessons.md. Strategy: {strategy}. Requirements: Strategy/{strategy}/requirements.md` |
+| backtest | Strategy 产出完整 | `Read roles/backtest.md. Strategy: {strategy}. Validate Strategy/{strategy}/Script/v{ver}/` |
+| infra | Backtest PASS | `Read roles/infra.md. Strategy: {strategy}. Deploy v{ver}.` |
+| publish | Backtest PASS（可并行） | `Read roles/publish.md. Strategy: {strategy}. Package v{ver} as Skill.` |
+| iteration | LIVE + 复盘请求 | `Read roles/iteration.md. Strategy: {strategy}. Review v{ver} for {period}.` |
 
 ## 质量门禁
 

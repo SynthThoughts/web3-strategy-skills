@@ -54,12 +54,14 @@ Lead 启动 Pipeline 时**必须**指定策略名称 `{strategy}`，所有路径
 
 ### Step 1: Strategy Development
 
-**Load**: `roles/strategy.md` + `references/api-interfaces.md`
+**Load**: `roles/lead.md`（第一跳流程）+ `roles/strategy.md` + `references/api-interfaces.md` + `references/strategy-lessons.md`
 
 **Actions**:
-1. Spawn strategy teammate，给定交易对、方向、信号来源
-2. Strategy agent 输出到 `Strategy/{strategy}/Script/v{version}/`
-3. Lead 验证产出完整性
+1. Lead 从主窗口讨论中提炼需求，填写 `templates/requirements.md` 模板，写入 `Strategy/{strategy}/requirements.md`
+2. Lead 展示需求给用户确认（用户可修正）
+3. 确认后 spawn strategy teammate，prompt 指向需求文件
+4. Strategy agent 输出到 `Strategy/{strategy}/Script/v{version}/`
+5. Lead 验证产出完整性
 
 **Gate** (ALL must pass):
 - [ ] `strategy.js` 或 `.ts` 存在，无硬编码参数
@@ -84,7 +86,7 @@ Lead 启动 Pipeline 时**必须**指定策略名称 `{strategy}`，所有路径
 - [ ] 任一 Compliance FAIL → **FAIL**，退回 Step 1 附失败详情
 - [ ] Compliance PASS 但指标 borderline → **CONDITIONAL**，请用户决定
 
-### Step 3: Deploy to VPS
+### Step 3: Local Validate + Deploy to VPS
 
 **Load**: `roles/infra.md`
 
@@ -92,14 +94,18 @@ Lead 启动 Pipeline 时**必须**指定策略名称 `{strategy}`，所有路径
 
 **Actions**:
 1. Spawn infra teammate
-2. 通过 1Password 获取 SSH 密钥
-3. 部署到目标 VPS（pre-check → upload → activate → health check）
+2. **本地验证**: `./deploy.sh {strategy} validate` — 3 tick dry-run，验证启动 + RPC + 钱包
+3. 本地验证通过后，`./deploy.sh {strategy} production` — 部署到 VPS
 4. 健康检查通过后更新 `VERSION`
 
-**Gate**:
+**Gate (Local)**:
+- [ ] 本地 3 tick dry-run 全部成功
+- [ ] onchainos 连接 + 价格/余额查询正常
+- [ ] 失败 → 退回 Step 1 修复
+
+**Gate (Production)**:
 - [ ] 进程存活（pm2 status → "online"）
-- [ ] 启动 30s 内无错误日志
-- [ ] RPC 连接 + 钱包适配器响应正常
+- [ ] 启动 10s 内无错误日志
 - [ ] 失败 → 自动回滚到上一版本
 
 ### Step 4: Publish as Skill
@@ -142,9 +148,10 @@ Lead 启动 Pipeline 时**必须**指定策略名称 `{strategy}`，所有路径
 每个策略独立维护状态，互不影响。
 
 ```
-DRAFT → BACKTEST → PASSED → DEPLOYING → LIVE → ITERATION_REVIEW
+DRAFT → BACKTEST → PASSED → LOCAL_VALIDATING → LOCAL_VALIDATED → DEPLOYING → LIVE → ITERATION_REVIEW
                  → FAILED → DRAFT (revision)
                  → CONDITIONAL → (user decides)
+LOCAL_VALIDATING → LOCAL_FAILED → DRAFT (fix issues)
 DEPLOYING → DEPLOY_FAILED → rollback + DRAFT or retry
 ITERATION_REVIEW → APPROVED → DRAFT (new version, must re-backtest)
                  → REJECTED → LIVE (keep current)

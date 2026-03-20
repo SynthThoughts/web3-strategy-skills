@@ -90,9 +90,12 @@ okx-strategy-factory/
 │   ├── infra.md          #   Deploys to VPS via SSH
 │   ├── publish.md        #   Packages strategy as cross-platform Skill
 │   └── iteration.md      #   Post-LIVE review and optimization proposals
+├── templates/            # Structured templates
+│   └── requirements.md   #   Strategy requirements template (Lead fills before spawning Strategy agent)
 ├── references/           # Shared technical references
 │   ├── api-interfaces.md #   Adapter interface spec (wallet, dex, position)
-│   └── risk-schema.json  #   JSON Schema for risk-profile.json validation
+│   ├── risk-schema.json  #   JSON Schema for risk-profile.json validation
+│   └── strategy-lessons.md # Strategy lessons learned (risk, MTF, cost, pitfalls)
 ├── assets/               # Templates and tools
 │   ├── product-skill-template/  # Strategy-specific packaging templates (.tmpl)
 │   ├── skill-templates/         # Skill design pattern templates (pipeline, tool-wrapper, etc.)
@@ -107,7 +110,7 @@ okx-strategy-factory/
 | Role | Responsibility | Input | Output |
 |------|---------------|-------|--------|
 | **Lead** | Coordinate pipeline, enforce quality gates, manage state | User request | Spawn prompts, state.json updates |
-| **Strategy** | Write strategy logic + config + risk profile | Trading pair, direction, signal source | `Strategy/{strategy}/Script/v{ver}/` (strategy.js, config.json, risk-profile.json, README.md) |
+| **Strategy** | Write strategy logic + config + risk profile | `Strategy/{strategy}/requirements.md` (structured requirements distilled by Lead) | `Strategy/{strategy}/Script/v{ver}/` (strategy.js, config.json, risk-profile.json, README.md) |
 | **Backtest** | Validate strategy against historical data | Strategy script directory | `Strategy/{strategy}/Backtest/v{ver}/` (backtest-report.json, equity-curve.csv) |
 | **Infra** | Deploy to VPS (SSH, pm2, health check, rollback) | Backtest-passed strategy version | Running process on VPS, VERSION file |
 | **Publish** | Package strategy as cross-platform Skill + GitHub release | Backtest-passed strategy + deploy confirmation | `{strategy}/` (manifest.json, install.sh, SKILL.md) |
@@ -117,6 +120,7 @@ okx-strategy-factory/
 
 ```
 Step 1: Strategy Development
+  Lead distills discussion into Strategy/{strategy}/requirements.md → user confirms → spawn Strategy agent
   Gate: strategy.js + config.json + risk-profile.json + README.md all present
     │
     ▼
