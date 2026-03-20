@@ -142,6 +142,21 @@ MTF_STRUCTURE_PERIOD = 96  # 96-bar (8h @ 5min tick) for structure detection
 SELL_TRAIL_TICKS = 2  # wait 2 ticks (10min) of price stability before selling
 SELL_MOMENTUM_THRESHOLD = 0.005  # skip sell if 1h momentum > 0.5% (strong uptrend)
 
+# Dip-buy accumulation (buy-only mode when sell is blocked)
+DIP_BUY_LOOKBACK = 12  # 1 hour of 5min bars for recent-high detection
+DIP_BUY_MIN_DRAWDOWN = 0.005  # 0.5% minimum pullback from recent high
+DIP_BUY_COOLDOWN = 1800  # 30min cooldown between dip buys
+DIP_BUY_TIERS = [  # (drawdown_threshold, sizing_multiplier)
+    (0.03, 2.0),  # ≥3% drop: 200% size
+    (0.02, 1.5),  # ≥2% drop: 150% size
+    (0.01, 1.0),  # ≥1% drop: 100% size
+    (0.005, 0.5),  # ≥0.5% drop: 50% size
+]
+DIP_BUY_MOMENTUM_FLOOR = -0.5  # skip if 1h momentum < -0.5% (still falling hard)
+DIP_BUY_REVERSAL_TICKS = (
+    2  # price must rise for N consecutive ticks to confirm reversal
+)
+
 # Paths
 SCRIPT_DIR = Path(__file__).parent
 STATE_FILE = SCRIPT_DIR / "grid_state_v1.json"
@@ -676,9 +691,7 @@ def calc_trade_amount(
 
     # Apply sizing strategy multiplier
     if current_level is not None and grid_levels is not None:
-        multiplier = _calc_sizing_multiplier(
-            current_level, grid_levels, direction, mtf
-        )
+        multiplier = _calc_sizing_multiplier(current_level, grid_levels, direction, mtf)
         max_usd *= multiplier
         log(f"  Sizing: {direction} mult={multiplier:.2f} -> max_usd=${max_usd:.2f}")
 
@@ -1312,6 +1325,77 @@ def _should_delay_sell(
     return None
 
 
+def _check_dip_buy(
+    state: dict,
+    price: float,
+    history: list[float],
+    eth_pct: float,
+    mtf: dict | None,
+) -> dict | None:
+    """Check if we should dip-buy in accumulation mode.
+
+    Triggers only when selling is structurally blocked (USDC-heavy).
+    Returns {"multiplier": float, "drawdown": float, "reason": str} or None.
+    """
+    # Only activate when ETH% is below the sell threshold (buy-only regime)
+    pos_max, pos_min = _get_position_limits(mtf)
+    if eth_pct >= pos_min:
+        return None  # can still sell → normal grid mode
+
+    # Need enough history
+    if len(history) < DIP_BUY_LOOKBACK:
+        return None
+
+    recent = history[-DIP_BUY_LOOKBACK:]
+    recent_high = max(recent)
+    if recent_high <= 0:
+        return None
+
+    drawdown = (recent_high - price) / recent_high
+
+    # Condition 1: minimum pullback
+    if drawdown < DIP_BUY_MIN_DRAWDOWN:
+        return None
+
+    # Condition 2: NOT falling hard (avoid catching knives)
+    momentum_1h = mtf.get("momentum_1h", 0) if mtf else 0
+    if momentum_1h < DIP_BUY_MOMENTUM_FLOOR:
+        log(
+            f"  dip-buy skip: momentum {momentum_1h:.2f}% < {DIP_BUY_MOMENTUM_FLOOR}% (falling knife)"
+        )
+        return None
+
+    # Condition 3: reversal confirmation — price rising for N consecutive ticks
+    tail = history[-DIP_BUY_REVERSAL_TICKS:]
+    if len(tail) >= DIP_BUY_REVERSAL_TICKS:
+        rising = all(tail[i] < tail[i + 1] for i in range(len(tail) - 1))
+        if not rising:
+            log(
+                f"  dip-buy skip: no {DIP_BUY_REVERSAL_TICKS}-tick reversal "
+                f"(last {len(tail)}: {[round(p, 1) for p in tail]})"
+            )
+            return None
+
+    # Condition 4: cooldown since last dip-buy
+    last_dip = state.get("last_dip_buy_time")
+    if last_dip:
+        elapsed = (datetime.now() - datetime.fromisoformat(last_dip)).total_seconds()
+        if elapsed < DIP_BUY_COOLDOWN:
+            return None
+
+    # Determine tier
+    for threshold, mult in DIP_BUY_TIERS:
+        if drawdown >= threshold:
+            return {
+                "multiplier": mult,
+                "drawdown": drawdown,
+                "reason": f"dip_buy ({drawdown * 100:.1f}% from ${recent_high:.0f}, "
+                f"momentum {momentum_1h:+.2f}%)",
+            }
+
+    return None
+
+
 # ── Core Logic ──────────────────────────────────────────────────────────────
 
 
@@ -1842,6 +1926,73 @@ def tick():
             state["current_level"] = current_level
             log(f"Grid initialized at level {current_level}")
             tick_status = "initialized"
+        else:
+            # ── Dip-buy accumulation (no grid crossing, sell blocked) ──
+            dip = _check_dip_buy(state, price, history, eth_pct, mtf)
+            if dip:
+                dip_mult = dip["multiplier"]
+                dip_dd = dip["drawdown"]
+                dip_reason = dip["reason"]
+                log(f"DIP BUY: {dip_reason} mult={dip_mult:.1f}x")
+
+                amount, calc_fail = calc_trade_amount(
+                    "BUY",
+                    eth_bal,
+                    usdc_bal,
+                    price,
+                    current_level=current_level,
+                    grid_levels=GRID_LEVELS,
+                    mtf=mtf,
+                )
+                # Apply dip tier multiplier on top of trend sizing
+                if amount:
+                    amount = int(amount * dip_mult)
+                    # Cap at 95% of USDC balance
+                    max_amount = int(usdc_bal * 0.95 * 1e6)
+                    amount = min(amount, max_amount)
+
+                if amount and amount / 1e6 >= MIN_TRADE_USD:
+                    tx_hash, swap_fail = execute_swap("BUY", amount, price)
+                    if tx_hash:
+                        _record_attempt(state, "BUY", True)
+                        trade_usd = amount / 1e6
+                        trade_record = {
+                            "time": datetime.now().isoformat(),
+                            "direction": "BUY",
+                            "price": round(price, 2),
+                            "amount_usd": round(trade_usd, 2),
+                            "est_profit": 0,
+                            "tx": tx_hash,
+                            "grid_from": current_level,
+                            "grid_to": current_level,
+                            "trend": mtf.get("trend", "neutral") if mtf else "neutral",
+                            "trend_strength": mtf.get("strength", 0) if mtf else 0,
+                            "dip_buy": True,
+                            "drawdown_pct": round(dip_dd * 100, 2),
+                        }
+                        state["trades"].append(trade_record)
+                        if len(state["trades"]) > 50:
+                            state["trades"] = state["trades"][-50:]
+                        state["stats"]["total_buy_usdc"] = round(
+                            state["stats"].get("total_buy_usdc", 0) + trade_usd, 2
+                        )
+                        _total_usd = eth_bal * price + usdc_bal
+                        _initial = state["stats"].get("initial_portfolio_usd") or 0
+                        _deposits = state["stats"].get("total_deposits_usd", 0)
+                        state["stats"]["realized_pnl"] = round(
+                            _total_usd - _initial - _deposits, 2
+                        )
+                        state["last_dip_buy_time"] = datetime.now().isoformat()
+                        if "last_trade_times" not in state:
+                            state["last_trade_times"] = {}
+                        state["last_trade_times"]["BUY"] = datetime.now().isoformat()
+                        action = f"逢低买入 ${trade_usd:.2f} (回撤{dip_dd * 100:.1f}%)"
+                        tick_status = "dip_buy"
+                        direction = "BUY"
+                        log(f"TX: https://basescan.org/tx/{tx_hash}")
+                    else:
+                        _record_attempt(state, "BUY", False)
+                        log(f"Dip buy failed: {swap_fail}")
 
     # Save balance snapshot
     state["last_balances"] = {
