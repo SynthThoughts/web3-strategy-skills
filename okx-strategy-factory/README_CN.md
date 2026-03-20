@@ -92,8 +92,10 @@ okx-strategy-factory/
 ├── references/           # 共享技术参考
 │   ├── api-interfaces.md #   适配器接口规范（钱包、DEX、持仓）
 │   └── risk-schema.json  #   risk-profile.json 的 JSON Schema
-├── assets/               # 模板
-│   └── product-skill-template/  # Publish 智能体使用的技能打包模板
+├── assets/               # 模板和工具
+│   ├── product-skill-template/  # 策略专用打包模板（.tmpl）
+│   ├── skill-templates/         # Skill 设计模式模板（pipeline、tool-wrapper 等）
+│   └── publish.sh               # Skill 验证与发布脚本
 └── hooks/                # 流水线自动化
     ├── task-completed-gate.sh   # 步骤间质量门禁检查
     └── teammate-idle-reassign.sh # 空闲智能体重新分配

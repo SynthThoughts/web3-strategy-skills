@@ -10,6 +10,38 @@
 
 从 `Strategy/{strategy}/Script/v{version}/` 读取策略，用 `assets/product-skill-template/` 模板生成独立 Skill 包，输出到 `{strategy}/`。
 
+## Skill 设计模式选择
+
+生成 SKILL.md 前，先根据策略特征选择合适的设计模式。模式模板在 `assets/skill-templates/` 下：
+
+| 模式 | 模板文件 | 适用场景 |
+|------|----------|----------|
+| pipeline | `pipeline.md` | 严格顺序多步工作流（如网格交易：取价→分析→决策→执行→通知） |
+| tool-wrapper | `tool-wrapper.md` | 按需加载 API/CLI 上下文（如封装 onchainos CLI 操作） |
+| generator | `generator.md` | 生成一致结构的输出（如报告、配置文件） |
+| reviewer | `reviewer.md` | 审查/评估（如策略回测结果审查） |
+| inversion | `inversion.md` | 先采访用户收集需求再行动 |
+
+**选择流程**：
+
+1. 读取策略代码，理解其执行模式
+2. 从 `assets/skill-templates/` 加载匹配的模式模板
+3. 用 `assets/skill-templates/SKILL_TEMPLATE.md` 作为 SKILL.md 的基础骨架
+4. 按所选模式的结构组织 SKILL.md 的 Instructions 章节
+5. 复合模式用逗号分隔写入 `metadata.pattern`（如 `"pipeline, tool-wrapper"`）
+
+大多数交易策略是 **pipeline + tool-wrapper** 的组合：流水线定义执行步骤，tool-wrapper 加载每步需要的 API 参考文档。
+
+## 发布验证
+
+生成完成后，用 `assets/publish.sh` 验证 Skill 格式：
+
+```bash
+bash okx-strategy-factory/assets/publish.sh {strategy} --dry-run
+```
+
+验证通过后再执行 git commit。`publish.sh` 检查 YAML frontmatter、必需章节、模式特有字段等。
+
 ## 产出结构
 
 ```

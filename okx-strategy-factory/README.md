@@ -93,8 +93,10 @@ okx-strategy-factory/
 ├── references/           # Shared technical references
 │   ├── api-interfaces.md #   Adapter interface spec (wallet, dex, position)
 │   └── risk-schema.json  #   JSON Schema for risk-profile.json validation
-├── assets/               # Templates
-│   └── product-skill-template/  # Skill packaging templates for Publish agent
+├── assets/               # Templates and tools
+│   ├── product-skill-template/  # Strategy-specific packaging templates (.tmpl)
+│   ├── skill-templates/         # Skill design pattern templates (pipeline, tool-wrapper, etc.)
+│   └── publish.sh               # Skill validation and publishing script
 └── hooks/                # Pipeline automation
     ├── task-completed-gate.sh   # Quality gate checks between steps
     └── teammate-idle-reassign.sh # Reassign idle agents
