@@ -112,10 +112,10 @@ TRAILING_STOP_PCT = 0.10  # stop at 10% drawdown from peak
 
 
 # Position limits (trend-asymmetric)
-POSITION_MAX_PCT_DEFAULT = 70  # Block BUY when ETH > this %
-POSITION_MIN_PCT_DEFAULT = 30  # Block SELL when ETH < this %
-POSITION_MAX_PCT_BULLISH = 80  # Allow more ETH in bullish trend
-POSITION_MIN_PCT_BEARISH = 25  # Allow less ETH in bearish trend
+POSITION_MAX_PCT_DEFAULT = 80  # Block BUY when ETH > this %
+POSITION_MIN_PCT_DEFAULT = 20  # Block SELL when ETH < this %
+POSITION_MAX_PCT_BULLISH = 90  # Allow more ETH in bullish trend
+POSITION_MIN_PCT_BEARISH = 15  # Allow less ETH in bearish trend
 
 # Adaptive step bounds (as fraction of price)
 STEP_MIN_PCT = 0.010  # 1.0% (covers DEX costs)
@@ -223,23 +223,23 @@ def onchainos_cmd(args: list[str], timeout: int = 30) -> dict | None:
 
 
 def get_eth_price() -> float | None:
-    """Get ETH price via onchainos market price (lightweight, no routing)."""
+    """Get ETH/USDC price via onchainos swap quote."""
     data = onchainos_cmd(
         [
-            "market",
-            "price",
-            "--address",
+            "swap",
+            "quote",
+            "--from",
             ETH_ADDR,
+            "--to",
+            USDC_ADDR,
+            "--amount",
+            "1000000000000000000",
             "--chain",
             "base",
-        ],
-        timeout=10,
+        ]
     )
     if data and data.get("ok") and data.get("data"):
-        try:
-            return float(data["data"][0]["price"])
-        except (KeyError, IndexError, ValueError):
-            pass
+        return int(data["data"][0]["toTokenAmount"]) / 1e6
     return None
 
 
