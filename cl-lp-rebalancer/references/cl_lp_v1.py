@@ -203,22 +203,32 @@ if not WALLET_ADDR:
 
 
 def get_eth_price() -> float | None:
+    """Get ETH price from market kline (last close). More reliable than swap quote."""
     data = onchainos_cmd(
         [
-            "swap",
-            "quote",
-            "--from",
+            "market",
+            "kline",
+            "--address",
             ETH_ADDR,
-            "--to",
-            USDC_ADDR,
-            "--amount",
-            "1000000000000000000",
             "--chain",
             POOL_CHAIN,
-        ]
+            "--bar",
+            "1m",
+            "--limit",
+            "1",
+        ],
+        timeout=10,
     )
     if data and data.get("ok") and data.get("data"):
-        return int(data["data"][0]["toTokenAmount"]) / 1e6
+        candle = data["data"][0]
+        try:
+            # candle is [ts, open, high, low, close, vol, ...]
+            if isinstance(candle, list) and len(candle) >= 5:
+                return float(candle[4])  # close price
+            elif isinstance(candle, dict):
+                return float(candle.get("c", 0) or candle.get("close", 0))
+        except (ValueError, TypeError, IndexError):
+            pass
     return None
 
 

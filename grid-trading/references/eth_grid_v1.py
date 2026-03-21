@@ -223,23 +223,23 @@ def onchainos_cmd(args: list[str], timeout: int = 30) -> dict | None:
 
 
 def get_eth_price() -> float | None:
-    """Get ETH/USDC price via onchainos swap quote."""
+    """Get ETH price via onchainos market price (lightweight, no routing)."""
     data = onchainos_cmd(
         [
-            "swap",
-            "quote",
-            "--from",
+            "market",
+            "price",
+            "--address",
             ETH_ADDR,
-            "--to",
-            USDC_ADDR,
-            "--amount",
-            "1000000000000000000",
             "--chain",
             "base",
-        ]
+        ],
+        timeout=10,
     )
     if data and data.get("ok") and data.get("data"):
-        return int(data["data"][0]["toTokenAmount"]) / 1e6
+        try:
+            return float(data["data"][0]["price"])
+        except (KeyError, IndexError, ValueError):
+            pass
     return None
 
 
