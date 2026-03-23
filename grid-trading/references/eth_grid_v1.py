@@ -1798,13 +1798,14 @@ def tick():
         direction = "SELL" if current_level > prev_level else "BUY"
         skip_reason = None
 
-        # ── Zone filter: only BUY in lower half, only SELL in upper half ──
-        mid_level = 1  # only BUY at L0-L1, SELL at L2+
-        if direction == "BUY" and current_level > mid_level:
-            skip_reason = f"above mid-zone (L{current_level} > L{mid_level}, buy only below)"
+        # ── Zone filter: block BUY at top, block SELL at bottom ──
+        buy_ceil = 4   # BUY allowed at L0-L4, blocked at L5-L6
+        sell_floor = 1  # SELL allowed at L1-L6, blocked at L0
+        if direction == "BUY" and current_level > buy_ceil:
+            skip_reason = f"above buy-zone (L{current_level} > L{buy_ceil})"
             tick_status = "zone_filter"
-        elif direction == "SELL" and current_level < mid_level:
-            skip_reason = f"below mid-zone (L{current_level} < L{mid_level}, sell only above)"
+        elif direction == "SELL" and current_level < sell_floor:
+            skip_reason = f"below sell-zone (L{current_level} < L{sell_floor})"
             tick_status = "zone_filter"
 
         # ── Cooldown: min interval between same-direction trades ──
