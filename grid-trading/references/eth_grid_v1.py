@@ -1798,6 +1798,15 @@ def tick():
         direction = "SELL" if current_level > prev_level else "BUY"
         skip_reason = None
 
+        # ── Zone filter: only BUY in lower half, only SELL in upper half ──
+        mid_level = grid["levels"] // 2  # e.g. 3 for 6-level grid
+        if direction == "BUY" and current_level > mid_level:
+            skip_reason = f"above mid-zone (L{current_level} > L{mid_level}, buy only below)"
+            tick_status = "zone_filter"
+        elif direction == "SELL" and current_level < mid_level:
+            skip_reason = f"below mid-zone (L{current_level} < L{mid_level}, sell only above)"
+            tick_status = "zone_filter"
+
         # ── Cooldown: min interval between same-direction trades ──
         last_trade_times = state.get("last_trade_times", {})
         last_time_str = last_trade_times.get(direction)
