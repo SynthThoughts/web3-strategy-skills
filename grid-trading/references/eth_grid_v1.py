@@ -1799,7 +1799,7 @@ def tick():
         skip_reason = None
 
         # ── Zone filter: only BUY in lower half, only SELL in upper half ──
-        mid_level = grid["levels"] // 2  # e.g. 3 for 6-level grid
+        mid_level = 1  # only BUY at L0-L1, SELL at L2+
         if direction == "BUY" and current_level > mid_level:
             skip_reason = f"above mid-zone (L{current_level} > L{mid_level}, buy only below)"
             tick_status = "zone_filter"
