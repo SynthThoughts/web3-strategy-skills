@@ -167,6 +167,17 @@ def onchainos_cmd(args: list[str], timeout: int = 30) -> dict | None:
 
 # ── Wallet Address ──────────────────────────────────────────────────────────
 
+# Auto-switch to the correct account if ACCOUNT_ID is set in config
+_cfg_account_id = CFG.get("account_id", "") or os.environ.get("ACCOUNT_ID", "")
+if _cfg_account_id:
+    try:
+        subprocess.run(
+            ["onchainos", "wallet", "switch", _cfg_account_id],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        pass
+
 
 def _resolve_wallet_addr() -> str:
     env_addr = os.environ.get("WALLET_ADDR", "")
@@ -232,21 +243,22 @@ def get_eth_price() -> float | None:
     return None
 
 
-def get_balances() -> tuple[float, float]:
+def get_balances() -> tuple[float, float] | None:
+    """Get ETH and USDC balances. Returns None on query failure."""
     data = onchainos_cmd(["wallet", "balance", "--chain", CHAIN_ID], timeout=15)
-    eth, usdc = 0.0, 0.0
-    if data and data.get("ok") and data.get("data"):
-        details = data["data"].get("details", [])
-        for chain_detail in details:
-            for token in chain_detail.get("tokenAssets", []):
-                if token.get("tokenAddress") == "" and token.get("symbol") == "ETH":
-                    eth = float(token.get("balance", "0"))
-                elif token.get("tokenAddress", "").lower() == USDC_ADDR.lower():
-                    usdc = float(token.get("balance", "0"))
-    if eth == 0.0 and usdc == 0.0:
+    if not data or not data.get("ok") or not data.get("data"):
         log(
-            f"Balance query returned empty, raw: {json.dumps(data)[:200] if data else 'None'}"
+            f"Balance query failed, raw: {json.dumps(data)[:200] if data else 'None'}"
         )
+        return None
+    eth, usdc = 0.0, 0.0
+    details = data["data"].get("details", [])
+    for chain_detail in details:
+        for token in chain_detail.get("tokenAssets", []):
+            if token.get("tokenAddress") == "" and token.get("symbol") == "ETH":
+                eth = float(token.get("balance", "0"))
+            elif token.get("tokenAddress", "").lower() == USDC_ADDR.lower():
+                usdc = float(token.get("balance", "0"))
     return eth, usdc
 
 
@@ -1356,6 +1368,9 @@ DISCORD_CHANNEL_ID = _resolve_discord_channel_id()
 
 
 def _get_discord_token() -> str:
+    env_token = os.environ.get("DISCORD_BOT_TOKEN", "")
+    if env_token:
+        return env_token
     cfg_path = Path.home() / ".openclaw" / "openclaw.json"
     if cfg_path.exists():
         cfg = json.loads(cfg_path.read_text())
@@ -1468,7 +1483,9 @@ def tick():
     state["price_history"] = history
 
     # Balances (wallet + LP position)
-    eth_bal, usdc_bal = get_balances()
+    bal = get_balances()
+    balance_failed = bal is None
+    eth_bal, usdc_bal = bal if bal else (0.0, 0.0)
     wallet_usd = eth_bal * price + usdc_bal
     position = state.get("position")
     lp_value = 0.0
@@ -1483,6 +1500,10 @@ def tick():
         pos_detail = get_position_detail(position["token_id"])
         lp_value = pos_detail["value"]
         unclaimed_fee = pos_detail["unclaimed_fee_usd"]
+        if lp_value == 0.0 and position.get("tick_lower"):
+            # Position exists in state but API returned 0 — treat as query failure
+            balance_failed = True
+            log("LP position query returned 0 value — treating as query failure")
     total_usd = wallet_usd + lp_value
     state["stats"]["unclaimed_fee_usd"] = round(unclaimed_fee, 4)
 
@@ -1565,9 +1586,13 @@ def tick():
         il_pct = estimate_il(entry_price, price)
         state["stats"]["estimated_il_pct"] = il_pct
 
-    # Risk checks (pre-trigger)
+    # Risk checks (pre-trigger) — skip if balance query failed
     trigger = check_rebalance_triggers(price, state, atr_pct, mtf)
-    risk_reject = run_risk_checks(state, price, total_usd, trigger)
+    if balance_failed:
+        log("Balance query failed — skipping risk checks this tick")
+        risk_reject = None
+    else:
+        risk_reject = run_risk_checks(state, price, total_usd, trigger)
 
     tick_status = "no_action"
     rebalanced = False
@@ -1806,10 +1831,20 @@ def _print_tick_output(
 
     if has_event or datetime.now().minute < 5:
         sent = _send_discord_embed([embed])
+        if not sent:
+            print("Failed to send Discord embed. Outputting to stdout instead:")
+            status_cn = "调仓" if rebalanced else "运行中"
+            summary = (
+                f"**LP** `${price:.2f}` | {range_str} | {regime} "
+                f"| `{eth_bal:.4f}` ETH + `${usdc_bal:.1f}` USDC (`${total_usd:.0f}`)"
+            )
+            pnl_sign = "+" if total_pnl >= 0 else ""
+            summary += f"\n> 收益 `{pnl_sign}${total_pnl:.2f}` | 范围内 `{tir:.0f}%` | 调仓 `{rebalances}` | {status_cn}"
+            if trigger:
+                summary += f" | 触发: {trigger['trigger']}"
+            print(summary)
     else:
         sent = False
-
-    if not sent:
         status_cn = "调仓" if rebalanced else "运行中"
         summary = (
             f"**LP** `${price:.2f}` | {range_str} | {regime} "

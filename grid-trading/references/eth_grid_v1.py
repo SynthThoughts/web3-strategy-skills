@@ -262,22 +262,22 @@ def get_eth_price() -> float | None:
     return None
 
 
-def get_balances() -> tuple[float, float]:
-    """Get ETH and USDC balances via onchainos wallet balance."""
+def get_balances() -> tuple[float, float] | None:
+    """Get ETH and USDC balances. Returns None on query failure."""
     data = onchainos_cmd(["wallet", "balance", "--chain", CHAIN_ID], timeout=15)
-    eth, usdc = 0.0, 0.0
-    if data and data.get("ok") and data.get("data"):
-        details = data["data"].get("details", [])
-        for chain_detail in details:
-            for token in chain_detail.get("tokenAssets", []):
-                if token.get("tokenAddress") == "" and token.get("symbol") == "ETH":
-                    eth = float(token.get("balance", "0"))
-                elif token.get("tokenAddress", "").lower() == USDC_ADDR.lower():
-                    usdc = float(token.get("balance", "0"))
-    if eth == 0.0 and usdc == 0.0:
+    if not data or not data.get("ok") or not data.get("data"):
         log(
-            f"Balance query returned empty, raw: {json.dumps(data)[:200] if data else 'None'}"
+            f"Balance query failed, raw: {json.dumps(data)[:200] if data else 'None'}"
         )
+        return None
+    eth, usdc = 0.0, 0.0
+    details = data["data"].get("details", [])
+    for chain_detail in details:
+        for token in chain_detail.get("tokenAssets", []):
+            if token.get("tokenAddress") == "" and token.get("symbol") == "ETH":
+                eth = float(token.get("balance", "0"))
+            elif token.get("tokenAddress", "").lower() == USDC_ADDR.lower():
+                usdc = float(token.get("balance", "0"))
     return eth, usdc
 
 
@@ -1123,7 +1123,7 @@ def _resolve_discord_channel_id() -> str:
                         return ch_id
     except Exception:
         pass
-    return ""
+    return "1469182686961602682"
 
 
 DISCORD_CHANNEL_ID = _resolve_discord_channel_id()
@@ -1485,15 +1485,20 @@ def tick():
     state["price_history"] = history
 
     # Get balances (fallback to last known if API fails)
-    eth_bal, usdc_bal = get_balances()
-    if eth_bal == 0.0 and usdc_bal == 0.0:
+    bal = get_balances()
+    balance_failed = bal is None
+    if bal is not None:
+        eth_bal, usdc_bal = bal
+    else:
         last_bal = state.get("last_balances", {})
         if last_bal.get("eth", 0) > 0 or last_bal.get("usdc", 0) > 0:
             eth_bal = last_bal.get("eth", 0)
             usdc_bal = last_bal.get("usdc", 0)
             log(
-                f"Balance API returned 0 — using last known: ETH={eth_bal}, USDC={usdc_bal}"
+                f"Balance query failed — using last known: ETH={eth_bal}, USDC={usdc_bal}"
             )
+        else:
+            eth_bal, usdc_bal = 0.0, 0.0
     total_usd = eth_bal * price + usdc_bal
 
     # Snapshot initial portfolio on first tick
@@ -1502,8 +1507,10 @@ def tick():
         state["stats"]["initial_eth_price"] = round(price, 2)
         log(f"Initial portfolio snapshot: ${total_usd:.2f} @ ETH ${price:.2f}")
 
-    # Detect external deposits/withdrawals
-    detected_deposit = _detect_deposits(state, eth_bal, usdc_bal, price)
+    # Detect external deposits/withdrawals (skip if balance query failed)
+    detected_deposit = None
+    if not balance_failed:
+        detected_deposit = _detect_deposits(state, eth_bal, usdc_bal, price)
 
     # ── Multi-timeframe analysis ──
     mtf = analyze_multi_timeframe(history, price)
@@ -1629,7 +1636,11 @@ def tick():
             )
             return
 
-    stop_trigger = _check_stop_conditions(state, total_usd, price)
+    if balance_failed:
+        log("Balance query failed — skipping stop checks this tick")
+        stop_trigger = None
+    else:
+        stop_trigger = _check_stop_conditions(state, total_usd, price)
     if stop_trigger:
         state["stop_triggered"] = stop_trigger
         log(f"STOP TRIGGERED: {stop_trigger}")
