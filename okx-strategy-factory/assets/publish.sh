@@ -348,6 +348,94 @@ else
     pass "文件大小合理: ${FILE_SIZE} 字节"
 fi
 
+# --- Step 3.5: 敏感信息扫描 ---
+echo -e "\n${BLUE}[3.5/4] 敏感信息扫描${NC}"
+
+# 扫描所有文件（排除 .git 和二进制文件）
+SCAN_FILES=$(find "$SKILL_DIR" -type f \
+    ! -path '*/.git/*' \
+    ! -name '*.png' ! -name '*.jpg' ! -name '*.gif' ! -name '*.ico' \
+    ! -name '*.woff*' ! -name '*.ttf' \
+    2>/dev/null)
+
+SECRETS_FOUND=0
+
+# 1. API keys / tokens（常见格式）
+while IFS= read -r f; do
+    # Discord bot tokens (MTQ/MTI/OT + base64)
+    if grep -qE 'MT[A-Za-z0-9]{20,}\.[A-Za-z0-9_-]{6}\.' "$f" 2>/dev/null; then
+        fail "疑似 Discord Bot Token: $f"
+        SECRETS_FOUND=$((SECRETS_FOUND + 1))
+    fi
+    # JWT tokens (eyJ...)
+    if grep -qE 'eyJ[A-Za-z0-9_-]{20,}\.' "$f" 2>/dev/null; then
+        fail "疑似 JWT Token: $f"
+        SECRETS_FOUND=$((SECRETS_FOUND + 1))
+    fi
+    # Generic API keys (sk-xxx, key-xxx 等长字符串)
+    if grep -qE '(sk-|key-)[a-f0-9]{32,}' "$f" 2>/dev/null; then
+        fail "疑似 API Key: $f"
+        SECRETS_FOUND=$((SECRETS_FOUND + 1))
+    fi
+    # OKX-style UUID API keys
+    if grep -qE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$f" 2>/dev/null; then
+        # 排除 ONCHAINOS_ACCOUNT_ID 模式（env var 引用，非硬编码）
+        if grep -qE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$f" 2>/dev/null | grep -qvE 'environ|getenv|os\.env' 2>/dev/null; then
+            warn "疑似 UUID（可能是 API Key 或 Account ID）: $f — 请人工确认"
+        fi
+    fi
+    # Private keys (hex 64 chars, exclude well-known constants like uint256 max)
+    if grep -E '["\x27][0-9a-fA-F]{64}["\x27]' "$f" 2>/dev/null | \
+       grep -qvE '115792089237316195423570985008687907853269984665640564039457584007913129639935|0{64}|f{64}|F{64}' 2>/dev/null; then
+        fail "疑似私钥（64位hex）: $f"
+        SECRETS_FOUND=$((SECRETS_FOUND + 1))
+    fi
+    # Passwords / passphrases (hardcoded string assignments)
+    if grep -qiE '(password|passphrase|secret)\s*=\s*["\x27][^"\x27]{4,}["\x27]' "$f" 2>/dev/null; then
+        # 排除从环境变量读取的模式
+        if ! grep -qiE '(environ|getenv|os\.env|process\.env)' "$f" 2>/dev/null || \
+           grep -qiE '(password|passphrase|secret)\s*=\s*["\x27][^"\x27]{4,}["\x27]' "$f" 2>/dev/null | grep -qvE 'environ|getenv'; then
+            warn "可能包含硬编码密码: $f — 请人工确认"
+        fi
+    fi
+done <<< "$SCAN_FILES"
+
+# 2. 硬编码的用户特定 ID（Discord channel、钱包地址等）
+while IFS= read -r f; do
+    # Discord channel/guild IDs (恰好 17-20 位纯数字，排除 wei 常量和 env 读取)
+    if grep -qE '["\x27][0-9]{17,20}["\x27]' "$f" 2>/dev/null; then
+        MATCHES=$(grep -nE '["\x27][0-9]{17,20}["\x27]' "$f" 2>/dev/null | grep -vE '[0-9]{21}|environ|getenv|os\.env|DISCORD_CHANNEL_ID|#|1000000000000000000|10\*\*|1e18|wei|decimal' || true)
+        if [[ -n "$MATCHES" ]]; then
+            warn "疑似硬编码 Discord ID: $f"
+            echo "$MATCHES" | head -3 | while read -r line; do
+                info "  $line"
+            done
+        fi
+    fi
+    # Hardcoded wallet addresses (非 token contract 地址)
+    if grep -qE '0x[0-9a-fA-F]{40}' "$f" 2>/dev/null; then
+        # 排除已知的 token contract 地址和全 e/全 0 地址
+        WALLET_MATCHES=$(grep -nE '0x[0-9a-fA-F]{40}' "$f" 2>/dev/null | \
+            grep -viE '0xeeee|0x0000|0x8335|0x4200|token.*addr|TOKEN.*ADDR|USDC_ADDR|ETH_ADDR|WETH|contract' || true)
+        if [[ -n "$WALLET_MATCHES" ]]; then
+            warn "疑似硬编码钱包地址: $f — 请确认是否为用户特定地址"
+            echo "$WALLET_MATCHES" | head -3 | while read -r line; do
+                info "  $line"
+            done
+        fi
+    fi
+done <<< "$SCAN_FILES"
+
+# 3. .env 文件不应被发布
+if find "$SKILL_DIR" -name '.env' -o -name '.env.*' -o -name 'env.local*' 2>/dev/null | grep -q .; then
+    fail "Skill 目录包含 .env 文件，禁止发布"
+    SECRETS_FOUND=$((SECRETS_FOUND + 1))
+fi
+
+if [[ $SECRETS_FOUND -gt 0 ]]; then
+    fail "发现 $SECRETS_FOUND 处疑似敏感信息，必须清理后才能发布"
+fi
+
 # --- 验证结果 ---
 echo -e "\n${BLUE}━━━ 验证结果 ━━━${NC}"
 echo -e "  错误: ${RED}${ERRORS}${NC}  警告: ${YELLOW}${WARNINGS}${NC}"

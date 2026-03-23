@@ -1123,7 +1123,7 @@ def _resolve_discord_channel_id() -> str:
                         return ch_id
     except Exception:
         pass
-    return "1469182686961602682"
+    return ""
 
 
 DISCORD_CHANNEL_ID = _resolve_discord_channel_id()
