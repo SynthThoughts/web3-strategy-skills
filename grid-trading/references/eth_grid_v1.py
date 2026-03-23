@@ -75,6 +75,19 @@ def _resolve_wallet_addr() -> str:
     return ""
 
 
+# Switch onchainos to the correct account if specified
+_account_id = os.environ.get("ONCHAINOS_ACCOUNT_ID", "")
+if _account_id:
+    try:
+        _sw = subprocess.run(
+            ["onchainos", "wallet", "switch", _account_id],
+            capture_output=True, text=True, timeout=10,
+        )
+        if _sw.returncode != 0:
+            print(f"WARN: onchainos account switch failed: {_sw.stderr.strip()}", file=sys.stderr)
+    except Exception as e:
+        print(f"WARN: onchainos account switch error: {e}", file=sys.stderr)
+
 WALLET_ADDR = _resolve_wallet_addr()
 if not WALLET_ADDR:
     print(
@@ -110,6 +123,12 @@ SIZING_MULTIPLIER_MAX = 2.0
 STOP_LOSS_PCT = 0.15  # stop at 15% loss from cost basis
 TRAILING_STOP_PCT = 0.10  # stop at 10% drawdown from peak
 
+# Auto-resume after stop-loss
+STOP_AUTO_RESUME = True  # enable automatic recovery after stop
+STOP_COOLDOWN_MINUTES = 60  # minimum wait time after stop before considering resume
+STOP_RESUME_BOUNCE_PCT = 0.01  # price must recover 1% from stop price
+STOP_RESUME_MAX_BEARISH = 0.5  # resume only if trend strength < this (not strongly bearish)
+
 
 # Position limits (trend-asymmetric)
 POSITION_MAX_PCT_DEFAULT = 80  # Block BUY when ETH > this %
@@ -139,7 +158,7 @@ MTF_LONG_PERIOD = 48  # 48-bar EMA (4h @ 5min tick)
 MTF_STRUCTURE_PERIOD = 96  # 96-bar (8h @ 5min tick) for structure detection
 
 # Sell improvement — trailing grid lock
-SELL_TRAIL_TICKS = 2  # wait 2 ticks (10min) of price stability before selling
+SELL_TRAIL_TICKS = 0  # sell immediately when price hits level
 SELL_MOMENTUM_THRESHOLD = 0.005  # skip sell if 1h momentum > 0.5% (strong uptrend)
 
 # Dip-buy accumulation (buy-only mode when sell is blocked)
@@ -1104,13 +1123,16 @@ def _resolve_discord_channel_id() -> str:
                         return ch_id
     except Exception:
         pass
-    return ""
+    return "1469182686961602682"
 
 
 DISCORD_CHANNEL_ID = _resolve_discord_channel_id()
 
 
 def _get_discord_token() -> str:
+    env_token = os.environ.get("DISCORD_BOT_TOKEN", "")
+    if env_token:
+        return env_token
     cfg_path = Path.home() / ".openclaw" / "openclaw.json"
     if cfg_path.exists():
         cfg = json.loads(cfg_path.read_text())
@@ -1517,28 +1539,95 @@ def tick():
         log(f"STOP ACTIVE: {trigger} -- trading halted")
         if not state.get("stop_notified"):
             state["stop_notified"] = True
+            state.setdefault("stop_price", round(price, 2))
+            state.setdefault("stop_time", datetime.now().isoformat())
             save_state(state)
             _send_discord_embed(
                 [
                     {
                         "title": "\U0001f6d1 交易已停止",
                         "color": 0xFF0000,
-                        "description": f"触发条件: **{trigger}**\n当前价格: ${price:.2f}\n组合价值: ${total_usd:.0f}\n\n使用 `resume-trading` 恢复交易",
+                        "description": f"触发条件: **{trigger}**\n当前价格: ${price:.2f}\n组合价值: ${total_usd:.0f}\n\n将在价格回升后自动恢复",
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     }
                 ]
             )
-        else:
+
+        # ── Auto-resume check ──
+        can_resume = False
+        resume_reasons = []
+        if STOP_AUTO_RESUME:
+            stop_price = state.get("stop_price", price)
+            stop_time_str = state.get("stop_time")
+            cooldown_ok = True
+            if stop_time_str:
+                elapsed_min = (datetime.now() - datetime.fromisoformat(stop_time_str)).total_seconds() / 60
+                cooldown_ok = elapsed_min >= STOP_COOLDOWN_MINUTES
+                if not cooldown_ok:
+                    resume_reasons.append(f"冷却中 {elapsed_min:.0f}/{STOP_COOLDOWN_MINUTES}min")
+
+            bounce_pct = (price - stop_price) / stop_price if stop_price > 0 else 0
+            bounce_ok = bounce_pct >= STOP_RESUME_BOUNCE_PCT
+            if not bounce_ok:
+                resume_reasons.append(f"反弹 {bounce_pct*100:+.1f}% < {STOP_RESUME_BOUNCE_PCT*100:.0f}%")
+
+            trend_ok = True
+            if mtf and mtf.get("trend") == "bearish" and mtf.get("strength", 0) >= STOP_RESUME_MAX_BEARISH:
+                trend_ok = False
+                resume_reasons.append(f"趋势仍强熊 strength={mtf.get('strength', 0):.2f}")
+
+            can_resume = cooldown_ok and bounce_ok and trend_ok
+
+        if can_resume:
+            old_trigger = state["stop_triggered"]
+            state.pop("stop_triggered", None)
+            state.pop("stop_notified", None)
+            state.pop("stop_price", None)
+            state.pop("stop_time", None)
+            # Reset cost basis to current portfolio for fresh start
+            state["stats"]["initial_portfolio_usd"] = round(total_usd, 2)
+            state["stats"]["initial_eth_price"] = round(price, 2)
+            state["stats"]["portfolio_peak_usd"] = round(total_usd, 2)
+            state["stats"]["started_at"] = datetime.now().isoformat()
+            state["grid"] = None  # force grid rebuild at current price
             save_state(state)
-        _emit_json(
-            {
-                "status": "stopped",
-                "stop_triggered": trigger,
-                "portfolio_usd": round(total_usd, 2),
-                "price": round(price, 2),
+            log(f"AUTO-RESUME: conditions met, rebuilding grid at ${price:.2f}")
+            _send_discord_embed(
+                [
+                    {
+                        "title": "\u2705 自动恢复交易",
+                        "color": 0x00C853,
+                        "description": (
+                            f"止损原因: {old_trigger}\n"
+                            f"恢复价格: ${price:.2f} (反弹 {bounce_pct*100:+.1f}%)\n"
+                            f"新基准: ${total_usd:.0f}\n"
+                            f"将以当前价格重建网格"
+                        ),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                ]
+            )
+            # Fall through to normal tick logic (grid rebuild etc.)
+        else:
+            reason_str = ", ".join(resume_reasons) if resume_reasons else "auto-resume disabled"
+            log(f"Auto-resume not ready: {reason_str}")
+            # Update balances to prevent repeated withdrawal detection
+            state["last_balances"] = {
+                "eth": round(eth_bal, 6),
+                "usdc": round(usdc_bal, 2),
+                "time": datetime.now().isoformat(),
             }
-        )
-        return
+            save_state(state)
+            _emit_json(
+                {
+                    "status": "stopped",
+                    "stop_triggered": trigger,
+                    "portfolio_usd": round(total_usd, 2),
+                    "price": round(price, 2),
+                    "auto_resume_pending": reason_str,
+                }
+            )
+            return
 
     stop_trigger = _check_stop_conditions(state, total_usd, price)
     if stop_trigger:
