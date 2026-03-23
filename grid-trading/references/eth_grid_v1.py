@@ -1123,7 +1123,7 @@ def _resolve_discord_channel_id() -> str:
                         return ch_id
     except Exception:
         pass
-    return "1469182686961602682"
+    return ""
 
 
 DISCORD_CHANNEL_ID = _resolve_discord_channel_id()
@@ -1756,7 +1756,10 @@ def tick():
         state["grid"] = grid
         state["grid_set_at"] = datetime.now().isoformat()
         new_level = price_to_level(price, grid)
-        state["current_level"] = new_level
+        old_level = state.get("current_level")
+        # Only silence ±1 level drift from grid rebuild; preserve real jumps
+        if old_level is None or abs(new_level - old_level) <= 1:
+            state["current_level"] = new_level
         # Clear sell trail counters on recalibration
         state["sell_trail_counter"] = {}
         step_change = f" (was ${old_step:.1f})" if old_step else ""
