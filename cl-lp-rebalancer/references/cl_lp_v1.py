@@ -684,11 +684,14 @@ def check_rebalance_triggers(
                 "detail": f"{old_regime}->{new_regime} (delta {vol_change:.0%})",
             }
 
-    # [4] Time decay — maintenance (>24h)
+    # [4] Time decay — maintenance (>24h since creation or last skip)
     created_at = position.get("created_at")
     if created_at:
         created_dt = _safe_isoparse(created_at)
-        age_seconds = (datetime.now() - created_dt).total_seconds() if created_dt else 0
+        last_skip = _safe_isoparse(state.get("_last_time_decay_skip", ""))
+        candidates = [d for d in (created_dt, last_skip) if d]
+        ref_dt = max(candidates) if candidates else None
+        age_seconds = (datetime.now() - ref_dt).total_seconds() if ref_dt else 0
         if age_seconds > 86400:  # 24h
             return {
                 "trigger": "time_decay",
@@ -1916,6 +1919,8 @@ def _tick_inner():
                         f"Range change too small ({width_change:.1%} < 5%) — skipping "
                         f"[{trigger['trigger']}]"
                     )
+                    if trigger["trigger"] == "time_decay":
+                        state["_last_time_decay_skip"] = datetime.now().isoformat()
                     trigger = None
                     tick_status = "skip_small_change"
 
