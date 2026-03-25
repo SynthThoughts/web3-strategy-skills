@@ -4,7 +4,7 @@ description: "Dynamic grid trading strategy for any token pair on EVM L2 chains 
 license: Apache-2.0
 metadata:
   author: SynthThoughts
-  version: "1.4.0"
+  version: "1.5.0"
   pattern: "pipeline, tool-wrapper"
   steps: "5"
   openclaw:
