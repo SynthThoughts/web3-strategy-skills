@@ -1320,13 +1320,19 @@ def execute_rebalance(
     )
 
     # Step 1: Claim fees (skip if unclaimed < $5 to save gas)
-    unclaimed = state.get("stats", {}).get("unclaimed_fee_usd", 0)
+    # Refetch position detail for fresh unclaimed amount before claiming
+    unclaimed = 0.0
+    if token_id:
+        pre_claim_detail = get_position_detail(token_id)
+        unclaimed = pre_claim_detail.get("unclaimed_fee_usd", 0)
+        state["stats"]["unclaimed_fee_usd"] = round(unclaimed, 4)
     if token_id and unclaimed >= MIN_TRADE_USD:
         claimed = defi_claim_fees(token_id)
         if claimed:
             state["stats"]["total_fees_claimed_usd"] = round(
                 state["stats"].get("total_fees_claimed_usd", 0) + unclaimed, 2
             )
+            state["stats"]["unclaimed_fee_usd"] = 0.0  # just claimed
             log(
                 f"  Fees claimed: ${unclaimed:.2f} (total: ${state['stats']['total_fees_claimed_usd']:.2f})"
             )
@@ -1689,7 +1695,10 @@ def _build_notification(tier: str, data: dict) -> dict:
         tir = data.get("time_in_range_pct", 0)
         rebal = data.get("total_rebalances", 0)
         pnl_usd = data.get("pnl_usd", 0)
+        pnl_pct = data.get("pnl_pct", 0)
+        pnl_valid = data.get("pnl_valid", False)
         unclaimed = data.get("unclaimed_fee_usd", 0)
+        portfolio = data.get("portfolio_usd", 0)
 
         visual = _range_visual(price, lower, upper) if lower and upper else ""
         edge = ""
@@ -1699,21 +1708,24 @@ def _build_notification(tier: str, data: dict) -> dict:
             edge_pct = min(dist_low, dist_high) * 100
             edge = f"{edge_pct:.0f}%"
 
+        pnl_str = f"${pnl_usd:+,.2f} ({pnl_pct:+.1f}%)" if pnl_valid else "—"
+
         fields_discord = [
             {"name": "价格", "value": f"${price:,.2f}", "inline": True},
             {"name": "边缘距离", "value": edge or "—", "inline": True},
-            {"name": "波动率", "value": f"{regime} ({atr:.1f}%)", "inline": True},
-            {"name": "趋势", "value": f"{trend} ({strength:.2f})", "inline": True},
-            {"name": "PnL", "value": f"${pnl_usd:+,.2f}", "inline": True},
+            {"name": "组合价值", "value": f"${portfolio:,.2f}", "inline": True},
+            {"name": "PnL", "value": pnl_str, "inline": True},
             {"name": "待领费用", "value": f"${unclaimed:,.2f}", "inline": True},
+            {"name": "波动/趋势", "value": f"{regime} · {trend}", "inline": True},
         ]
         footer = f"范围内 {tir:.0f}% · 累计调仓 {rebal}次"
 
         text_lines = [
             f"📊 **{PAIR_NAME} · {CHAIN_LABEL} · 运行中**",
             f"`{visual}`" if visual else None,
-            f"💰 `${price:,.2f}` | 边缘 `{edge}` | 波动 `{regime}` | 趋势 `{trend}`",
-            f"📈 PnL `${pnl_usd:+,.2f}` | 待领费用 `${unclaimed:,.2f}`",
+            f"💰 `${price:,.2f}` | 边缘 `{edge}` | 组合 `${portfolio:,.2f}`",
+            f"📈 PnL `{pnl_str}` | 待领费用 `${unclaimed:,.2f}`" if pnl_valid else f"📈 待领费用 `${unclaimed:,.2f}`",
+            f"📉 波动 `{regime}` | 趋势 `{trend}` ({strength:.2f})",
             f"_{footer}_",
         ]
 
@@ -1732,6 +1744,7 @@ def _build_notification(tier: str, data: dict) -> dict:
     if tier == "daily_report":
         pnl_usd = data.get("pnl_usd", 0)
         pnl_pct = data.get("pnl_pct", 0)
+        pnl_valid = data.get("pnl_valid", False)
         tir = data.get("time_in_range_pct", 0)
         rebal = data.get("total_rebalances", 0)
         atr = data.get("atr_pct", 0)
@@ -1740,25 +1753,24 @@ def _build_notification(tier: str, data: dict) -> dict:
         strength = data.get("trend_strength", 0)
         fees_claimed = data.get("total_fees_claimed_usd", 0)
         unclaimed = data.get("unclaimed_fee_usd", 0)
+        il_pct = data.get("il_pct", 0)
         il_usd = data.get("il_usd", 0)
         today_rebal = data.get("today_rebalances", [])
         started = data.get("started_at", "")
         portfolio = data.get("portfolio_usd", 0)
 
         today = datetime.now().date().isoformat()
+        pnl_str = f"${pnl_usd:+,.2f} ({pnl_pct:+.1f}%)" if pnl_valid else "数据不足"
+        il_str = f"${il_usd:,.2f} ({il_pct:.2f}%)" if il_pct else "—"
 
         fields_discord = [
-            {
-                "name": "📈 PnL",
-                "value": f"${pnl_usd:+,.2f} ({pnl_pct:+.1f}%)",
-                "inline": True,
-            },
+            {"name": "📈 PnL", "value": pnl_str, "inline": True},
             {
                 "name": "💵 LP 费用",
-                "value": f"${fees_claimed + unclaimed:,.2f}",
+                "value": f"${fees_claimed + unclaimed:,.2f} (已领 ${fees_claimed:,.2f})",
                 "inline": True,
             },
-            {"name": "📉 无常损失", "value": f"${il_usd:,.2f}", "inline": True},
+            {"name": "📉 无常损失", "value": il_str, "inline": True},
             {"name": "🔄 今日调仓", "value": f"{len(today_rebal)} 次", "inline": True},
             {"name": "📊 范围内", "value": f"{tir:.0f}%", "inline": True},
             {"name": "💰 组合价值", "value": f"${portfolio:,.2f}", "inline": True},
@@ -1777,9 +1789,9 @@ def _build_notification(tier: str, data: dict) -> dict:
             f"📈 **日报 · {PAIR_NAME} · {today}**",
             "",
             "**收益**",
-            f"  PnL: `${pnl_usd:+,.2f}` (`{pnl_pct:+.1f}%`)",
+            f"  PnL: `{pnl_str}`",
             f"  LP 费用: `${fees_claimed + unclaimed:,.2f}` (已领 `${fees_claimed:,.2f}` + 待领 `${unclaimed:,.2f}`)",
-            f"  无常损失: `${il_usd:,.2f}`" if il_usd else None,
+            f"  无常损失: `{il_str}`" if il_pct else None,
             "",
             "**运营**",
             f"  今日调仓: `{len(today_rebal)}` 次 | 范围内: `{tir:.0f}%`",
@@ -2064,9 +2076,8 @@ def _tick_inner():
             balance_failed = True
             log("LP position query returned 0 value — treating as query failure")
     total_usd = wallet_usd + lp_value
-    # Track unclaimed fees in stats for IL derivation
+    # Track unclaimed fees in stats
     state.setdefault("stats", {})["unclaimed_fee_usd"] = round(unclaimed_fee, 2)
-    state["stats"]["unclaimed_fee_usd"] = round(unclaimed_fee, 4)
 
     # Track portfolio value history for smoothing (only when data is reliable)
     if not balance_failed:
@@ -2329,9 +2340,13 @@ def _tick_inner():
     )
     stats = state.get("stats", {})
     pnl = calc_pnl(stats, total_usd)
-    unclaimed_fee = stats.get("unclaimed_fee_usd", 0)
-    total_fees = stats.get("total_fees_claimed_usd", 0) + unclaimed_fee
-    il_usd = (total_fees - pnl["pnl_usd"]) if pnl["valid"] and total_fees > 0 else 0
+    unclaimed_fee_usd = stats.get("unclaimed_fee_usd", 0)
+    claimed_fee_usd = stats.get("total_fees_claimed_usd", 0)
+
+    # IL estimation: geometric formula (price divergence from entry)
+    entry_price = stats.get("initial_eth_price")
+    il_pct = estimate_il(entry_price, price) if entry_price else 0.0
+    il_usd = round(il_pct / 100 * total_usd, 2) if il_pct else 0.0
 
     tick_data = {
         "status": tick_status,
@@ -2342,9 +2357,12 @@ def _tick_inner():
         "trend_strength": round(mtf.get("strength", 0), 2),
         "portfolio_usd": round(total_usd, 2),
         "pnl_usd": pnl["pnl_usd"],
-        "unclaimed_fee_usd": round(unclaimed_fee, 2),
-        "total_fees_claimed_usd": round(stats.get("total_fees_claimed_usd", 0), 2),
-        "il_usd": round(il_usd, 2),
+        "pnl_pct": round(pnl["pnl_pct"], 2),
+        "pnl_valid": pnl["valid"],
+        "unclaimed_fee_usd": round(unclaimed_fee_usd, 2),
+        "total_fees_claimed_usd": round(claimed_fee_usd, 2),
+        "il_pct": round(il_pct, 2),
+        "il_usd": il_usd,
         "balances": {
             "eth": round(eth_bal, 6),
             "usdc": round(usdc_bal, 2),
@@ -2546,9 +2564,20 @@ def report():
     if price and len(history) >= MTF_SHORT_PERIOD:
         mtf = analyze_multi_timeframe(history, price)
 
-    unclaimed_fee = stats.get("unclaimed_fee_usd", 0)
-    total_fees = stats.get("total_fees_claimed_usd", 0) + unclaimed_fee
-    il_usd = (total_fees - pnl["pnl_usd"]) if pnl["valid"] and total_fees > 0 else 0
+    # Refetch position for fresh unclaimed fees (report runs independently)
+    unclaimed_fee = 0.0
+    lp_value = 0.0
+    if position and position.get("token_id"):
+        pos_detail = get_position_detail(position["token_id"])
+        unclaimed_fee = pos_detail.get("unclaimed_fee_usd", 0)
+        lp_value = pos_detail.get("value", 0)
+        total_usd = eth_bal * (price or 0) + usdc_bal + lp_value
+    claimed_fee = stats.get("total_fees_claimed_usd", 0)
+
+    # IL: geometric formula from entry price divergence
+    entry_price = stats.get("initial_eth_price")
+    il_pct = estimate_il(entry_price, price) if entry_price and price else 0.0
+    il_usd = round(il_pct / 100 * total_usd, 2) if il_pct else 0.0
 
     report_data = {
         "price": round(price, 2) if price else None,
@@ -2558,9 +2587,11 @@ def report():
         "portfolio_usd": round(total_usd, 2),
         "pnl_usd": pnl["pnl_usd"],
         "pnl_pct": round(pnl["pnl_pct"], 2),
-        "total_fees_claimed_usd": round(stats.get("total_fees_claimed_usd", 0), 2),
+        "pnl_valid": pnl["valid"],
+        "total_fees_claimed_usd": round(claimed_fee, 2),
         "unclaimed_fee_usd": round(unclaimed_fee, 2),
-        "il_usd": round(il_usd, 2),
+        "il_pct": round(il_pct, 2),
+        "il_usd": il_usd,
         "time_in_range_pct": round(tir, 1),
         "total_rebalances": total_rebal,
         "today_rebalances": today_rebal[-5:],
