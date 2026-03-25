@@ -324,6 +324,14 @@ def get_balances() -> tuple[float, float, bool]:
     if not data or not data.get("ok") or not data.get("data"):
         log(f"Balance query failed, raw: {json.dumps(data)[:200] if data else 'None'}")
         return 0.0, 0.0, True
+    # Verify returned address matches configured wallet
+    returned_addr = data["data"].get("evmAddress", "")
+    if returned_addr.lower() != WALLET_ADDR.lower():
+        log(
+            f"Balance address mismatch: got {returned_addr}, "
+            f"expected {WALLET_ADDR} — wrong account active"
+        )
+        return 0.0, 0.0, True
     eth, usdc = 0.0, 0.0
     details = data["data"].get("details", [])
     for chain_detail in details:
