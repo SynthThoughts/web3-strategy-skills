@@ -22,7 +22,7 @@ metadata:
         - onchainos
         - python3
     primaryEnv: OKX_API_KEY
-    entrypoint: references/eth_grid_v1.py
+    entrypoint: references/eth_grid.py
     os:
       - darwin
       - linux
@@ -53,7 +53,7 @@ New grid dict fields: `buy_step`, `sell_step` (backward-compatible `step` = aver
 ```
 Cron (5min) → Python script → onchainos CLI → OKX Web3 API → Chain
                   ↓                ↓
-            state_v1.json    Wallet (TEE signing)
+            grid_state.json    Wallet (TEE signing)
                   ↓
             ┌─────────────┐
             │ MTF Analysis │ ← price_history (288 bars = 24h)
@@ -185,7 +185,7 @@ OKX_PASSPHRASE=...
 | Swap Quote+TX | `onchainos swap swap --from $A --to $B --amount $amt --chain base --wallet $addr --slippage 1` | Tokens, amount, wallet | `{data: [{tx: {to, data, value, gas}}]}` |
 | Approve ERC-20 | `onchainos swap approve --token $USDC --amount $max --chain base` | Token, amount | Approval TX data |
 | Simulate TX | `onchainos gateway simulate --from $wallet --to $to --data $hex --chain base` | TX params | `{failReason, gasUsed}` |
-| Sign+Broadcast | `onchainos wallet contract-call --to $addr --chain 8453 --input-data $hex --value $eth` | TX params | `{txHash}` |
+| Sign+Broadcast | `onchainos wallet contract-call --to $addr --chain 8453 --input-data $hex --amt $wei` | TX params | `{txHash}` |
 
 ### Error Handling Protocol
 
@@ -678,7 +678,7 @@ if abs(unexplained_change) > $100:
 
 ### Logging
 
-- File: `grid_bot_v1.log` in script directory
+- File: `grid_bot.log` in script directory
 - Rotation: simple half-file rotation at 1MB
 - Format: `[YYYY-MM-DD HH:MM:SS] message`
 
@@ -807,7 +807,7 @@ Simulate new parameters against historical data, then: backup → patch → reca
 ### Review Checklist (AI Agent Prompt)
 
 ```
-1. Read grid_state_v1.json and grid_bot_v1.log
+1. Read grid_state.json and grid_bot.log
 2. Filter trades to review window (default: last 48h)
 3. Pair trades into round trips
 4. Compute: win_rate, avg_spread, loss_count, micro_count, total_pnl, hodl_alpha
@@ -822,7 +822,7 @@ Simulate new parameters against historical data, then: backup → patch → reca
 
 ```
 IF Step N fails:
-  1. Log failure reason to grid_bot_v1.log
+  1. Log failure reason to grid_bot.log
   2. Increment errors.consecutive
   3. If errors.consecutive >= 5: trigger circuit breaker (1h cooldown)
   4. Cache failed trade for retry command (10min expiry)

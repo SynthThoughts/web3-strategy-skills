@@ -1,78 +1,129 @@
 # Grid Trading
 
-[中文](./README_CN.md)
+基于 OKX DEX API 的 EVM L2 链上动态网格交易策略，适用于任意交易对。
 
-Dynamic grid trading strategy for any token pair on EVM L2 chains via OKX DEX API.
+**核心思路：在波动中自动低买高卖。** 将价格区间划分为多个网格层级，价格下跌触网买入，上涨触网卖出。结合 MTF 多时间框架趋势分析，动态调整网格宽度和仓位。
 
-## Features
+## 特性
 
-- **Asymmetric Grid** — buy-dense/sell-wide in bullish trends, reverse in bearish
-- **Volatility-Adaptive** — ATR-based dynamic grid width adjustment
-- **Multi-Timeframe Analysis (MTF)** — 5min price + 1H/4H EMA + 8H structure detection
-- **Trend Following** — dynamic position sizing, scale in with trend, scale out against it
-- **Trailing Take-Profit** — delay selling in strong uptrends, let profits run
-- **Momentum Filter** — skip sell signals when trend momentum is strong
-- **HODL Alpha Tracking** — measure strategy vs simple buy-and-hold
-- **Risk Controls** — Stop Loss / Trailing Stop / Flash Crash Protection / Circuit Breaker
-- **Discord Notifications** — trade alerts, daily reports
+- **非对称网格** — 看涨时买侧密集/卖侧稀疏，看跌时反转
+- **波动率自适应** — 基于 ATR 动态调整网格宽度
+- **多时间框架分析 (MTF)** — 5min 价格 + 1H/4H EMA + 8H 结构检测
+- **趋势跟踪** — 动态仓位管理，顺势加仓逆势减仓
+- **追踪止盈** — 强上涨中延迟卖出，让利润奔跑
+- **动量过滤器** — 趋势动量强劲时跳过卖出信号
+- **HODL Alpha 追踪** — 对比策略收益与简单持有
+- **风控体系** — 止损 / 追踪止损 / 闪崩保护 / 熔断机制
 
-## Architecture
+## 架构
 
 ```
-Cron (5min) → Python script → onchainos CLI → OKX Web3 API → Chain
-                  ↓                ↓
-            state_v1.json    Wallet (TEE signing)
-                  ↓
-            MTF Analysis → Trend-Adaptive Grid → Discord
+┌─────────────────────────────────────────────────────┐
+│               AI Agent (Claude)                      │
+│  策略设计 → 回测验证 → 参数调优 → 复盘迭代          │
+└──────────────────────┬──────────────────────────────┘
+                       │ 生成 / 优化
+┌──────────────────────▼──────────────────────────────┐
+│               策略脚本 (Python)                      │
+│  数据采集 → MTF分析 → 网格决策 → 风控检查 → 交易执行│
+└──────────────────────┬──────────────────────────────┘
+                       │ 调用
+┌──────────────────────▼──────────────────────────────┐
+│                 onchainos Skills                      │
+│  行情 · K线 · 钱包 · DEX路由 · TEE签名 · 交易广播  │
+└──────────────────────┬──────────────────────────────┘
+                       │ 上链
+┌──────────────────────▼──────────────────────────────┐
+│                  EVM L2 链上执行                      │
+│           OKX DEX 聚合器 → 最优路由 → 成交           │
+└─────────────────────────────────────────────────────┘
 ```
 
-## Installation
+## 网格算法
 
-**ClawHub** (recommended):
+```
+当前价格 → 1H K线 (24根) → ATR% → 波动率分类 → 网格宽度
+                                        ↓
+                                  MTF 趋势分析
+                                        ↓
+                              非对称网格 + 动态仓位
+                                        ↓
+                                  买/卖触发 → 执行
+```
+
+| 市场状态 | 网格行为 | 仓位策略 |
+|----------|----------|----------|
+| 震荡 | 窄间距，双向密集 | 买卖等量 |
+| 看涨 | 买侧密集，卖侧稀疏 | 加大买入，减少卖出 |
+| 看跌 | 卖侧密集，买侧稀疏 | 加大卖出，减少买入 |
+| 高波动 | 自动加宽间距 | 降低单笔金额 |
+
+详细算法说明见 [references/grid-algorithm.md](references/grid-algorithm.md)。
+
+## 与 V3 LP 调仓的区别
+
+| 维度 | 网格交易 | V3 LP 调仓 |
+|------|---------|-----------|
+| 收益来源 | 网格价差（低买高卖） | LP 手续费（做市） |
+| 持仓形式 | ETH + USDC 代币余额 | LP NFT 头寸 |
+| 链上操作 | 单步 swap | 四步：claim → remove → swap → deposit |
+| 交易频率 | 每 tick 可能触发 | 仅在触发条件满足时调仓 |
+| 主要风险 | 单边行情踏空 | 无常损失 (IL) |
+| Gas 敏感度 | 低 | 高（多步操作） |
+
+## 快速开始
+
+详细步骤见 [SETUP.md](SETUP.md)。
+
 ```bash
-npx clawhub install grid-trading
+# 1. 安装
+openclaw skill install grid-trading
+
+# 2. 配置
+cd ~/.openclaw/skills/grid-trading/references
+cp ../.env.example .env    # 填入 API keys + 钱包地址
+vi config.json             # 调整网格参数
+
+# 3. 测试（只读，安全）
+python3 eth_grid.py status
+
+# 4. 注册 cron
+zeroclaw cron add '*/5 * * * *' \
+  'cd ~/.openclaw/skills/grid-trading/references && set -a && . ../.env && set +a && python3 eth_grid.py tick'
 ```
 
-**OpenClaw with cron**:
-```bash
-cp -r grid-trading ~/.openclaw/skills/
-cp grid-trading/references/eth_grid_v1.py ~/.openclaw/scripts/
+## 命令
 
-openclaw cron add --name eth-grid-tick \
-  --schedule "*/5 * * * *" \
-  --command "cd ~/.openclaw/scripts && python3 eth_grid_v1.py tick"
+| 命令 | 用途 | 触发 |
+|------|------|------|
+| `tick` | 主循环：采集→分析→网格决策→交易 | Cron 每 5 分钟 |
+| `status` | 价格、余额、网格层级、趋势、收益 | 手动 |
+| `report` | 每日报告 (Discord) | Cron 每天 |
+| `history` | 近期交易记录 | 手动 |
+| `analyze` | 市场分析 + round-trip 配对 | AI Agent |
+| `reset` | 重新校准网格 | 手动 |
+| `retry` | 重试上次失败的交易 | 手动 |
+| `deposit` | 记录外部存取款 | 手动 |
+| `resume-trading` | 清除止损恢复交易 | 手动 |
 
-openclaw cron add --name eth-grid-daily \
-  --schedule "0 0 * * *" \
-  --command "cd ~/.openclaw/scripts && python3 eth_grid_v1.py report"
-```
-
-**System crontab**:
-```bash
-scp grid-trading/references/eth_grid_v1.py user@your-vps:~/scripts/
-
-crontab -e
-# */5 * * * * cd ~/scripts && python3 eth_grid_v1.py tick >> /tmp/grid.log 2>&1
-# 0 0 * * *   cd ~/scripts && python3 eth_grid_v1.py report >> /tmp/grid.log 2>&1
-```
-
-## Directory Structure
+## 目录结构
 
 ```
 grid-trading/
-├── SKILL.md              # Core knowledge: algorithm, pipeline, config
+├── SKILL.md              # AI Agent 核心知识（流水线、状态机、参数）
+├── README.md             # 本文件
+├── .env.example          # 环境变量模板
 └── references/
-    ├── eth_grid_v1.py     # Production strategy script
-    └── grid-algorithm.md  # Algorithm deep-dive: grid math, MTF, asymmetry
+    ├── eth_grid.py    # 策略代码（零第三方依赖）
+    ├── config.json       # 参考配置（所有可调参数）
+    └── grid-algorithm.md # 网格算法详解
 ```
 
-## Prerequisites
+## 前置条件
 
-- onchainos CLI — `npx skills add okx/onchainos-skills`
-- OKX API Key with DEX trading permissions
-- OnchainOS Agentic Wallet with TEE signing
-- Python 3.10+
-- VPS (recommended for 24/7 operation)
+- **onchainos** — OKX OnchainOS CLI，内置钱包管理、DEX 交易、TEE 签名等 Skills
+- **OKX API Key** — DEX 交易权限
+- **Python 3.10+** — 零第三方依赖
 
 ## License
 

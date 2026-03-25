@@ -188,8 +188,8 @@ DIP_BUY_REVERSAL_TICKS = (
 
 # Paths
 SCRIPT_DIR = Path(__file__).parent
-STATE_FILE = SCRIPT_DIR / "grid_state_v1.json"
-LOG_FILE = SCRIPT_DIR / "grid_bot_v1.log"
+STATE_FILE = SCRIPT_DIR / "grid_state.json"
+LOG_FILE = SCRIPT_DIR / "grid_bot.log"
 MAX_LOG_BYTES = 1_000_000  # 1MB log rotation
 
 # ── Logging ─────────────────────────────────────────────────────────────────
@@ -273,19 +273,36 @@ def get_eth_price() -> float | None:
 
 
 def get_balances() -> tuple[float, float] | None:
-    """Get ETH and USDC balances. Returns None on query failure."""
-    data = onchainos_cmd(["wallet", "balance", "--chain", CHAIN_ID], timeout=15)
+    """Get ETH and USDC balances via --all to avoid wallet-switch race condition."""
+    account_id = os.environ.get("ONCHAINOS_ACCOUNT_ID", "")
+    if account_id:
+        data = onchainos_cmd(["wallet", "balance", "--all", "--chain", CHAIN_ID], timeout=15)
+    else:
+        data = onchainos_cmd(["wallet", "balance", "--chain", CHAIN_ID], timeout=15)
     if not data or not data.get("ok") or not data.get("data"):
         log(f"Balance query failed, raw: {json.dumps(data)[:200] if data else 'None'}")
         return None
     eth, usdc = 0.0, 0.0
-    details = data["data"].get("details", [])
-    for chain_detail in details:
-        for token in chain_detail.get("tokenAssets", []):
-            if token.get("tokenAddress") == "" and token.get("symbol") == "ETH":
-                eth = float(token.get("balance", "0"))
-            elif token.get("tokenAddress", "").lower() == USDC_ADDR.lower():
-                usdc = float(token.get("balance", "0"))
+    if account_id:
+        # --all returns {details: {accountId: {data: [{tokenAssets: [...]}]}}}
+        acct_data = data["data"].get("details", {}).get(account_id)
+        if not acct_data or not acct_data.get("data"):
+            log(f"Balance: account {account_id} not found in --all response")
+            return None
+        for chain_detail in acct_data["data"]:
+            for token in chain_detail.get("tokenAssets", []):
+                if token.get("tokenAddress") == "" and token.get("symbol") == "ETH":
+                    eth = float(token.get("balance", "0"))
+                elif token.get("tokenAddress", "").lower() == USDC_ADDR.lower():
+                    usdc = float(token.get("balance", "0"))
+    else:
+        details = data["data"].get("details", [])
+        for chain_detail in details:
+            for token in chain_detail.get("tokenAssets", []):
+                if token.get("tokenAddress") == "" and token.get("symbol") == "ETH":
+                    eth = float(token.get("balance", "0"))
+                elif token.get("tokenAddress", "").lower() == USDC_ADDR.lower():
+                    usdc = float(token.get("balance", "0"))
     return eth, usdc
 
 
@@ -801,8 +818,7 @@ def ensure_approval(spender: str, amount: int) -> bool:
 
 def _wallet_contract_call(tx: dict) -> tuple[str | None, dict | None]:
     """Sign + broadcast via onchainos wallet contract-call (TEE signing)."""
-    value_wei = int(tx.get("value", "0"))
-    value_eth = str(value_wei / 1e18) if value_wei > 0 else "0"
+    value_wei = str(int(tx.get("value", "0")))
 
     args = [
         "wallet",
@@ -813,8 +829,8 @@ def _wallet_contract_call(tx: dict) -> tuple[str | None, dict | None]:
         CHAIN_ID,
         "--input-data",
         tx.get("data", "0x"),
-        "--value",
-        value_eth,
+        "--amt",
+        value_wei,
     ]
 
     # Let onchainos estimate gas internally (tx.gas from DEX API is unreliable)
@@ -1111,7 +1127,7 @@ def _emit_json(data: dict):
     print(json.dumps(data, indent=2))
 
 
-# ── Discord embed helper ────────────────────────────────────────────────────
+# ── Notification helpers (Discord + Telegram) ─────────────────────────────
 
 
 def _resolve_discord_channel_id() -> str:
@@ -1148,34 +1164,126 @@ def _get_discord_token() -> str:
     return ""
 
 
-def _send_discord_embed(embeds: list[dict], content: str = ""):
-    """Send a Discord embed (card) message directly via Bot API."""
+def _get_telegram_config() -> tuple[str, str]:
+    """Return (bot_token, chat_id). Checks env first, then zeroclaw config."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if token and chat_id:
+        return token, chat_id
+    # Try zeroclaw-strategy config
+    for cfg_dir in ["zeroclaw-strategy", "zeroclaw", "openclaw"]:
+        cfg_path = Path.home() / f".{cfg_dir}" / "config.toml"
+        if cfg_path.exists():
+            try:
+                text = cfg_path.read_text()
+                # Simple TOML parse for telegram section
+                in_tg = False
+                for line in text.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("[") and "telegram" in stripped.lower():
+                        in_tg = True
+                        continue
+                    if stripped.startswith("[") and in_tg:
+                        break
+                    if in_tg and "=" in stripped:
+                        k, v = stripped.split("=", 1)
+                        k, v = k.strip(), v.strip().strip('"').strip("'")
+                        if k == "bot_token" and not token:
+                            token = v
+                        if k == "chat_id" and not chat_id:
+                            chat_id = v
+            except Exception:
+                pass
+    return token, chat_id
+
+
+TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID = _get_telegram_config()
+
+
+def _embed_to_text(embeds: list[dict], content: str = "") -> str:
+    """Convert Discord embeds to plain text for Telegram."""
+    parts = []
+    if content:
+        parts.append(content)
+    for e in embeds:
+        title = e.get("title", "")
+        desc = e.get("description", "")
+        if title:
+            parts.append(f"*{title}*")
+        if desc:
+            parts.append(desc)
+        fields = e.get("fields", [])
+        for f in fields:
+            name = f.get("name", "")
+            value = f.get("value", "")
+            parts.append(f"{name}: {value}")
+    return "\n".join(parts)
+
+
+def _send_telegram(text: str) -> bool:
+    """Send a message via Telegram Bot API."""
     import urllib.request
     import urllib.error
 
-    token = _get_discord_token()
-    if not token:
-        log("Discord embed: no token found, falling back to print")
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
-    url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages"
-    payload = {"embeds": embeds}
-    if content:
-        payload["content"] = content
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
-        headers={
-            "Authorization": f"Bot {token}",
-            "Content-Type": "application/json",
-            "User-Agent": "DiscordBot (https://openclaw.ai, 1.0)",
-        },
+        headers={"Content-Type": "application/json"},
     )
     try:
         urllib.request.urlopen(req, timeout=10)
         return True
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
-        log(f"Discord embed error: {e}")
+        log(f"Telegram send error: {e}")
         return False
+
+
+def _send_discord_embed(embeds: list[dict], content: str = ""):
+    """Send notification via Discord embed + Telegram text."""
+    import urllib.request
+    import urllib.error
+
+    discord_ok = False
+    token = _get_discord_token()
+    if token and DISCORD_CHANNEL_ID:
+        url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages"
+        payload = {"embeds": embeds}
+        if content:
+            payload["content"] = content
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={
+                "Authorization": f"Bot {token}",
+                "Content-Type": "application/json",
+                "User-Agent": "DiscordBot (https://openclaw.ai, 1.0)",
+            },
+        )
+        try:
+            urllib.request.urlopen(req, timeout=10)
+            discord_ok = True
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
+            log(f"Discord embed error: {e}")
+
+    # Also send to Telegram
+    tg_ok = False
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        text = _embed_to_text(embeds, content)
+        tg_ok = _send_telegram(text)
+
+    if not discord_ok and not tg_ok:
+        log("No notification channel available (Discord + Telegram both failed)")
+        return False
+    return True
 
 
 def _record_attempt(state: dict, direction: str, success: bool, is_retry: bool = False):
@@ -3002,7 +3110,7 @@ def analyze():
 def deposit():
     """Manually record deposit/withdrawal."""
     if len(sys.argv) < 3:
-        print("用法: eth_grid_v1.py deposit <金额USD>")
+        print("用法: eth_grid.py deposit <金额USD>")
         print("正数=存入, 负数=取出. 例: deposit 100 或 deposit -50")
         return
 
