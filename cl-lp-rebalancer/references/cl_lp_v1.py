@@ -10,11 +10,13 @@ Uses OKX DEX API (via onchainos CLI) + OnchainOS Agentic Wallet (TEE signing).
 Designed for OpenClaw cron integration.
 """
 
+import fcntl
 import json
 import math
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -115,11 +117,74 @@ def log(msg: str):
     print(line)
     try:
         if LOG_FILE.exists() and LOG_FILE.stat().st_size > MAX_LOG_BYTES:
-            lines = LOG_FILE.read_text().splitlines()
-            LOG_FILE.write_text("\n".join(lines[len(lines) // 2 :]) + "\n")
+            content = LOG_FILE.read_text()
+            lines = content.splitlines()
+            # Atomic log rotation
+            fd, tmp = tempfile.mkstemp(dir=LOG_FILE.parent, suffix=".log.tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write("\n".join(lines[len(lines) // 2 :]) + "\n")
+                os.replace(tmp, LOG_FILE)
+            except Exception as e:
+                print(f"WARNING: log rotation failed: {e}", file=sys.stderr)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         with open(LOG_FILE, "a") as f:
             f.write(line + "\n")
-    except Exception:
+    except Exception as e:
+        print(f"WARNING: log write failed: {e}", file=sys.stderr)
+
+
+# ── Safe datetime parsing ──────────────────────────────────────────────────
+
+
+def _safe_isoparse(s: str, default: datetime | None = None) -> datetime | None:
+    """Parse ISO datetime string safely. Returns default on failure."""
+    if not s:
+        return default
+    try:
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return default
+
+
+# ── Process lock ───────────────────────────────────────────────────────────
+
+LOCK_FILE = SCRIPT_DIR / ".cl_lp_v1.lock"
+_lock_fd = None
+
+
+def _acquire_lock() -> bool:
+    """Acquire exclusive process lock. Returns False if another instance is running."""
+    global _lock_fd
+    try:
+        _lock_fd = open(LOCK_FILE, "w")
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_fd.write(str(os.getpid()))
+        _lock_fd.flush()
+        return True
+    except (OSError, IOError):
+        if _lock_fd:
+            _lock_fd.close()
+            _lock_fd = None
+        return False
+
+
+def _release_lock():
+    """Release process lock."""
+    global _lock_fd
+    if _lock_fd:
+        try:
+            fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+            _lock_fd.close()
+        except (OSError, IOError):
+            pass
+        _lock_fd = None
+    try:
+        LOCK_FILE.unlink(missing_ok=True)
+    except OSError:
         pass
 
 
@@ -151,7 +216,9 @@ def onchainos_cmd(args: list[str], timeout: int = 30) -> dict | None:
                     "data": data if isinstance(data, list) else [data],
                 }
             except json.JSONDecodeError:
-                pass
+                log(
+                    f"onchainos invalid JSON: {' '.join(args[:3])} output={output[:100]}"
+                )
         if result.returncode != 0:
             stderr = result.stderr.strip() if result.stderr else ""
             log(
@@ -171,12 +238,20 @@ def onchainos_cmd(args: list[str], timeout: int = 30) -> dict | None:
 _cfg_account_id = CFG.get("account_id", "") or os.environ.get("ACCOUNT_ID", "")
 if _cfg_account_id:
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["onchainos", "wallet", "switch", _cfg_account_id],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
-    except Exception:
-        pass
+        if result.returncode != 0:
+            print(
+                f"WARNING: wallet switch to {_cfg_account_id} failed: "
+                f"{result.stderr.strip()[:100] if result.stderr else 'unknown error'}",
+                file=sys.stderr,
+            )
+    except Exception as e:
+        print(f"WARNING: wallet switch failed: {e}", file=sys.stderr)
 
 
 def _resolve_wallet_addr() -> str:
@@ -198,8 +273,8 @@ def _resolve_wallet_addr() -> str:
                     if entry.get("chainIndex") == CHAIN_ID:
                         return entry["address"]
                 return evm_addrs[0]["address"]
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"WARNING: wallet address resolution failed: {e}", file=sys.stderr)
     return ""
 
 
@@ -243,14 +318,12 @@ def get_eth_price() -> float | None:
     return None
 
 
-def get_balances() -> tuple[float, float] | None:
-    """Get ETH and USDC balances. Returns None on query failure."""
+def get_balances() -> tuple[float, float, bool]:
+    """Get ETH and USDC balances. Returns (eth, usdc, failed)."""
     data = onchainos_cmd(["wallet", "balance", "--chain", CHAIN_ID], timeout=15)
     if not data or not data.get("ok") or not data.get("data"):
-        log(
-            f"Balance query failed, raw: {json.dumps(data)[:200] if data else 'None'}"
-        )
-        return None
+        log(f"Balance query failed, raw: {json.dumps(data)[:200] if data else 'None'}")
+        return 0.0, 0.0, True
     eth, usdc = 0.0, 0.0
     details = data["data"].get("details", [])
     for chain_detail in details:
@@ -259,7 +332,7 @@ def get_balances() -> tuple[float, float] | None:
                 eth = float(token.get("balance", "0"))
             elif token.get("tokenAddress", "").lower() == USDC_ADDR.lower():
                 usdc = float(token.get("balance", "0"))
-    return eth, usdc
+    return eth, usdc, False
 
 
 def get_position_detail(token_id: str) -> dict:
@@ -454,19 +527,20 @@ def analyze_multi_timeframe(history: list[float], price: float) -> dict:
     result["ema_medium"] = round(ema_medium, 2)
     result["ema_long"] = round(ema_long, 2)
 
-    if len(history) >= 12:
+    if len(history) >= 12 and history[-12] > 0:
         result["momentum_1h"] = round((price - history[-12]) / history[-12] * 100, 3)
-    if len(history) >= 48:
+    if len(history) >= 48 and history[-48] > 0:
         result["momentum_4h"] = round((price - history[-48]) / history[-48] * 100, 3)
 
-    if ema_short > ema_medium > ema_long:
-        result["trend"] = "bullish"
-        spread = (ema_short - ema_long) / ema_long * 100
-        result["strength"] = round(min(spread / 2.0, 1.0), 3)
-    elif ema_short < ema_medium < ema_long:
-        result["trend"] = "bearish"
-        spread = (ema_long - ema_short) / ema_long * 100
-        result["strength"] = round(min(spread / 2.0, 1.0), 3)
+    if ema_long > 0:
+        if ema_short > ema_medium > ema_long:
+            result["trend"] = "bullish"
+            spread = (ema_short - ema_long) / ema_long * 100
+            result["strength"] = round(min(spread / 2.0, 1.0), 3)
+        elif ema_short < ema_medium < ema_long:
+            result["trend"] = "bearish"
+            spread = (ema_long - ema_short) / ema_long * 100
+            result["strength"] = round(min(spread / 2.0, 1.0), 3)
 
     if len(history) >= MTF_STRUCTURE_PERIOD:
         seg_len = MTF_STRUCTURE_PERIOD // 4
@@ -613,9 +687,8 @@ def check_rebalance_triggers(
     # [4] Time decay — maintenance (>24h)
     created_at = position.get("created_at")
     if created_at:
-        age_seconds = (
-            datetime.now() - datetime.fromisoformat(created_at)
-        ).total_seconds()
+        created_dt = _safe_isoparse(created_at)
+        age_seconds = (datetime.now() - created_dt).total_seconds() if created_dt else 0
         if age_seconds > 86400:  # 24h
             return {
                 "trigger": "time_decay",
@@ -643,11 +716,9 @@ def run_risk_checks(
     # [2] Circuit breaker
     errors = state.get("errors", {})
     if errors.get("consecutive", 0) >= MAX_CONSECUTIVE_ERRORS:
-        cooldown = errors.get("cooldown_until")
-        if cooldown and datetime.fromisoformat(cooldown) > datetime.now():
-            remaining = (
-                datetime.fromisoformat(cooldown) - datetime.now()
-            ).seconds // 60
+        cooldown_dt = _safe_isoparse(errors.get("cooldown_until", ""))
+        if cooldown_dt and cooldown_dt > datetime.now():
+            remaining = int((cooldown_dt - datetime.now()).total_seconds()) // 60
             return f"circuit_breaker ({remaining}min remaining)"
         else:
             errors["consecutive"] = 0
@@ -660,18 +731,23 @@ def run_risk_checks(
         return "zero_balance"
 
     # [4] Stop-loss / trailing-stop / IL
+    # Use smoothed portfolio value to avoid API glitch triggers
+    value_history = state.get("_value_history", [])
     stats = state.get("stats", {})
     initial = stats.get("initial_portfolio_usd")
-    if initial and initial > 0:
-        deposits = stats.get("total_deposits_usd", 0)
-        cost_basis = initial + deposits
+    if initial and initial > 0 and len(value_history) >= 3:
+        # Median of recent values for stop decisions
+        smooth_usd = sorted(value_history[-5:])[len(value_history[-5:]) // 2]
+        cost_basis = initial + stats.get("total_deposits_usd", 0)
         peak = stats.get("portfolio_peak_usd", cost_basis)
 
-        if total_usd > peak:
-            peak = total_usd
+        # Peak only updates if confirmed by 2 consecutive readings above old peak
+        prev_val = value_history[-2] if len(value_history) >= 2 else 0
+        if smooth_usd > peak and prev_val > peak:
+            peak = smooth_usd
             stats["portfolio_peak_usd"] = round(peak, 2)
 
-        pnl_pct = (total_usd - cost_basis) / cost_basis
+        pnl_pct = (smooth_usd - cost_basis) / cost_basis if cost_basis > 0 else 0
         if STOP_LOSS_PCT > 0 and pnl_pct <= -STOP_LOSS_PCT:
             state["stop_triggered"] = (
                 f"stop_loss ({pnl_pct * 100:+.1f}% <= -{STOP_LOSS_PCT * 100:.0f}%)"
@@ -679,7 +755,7 @@ def run_risk_checks(
             return state["stop_triggered"]
 
         if TRAILING_STOP_PCT > 0 and peak > 0:
-            drawdown = (peak - total_usd) / peak
+            drawdown = (peak - smooth_usd) / peak
             if drawdown >= TRAILING_STOP_PCT:
                 state["stop_triggered"] = (
                     f"trailing_stop (drawdown {drawdown * 100:.1f}% from peak ${peak:.0f})"
@@ -687,7 +763,7 @@ def run_risk_checks(
                 return state["stop_triggered"]
 
     # IL check
-    il_pct = state.get("stats", {}).get("estimated_il_pct", 0)
+    il_pct = stats.get("estimated_il_pct", 0)
     if abs(il_pct) > MAX_IL_TOLERANCE_PCT:
         state["stop_triggered"] = f"il_limit ({il_pct:.1f}% > {MAX_IL_TOLERANCE_PCT}%)"
         return state["stop_triggered"]
@@ -695,18 +771,19 @@ def run_risk_checks(
     # [5] Rebalance frequency
     rebalance_history = state.get("rebalance_history", [])
     now = datetime.now()
-    recent_24h = [
-        r
-        for r in rebalance_history
-        if (now - datetime.fromisoformat(r["time"])).total_seconds() < 86400
-    ]
+    recent_24h = []
+    for r in rebalance_history:
+        r_dt = _safe_isoparse(r.get("time", ""))
+        if r_dt and (now - r_dt).total_seconds() < 86400:
+            recent_24h.append(r)
     if len(recent_24h) >= MAX_REBALANCES_24H:
         return f"max_rebalances ({len(recent_24h)}/{MAX_REBALANCES_24H} in 24h)"
 
     # [6] Position age
     position = state.get("position")
     if position and position.get("created_at"):
-        age = (now - datetime.fromisoformat(position["created_at"])).total_seconds()
+        created_dt = _safe_isoparse(position["created_at"])
+        age = (now - created_dt).total_seconds() if created_dt else MIN_POSITION_AGE + 1
         if age < MIN_POSITION_AGE:
             remaining = int(MIN_POSITION_AGE - age)
             return f"position_too_young ({remaining}s remaining)"
@@ -1158,10 +1235,31 @@ def execute_rebalance(
         if not redeemed:
             log("  Redeem failed — attempting emergency wide deposit")
             return _emergency_deposit(state, price, trigger)
+        # Mark position as redeemed immediately to prevent stale state
+        state["_rebalance_in_progress"] = True
+        state["position"] = {
+            "token_id": "",
+            "tick_lower": None,
+            "tick_upper": None,
+            "lower_price": None,
+            "upper_price": None,
+            "created_at": None,
+            "created_atr_pct": 0,
+            "_redeemed_from": token_id,
+        }
+        save_state(state)
         time.sleep(3)
 
     # Step 3: Get current balances after redeem
-    eth_bal, usdc_bal = get_balances()
+    eth_bal, usdc_bal, bal_failed = get_balances()
+    if bal_failed:
+        log("  Balance query failed after redeem — funds may be idle")
+        # Don't crash, but try to continue with what we have
+        time.sleep(5)
+        eth_bal, usdc_bal, bal_failed = get_balances()
+        if bal_failed:
+            log("  Balance still unavailable — aborting, funds sitting idle in wallet")
+            return False
     available_eth = eth_bal - GAS_RESERVE_ETH
     if available_eth < 0:
         available_eth = 0
@@ -1204,6 +1302,7 @@ def execute_rebalance(
     candles = get_kline_data("1H", 24)
     current_atr = calc_kline_volatility(candles) if candles else 0
 
+    state.pop("_rebalance_in_progress", None)
     state["position"] = {
         "token_id": new_token_id,
         "tick_lower": new_tick_lower,
@@ -1248,7 +1347,10 @@ def _emergency_deposit(state: dict, price: float, trigger: dict) -> bool:
     tick_lower = price_to_tick(lower_price)
     tick_upper = price_to_tick(upper_price)
 
-    eth_bal, usdc_bal = get_balances()
+    eth_bal, usdc_bal, bal_failed = get_balances()
+    if bal_failed:
+        log("  Emergency: balance query failed — cannot proceed")
+        return False
     usdc_deposit = int(usdc_bal * 0.9)
     if usdc_deposit < MIN_TRADE_USD:
         log(f"  Emergency: USDC balance too low ({usdc_bal:.2f})")
@@ -1280,7 +1382,7 @@ def _emergency_deposit(state: dict, price: float, trigger: dict) -> bool:
             "lower_price": round(lower_price, 2),
             "upper_price": round(upper_price, 2),
             "created_at": datetime.now().isoformat(),
-            "created_atr_pct": round(half_width * 100, 1),  # store as percentage
+            "created_atr_pct": round(half_width, 2),  # already in percentage
         }
         log(
             f"  Emergency deposit OK: [{tick_lower},{tick_upper}] "
@@ -1299,8 +1401,17 @@ def load_state() -> dict:
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text())
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            log(f"State file corrupted: {e}")
+            # Try backup
+            bak = STATE_FILE.with_suffix(".json.bak")
+            if bak.exists():
+                try:
+                    state = json.loads(bak.read_text())
+                    log("Recovered state from backup")
+                    return state
+                except (json.JSONDecodeError, OSError):
+                    log("Backup also corrupted — starting fresh")
     return {
         "version": 1,
         "pool": {
@@ -1336,10 +1447,28 @@ def load_state() -> dict:
 
 
 def save_state(state: dict):
+    """Atomic state save: write to temp file, then rename."""
     if STATE_FILE.exists():
-        bak = STATE_FILE.with_suffix(".json.bak")
-        bak.write_text(STATE_FILE.read_text())
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+        try:
+            STATE_FILE.with_suffix(".json.bak").write_text(STATE_FILE.read_text())
+        except OSError:
+            pass
+    content = json.dumps(state, indent=2)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=STATE_FILE.parent, suffix=".json.tmp", prefix=".cl_lp_"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, STATE_FILE)
+    except Exception as e:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        log(f"CRITICAL: Failed to save state: {e}")
 
 
 # ── Discord Notification ────────────────────────────────────────────────────
@@ -1430,18 +1559,44 @@ def estimate_il(entry_price: float, current_price: float) -> float:
 # ── Core Logic: tick ────────────────────────────────────────────────────────
 
 
+STOP_AUTO_RESUME = CFG.get("stop_auto_resume", True)
+STOP_RESUME_COOLDOWN = CFG.get("stop_resume_cooldown_seconds", 3600)  # 1h default
+STOP_RESUME_REBOUND_PCT = CFG.get("stop_resume_rebound_pct", 0.02)  # 2% default
+MAX_BALANCE_FAILURES = CFG.get("max_balance_failures", 5)
+
+
 def tick():
     """Main loop: check position, decide rebalance, execute."""
+    # Process lock — prevent concurrent ticks
+    if not _acquire_lock():
+        log("Another tick is already running — skipping")
+        _emit_json({"status": "locked", "retriable": False})
+        return
+    try:
+        _tick_inner()
+    finally:
+        _release_lock()
+
+
+def _tick_inner():
+    """Actual tick logic (called under process lock)."""
     state = load_state()
+
+    # Check for in-progress rebalance from crashed previous tick
+    if state.get("_rebalance_in_progress"):
+        log(
+            "Previous rebalance was interrupted — clearing position, next tick will re-deposit"
+        )
+        state.pop("_rebalance_in_progress", None)
+        state["position"] = None
+        save_state(state)
 
     # Circuit breaker
     errors = state.get("errors", {})
     if errors.get("consecutive", 0) >= MAX_CONSECUTIVE_ERRORS:
-        cooldown = errors.get("cooldown_until")
-        if cooldown and datetime.fromisoformat(cooldown) > datetime.now():
-            remaining = (
-                datetime.fromisoformat(cooldown) - datetime.now()
-            ).seconds // 60
+        cooldown_dt = _safe_isoparse(errors.get("cooldown_until", ""))
+        if cooldown_dt and cooldown_dt > datetime.now():
+            remaining = int((cooldown_dt - datetime.now()).total_seconds()) // 60
             log(f"CIRCUIT BREAKER: cooldown {remaining}min remaining")
             _emit_json(
                 {
@@ -1483,9 +1638,53 @@ def tick():
     state["price_history"] = history
 
     # Balances (wallet + LP position)
-    bal = get_balances()
-    balance_failed = bal is None
-    eth_bal, usdc_bal = bal if bal else (0.0, 0.0)
+    eth_bal, usdc_bal, balance_failed = get_balances()
+    if balance_failed:
+        consec_bal_fail = state.get("_consecutive_balance_failures", 0) + 1
+        state["_consecutive_balance_failures"] = consec_bal_fail
+        if consec_bal_fail >= MAX_BALANCE_FAILURES:
+            log(
+                f"Balance query failed {consec_bal_fail} consecutive times — "
+                f"pausing trading until balance recovers"
+            )
+            if consec_bal_fail == MAX_BALANCE_FAILURES:
+                _send_discord_embed(
+                    [
+                        {
+                            "title": "LP 余额查询连续失败",
+                            "color": 0xFF9800,
+                            "description": (
+                                f"连续 {consec_bal_fail} 次失败\n"
+                                f"交易已暂停，等待恢复\n"
+                                f"价格: ${price:.2f}"
+                            ),
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        }
+                    ]
+                )
+            save_state(state)
+            _emit_json(
+                {
+                    "status": "balance_unavailable",
+                    "consecutive_failures": consec_bal_fail,
+                }
+            )
+            return
+        # Use last known balances for non-critical operations
+        last_bal = state.get("last_balances", {})
+        if last_bal.get("eth", 0) > 0 or last_bal.get("usdc", 0) > 0:
+            eth_bal = last_bal.get("eth", 0)
+            usdc_bal = last_bal.get("usdc", 0)
+            log(
+                f"Balance query failed ({consec_bal_fail}x) — using last known: ETH={eth_bal}, USDC={usdc_bal}"
+            )
+    else:
+        if state.get("_consecutive_balance_failures", 0) > 0:
+            log(
+                f"Balance query recovered after {state['_consecutive_balance_failures']} failures"
+            )
+        state["_consecutive_balance_failures"] = 0
+
     wallet_usd = eth_bal * price + usdc_bal
     position = state.get("position")
     lp_value = 0.0
@@ -1507,8 +1706,20 @@ def tick():
     total_usd = wallet_usd + lp_value
     state["stats"]["unclaimed_fee_usd"] = round(unclaimed_fee, 4)
 
-    # Initial snapshot
-    if state["stats"].get("initial_portfolio_usd") is None and total_usd > 0:
+    # Track portfolio value history for smoothing (only when data is reliable)
+    if not balance_failed:
+        value_history = state.get("_value_history", [])
+        value_history.append(round(total_usd, 2))
+        if len(value_history) > 12:  # keep ~1h @ 5min ticks
+            value_history = value_history[-12:]
+        state["_value_history"] = value_history
+
+    # Initial snapshot — only when both wallet and LP data are reliable
+    if (
+        state["stats"].get("initial_portfolio_usd") is None
+        and total_usd > 0
+        and not balance_failed
+    ):
         state["stats"]["initial_portfolio_usd"] = round(total_usd, 2)
         state["stats"]["initial_eth_price"] = round(price, 2)
         log(f"Initial portfolio: ${total_usd:.2f} @ ETH ${price:.2f}")
@@ -1521,10 +1732,10 @@ def tick():
     kline_cache = state.get("kline_cache")
     kline_stale = True
     if kline_cache and kline_cache.get("fetched_at"):
-        elapsed = (
-            datetime.now() - datetime.fromisoformat(kline_cache["fetched_at"])
-        ).total_seconds()
-        kline_stale = elapsed > 3600
+        fetched_dt = _safe_isoparse(kline_cache["fetched_at"])
+        if fetched_dt:
+            elapsed = (datetime.now() - fetched_dt).total_seconds()
+            kline_stale = elapsed > 3600
     if kline_stale:
         candles = get_kline_data("1H", 24)
         if candles:
@@ -1550,34 +1761,100 @@ def tick():
         vol_history = vol_history[-288:]
     state["vol_history"] = vol_history
 
-    # Stop check
+    # Stop check — with auto-resume and log dedup
     if state.get("stop_triggered"):
         trigger_msg = state["stop_triggered"]
-        log(f"STOP ACTIVE: {trigger_msg}")
-        if not state.get("stop_notified"):
-            state["stop_notified"] = True
-            save_state(state)
-            _send_discord_embed(
-                [
-                    {
-                        "title": "LP 已停止",
-                        "color": 0xFF0000,
-                        "description": f"触发: **{trigger_msg}**\n价格: ${price:.2f}\n组合: ${total_usd:.0f}\n\n使用 `resume-trading` 恢复",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    }
-                ]
+
+        # Auto-resume logic
+        resumed = False
+        if STOP_AUTO_RESUME and "trailing_stop" in trigger_msg:
+            stop_time = _safe_isoparse(state.get("stop_triggered_at", ""))
+            cooldown_met = (
+                not stop_time
+                or (datetime.now() - stop_time).total_seconds() > STOP_RESUME_COOLDOWN
             )
-        else:
-            save_state(state)
-        _emit_json(
-            {
-                "status": "stopped",
-                "stop_triggered": trigger_msg,
-                "portfolio_usd": round(total_usd, 2),
-                "price": round(price, 2),
-            }
-        )
-        return
+            # Check drawdown recovery (use smoothed value)
+            stats = state.get("stats", {})
+            peak = stats.get("portfolio_peak_usd", 0)
+            value_history = state.get("_value_history", [])
+            smooth_usd = (
+                sorted(value_history[-5:])[len(value_history[-5:]) // 2]
+                if len(value_history) >= 3
+                else total_usd
+            )
+            current_drawdown = (peak - smooth_usd) / peak if peak > 0 else 1.0
+            # Resume if drawdown recovered below threshold with margin
+            resume_threshold = (
+                TRAILING_STOP_PCT * 0.7
+            )  # must recover to 70% of stop level
+            if cooldown_met and current_drawdown < resume_threshold:
+                log(
+                    f"AUTO-RESUME: drawdown {current_drawdown:.1%} < {resume_threshold:.1%} "
+                    f"threshold, cooldown met"
+                )
+                state.pop("stop_triggered", None)
+                state.pop("stop_notified", None)
+                state.pop("stop_triggered_at", None)
+                save_state(state)
+                _send_discord_embed(
+                    [
+                        {
+                            "title": "LP 自动恢复",
+                            "color": 0x00C853,
+                            "description": (
+                                f"之前: {trigger_msg}\n"
+                                f"当前回撤: {current_drawdown:.1%}\n"
+                                f"价格: ${price:.2f}"
+                            ),
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        }
+                    ]
+                )
+                resumed = True
+
+        if not resumed:
+            # Log dedup: only log stop message once per hour
+            last_stop_log = _safe_isoparse(state.get("_last_stop_log", ""))
+            if (
+                not last_stop_log
+                or (datetime.now() - last_stop_log).total_seconds() > 3600
+            ):
+                log(f"STOP ACTIVE: {trigger_msg}")
+                state["_last_stop_log"] = datetime.now().isoformat()
+
+            if not state.get("stop_notified"):
+                state["stop_notified"] = True
+                state["stop_triggered_at"] = datetime.now().isoformat()
+                save_state(state)
+                _send_discord_embed(
+                    [
+                        {
+                            "title": "LP 已停止",
+                            "color": 0xFF0000,
+                            "description": (
+                                f"触发: **{trigger_msg}**\n价格: ${price:.2f}\n"
+                                f"组合: ${total_usd:.0f}\n\n"
+                                + (
+                                    "自动恢复已启用，满足条件后将自动恢复"
+                                    if STOP_AUTO_RESUME
+                                    else "使用 `resume-trading` 恢复"
+                                )
+                            ),
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        }
+                    ]
+                )
+            else:
+                save_state(state)
+            _emit_json(
+                {
+                    "status": "stopped",
+                    "stop_triggered": trigger_msg,
+                    "portfolio_usd": round(total_usd, 2),
+                    "price": round(price, 2),
+                }
+            )
+            return
 
     # IL estimation
     position = state.get("position")
@@ -1681,6 +1958,13 @@ def tick():
             )
 
     state["stats"]["last_check"] = datetime.now().isoformat()
+    # Save balance snapshot for fallback
+    if not balance_failed:
+        state["last_balances"] = {
+            "eth": round(eth_bal, 6),
+            "usdc": round(usdc_bal, 2),
+            "time": datetime.now().isoformat(),
+        }
     save_state(state)
 
     # Output
@@ -1688,10 +1972,9 @@ def tick():
     should_print = True
     if not has_event:
         last_quiet = state.get("last_quiet_report")
-        if last_quiet:
-            elapsed = (
-                datetime.now() - datetime.fromisoformat(last_quiet)
-            ).total_seconds()
+        last_quiet_dt = _safe_isoparse(last_quiet) if last_quiet else None
+        if last_quiet_dt:
+            elapsed = (datetime.now() - last_quiet_dt).total_seconds()
             if elapsed < QUIET_INTERVAL:
                 should_print = False
         if should_print:
@@ -1864,7 +2147,9 @@ def status():
     """Print current status."""
     state = load_state()
     price = get_eth_price()
-    eth_bal, usdc_bal = get_balances()
+    eth_bal, usdc_bal, bal_failed = get_balances()
+    if bal_failed:
+        print("> 余额查询失败，显示的余额可能不准确")
     wallet_usd = eth_bal * (price or 0) + usdc_bal
     position = state.get("position")
     lp_value = 0.0
@@ -1892,10 +2177,10 @@ def status():
             f"| token_id: `{position.get('token_id', 'N/A')}`"
         )
         if position.get("created_at"):
-            age_h = (
-                datetime.now() - datetime.fromisoformat(position["created_at"])
-            ).total_seconds() / 3600
-            print(f"> 头寸年龄: `{age_h:.1f}h`")
+            created_dt = _safe_isoparse(position["created_at"])
+            if created_dt:
+                age_h = (datetime.now() - created_dt).total_seconds() / 3600
+                print(f"> 头寸年龄: `{age_h:.1f}h`")
     else:
         print("> 头寸: 未建立")
 
@@ -1942,7 +2227,7 @@ def report():
     """Daily report."""
     state = load_state()
     price = get_eth_price()
-    eth_bal, usdc_bal = get_balances()
+    eth_bal, usdc_bal, _ = get_balances()
     total_usd = eth_bal * (price or 0) + usdc_bal
     stats = state.get("stats", {})
     position = state.get("position")
@@ -2117,7 +2402,7 @@ def reset():
     save_state(new_state)
 
     price = get_eth_price()
-    eth_bal, usdc_bal = get_balances()
+    eth_bal, usdc_bal, _ = get_balances()
     total = eth_bal * (price or 0) + usdc_bal
     print(f"LP 已重置。价格: `${price:.2f}`, 余额: `${total:.0f}`")
     print("下次 tick 将重新建仓。")
@@ -2143,7 +2428,7 @@ def close():
         state["stop_triggered"] = "manual_close"
         save_state(state)
 
-        eth_bal, usdc_bal = get_balances()
+        eth_bal, usdc_bal, _ = get_balances()
         price = get_eth_price()
         total = eth_bal * (price or 0) + usdc_bal
         print(
@@ -2168,7 +2453,7 @@ def analyze():
     """Detailed JSON analysis for AI agent."""
     state = load_state()
     price = get_eth_price()
-    eth_bal, usdc_bal = get_balances()
+    eth_bal, usdc_bal, _ = get_balances()
     history = state.get("price_history", [])
     position = state.get("position")
     stats = state.get("stats", {})
@@ -2220,12 +2505,14 @@ def analyze():
             "token_id": position.get("token_id") if position else None,
             "age_hours": round(
                 (
-                    datetime.now() - datetime.fromisoformat(position["created_at"])
+                    datetime.now() - _safe_isoparse(position["created_at"])
                 ).total_seconds()
                 / 3600,
                 1,
             )
-            if position and position.get("created_at")
+            if position
+            and position.get("created_at")
+            and _safe_isoparse(position["created_at"])
             else None,
         },
         "optimal_range": optimal,
@@ -2318,6 +2605,7 @@ COMMANDS = {
     "deposit": deposit,
     "resume-trading": resume_trading,
 }
+
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "tick"
