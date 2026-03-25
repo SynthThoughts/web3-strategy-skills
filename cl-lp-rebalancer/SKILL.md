@@ -4,7 +4,7 @@ description: "Uniswap V3 集中流动性 LP 自动调仓策略。基于波动率
 license: Apache-2.0
 metadata:
   author: SynthThoughts
-  version: "2.2.0"
+  version: "2.3.0"
   pattern: "pipeline, tool-wrapper"
   steps: "5"
 ---
@@ -73,78 +73,94 @@ Cron (5min) → Python script → onchainos CLI → OKX Web3 API → Chain
 
 ## Step 0: Pool Selection (First-Time Setup)
 
-When user has no `config.json` or asks to set up a new pool, guide them through selection:
+When user has no `config.json` or asks to set up a new pool, trigger this step.
 
-### 0.1 Choose Chain
+**核心原则**：AI 应从用户的自然语言中提取意图，自动推断尽可能多的参数，只在信息不足时才追问。
 
-Ask: "在哪条链上做 LP？"
+### 0.1 Intent Recognition
 
-Supported chains (by `onchainos defi search`): Base, Ethereum, Arbitrum, Polygon, BSC, etc.
-- **推荐 Base / Arbitrum** — L2 gas 低，适合频繁调仓
-- Ethereum mainnet gas 高，调仓 4 步操作可能吃掉利润
+从用户输入中提取：
 
-### 0.2 Choose Pool Type
+| 信息 | 示例用户输入 | 提取结果 |
+|------|------------|---------|
+| 链 | "在 Base 上做 LP" | chain = base |
+| 代币对 | "ETH/USDC 的流动性" | token0 = ETH, token1 = USDC |
+| 风险偏好 | "稳定一点的" | pool_type = stablecoin |
+| Fee tier | "0.3% 的池子" | fee_tier = 0.3% |
 
-Ask: "想做哪类 LP 池？"
+**缺失信息的默认推断**：
+- 未指定链 → 推荐 Base（L2 gas 低，适合频繁调仓）
+- 未指定代币对 → 必须追问（核心参数，无法推断）
+- 未指定 fee tier → 根据代币对自动选 TVL 最大的池子
+- 未指定风险偏好 → 从代币对自动分类
 
-| 类型 | 示例 | 风险 | 适用 |
-|------|------|------|------|
-| **稳定币对** | USDC/USDT, USDC/DAI | 极低 IL，低收益 | 保守，追求稳定 |
-| **Native/稳定币** | ETH/USDC, ETH/USDT | 中等 IL，中等收益 | 推荐，流动性好 |
-| **非稳定币对** | ETH/WBTC, ARB/ETH | 双边 IL，高波动 | 有经验的用户 |
-| **含 Meme 币** | PEPE/ETH, DEGEN/ETH | 极高风险 | 见下方警告 |
+### 0.2 Pool Type Classification
 
-### 0.3 Meme Coin Warning
+根据代币对自动分类，**不需要问用户**：
 
-If user selects a pool containing meme/low-cap tokens, **MUST display warning**:
+| 类型 | 判断规则 | 默认参数集 |
+|------|---------|-----------|
+| **稳定币对** | 两个都是稳定币（USDC/USDT/DAI/FRAX） | 窄范围、低止损 |
+| **Native/稳定币** | 一个是 ETH/WETH/WBTC，另一个是稳定币 | 标准参数 |
+| **非稳定币对** | 两个都不是稳定币，但都是主流币 | 宽范围、高止损 |
+| **含 Meme 币** | 代币不在主流币列表中（市值低、无 Coingecko 排名） | 极宽范围 + 强制风险确认 |
+
+主流币白名单：ETH, WETH, WBTC, USDC, USDT, DAI, FRAX, ARB, OP, MATIC, BNB, AVAX, SOL
+
+### 0.3 Meme Coin Risk Gate
+
+**仅当检测到 meme/低市值代币时触发**。MUST display warning before proceeding:
 
 ```
-⚠️ 风险提示：Meme 币 LP 存在以下额外风险：
-1. 极端无常损失 — 价格可能单方向暴涨/暴跌 90%+，IL 远超手续费收入
-2. 流动性枯竭 — 池子 TVL 可能骤降，你的头寸可能无法正常退出
+⚠️ Meme 币 LP 额外风险：
+1. 极端无常损失 — 价格可能单方向暴涨/暴跌 90%+
+2. 流动性枯竭 — 池子 TVL 可能骤降，头寸无法退出
 3. 合约风险 — 代币可能有 honeypot/税收/暂停转账等恶意机制
-4. 调仓失败 — 低流动性导致 swap 滑点过大，调仓流水线中途失败
-
+4. 调仓失败 — 低流动性导致 swap 滑点过大
 ```
 
-Ask user to explicitly confirm: "了解风险，继续设置" before proceeding.
+Must get explicit user confirmation before proceeding.
 
-### 0.4 Search & Select Pool
+### 0.4 Search, Rank & Auto-Select
 
-Use `onchainos defi search --chain <chain> --token "<token0>,<token1>" --product-group DEX_POOL` to find pools.
+```bash
+onchainos defi search --chain <chain> --token "<token0>,<token1>" --product-group DEX_POOL
+```
 
-Present results to user:
-- Pool name, fee tier (0.01% / 0.05% / 0.3% / 1%), TVL, 预估池 APY（`rate` 字段）
-- **Fee tier guidance**:
-  - 0.01%: 稳定币对
-  - 0.05%: 相关性高的对（ETH/stETH）
-  - 0.3%: 主流对（ETH/USDC）— 推荐
-  - 1%: 高波动/低流动性对
+**自动选择逻辑**（用户无需手动选）：
+1. 按 TVL 降序排列
+2. 如果用户指定了 fee tier → 直接匹配
+3. 如果未指定 → 选 TVL 最大的池子（通常是最佳流动性）
+4. 展示选择结果供用户确认：池名、fee tier、TVL、预估池 APY（`rate` 字段）
+
+**Fee tier 参考**（仅在用户问及或多池需选择时展示）：
+- 0.01%: 稳定币对 · 0.05%: 高相关性对 · 0.3%: 主流对（推荐）· 1%: 高波动对
 
 ### 0.5 Generate config.json
 
-After user confirms pool, fetch detail via `onchainos defi detail` and generate config:
+自动 fetch detail (`onchainos defi detail`) 并生成 config，**无需用户手动填写**。
 
-**字段映射**:
-- `investment_id` ← search result `investmentId`
-- `chain_id` ← search result `chainIndex`
+**字段映射**：
+- `investment_id` ← search `investmentId`
+- `chain_id` ← search `chainIndex`
 - `platform_id` ← detail `analysisPlatformId`（注意不是 `platformId`）
-- `fee_tier` ← search result `feeRate`
+- `fee_tier` ← search `feeRate`
 - `tick_spacing` ← 根据 fee tier 推导：0.01%→1, 0.05%→10, 0.3%→60, 1%→200
-- `token0/token1` ← detail `underlyingToken`。**注意**：如果 token 是 native ETH（`0xeee...`），LP 合约实际用 WETH，需映射为链对应的 WETH 地址（Base: `0x4200000000000000000000000000000000000006`）
-- `native_token` ← 始终为 `0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee`（用于 swap 和余额查询）
+- `token0/token1` ← detail `underlyingToken`。如果 token 是 native ETH（`0xeee...`），LP 合约用 WETH，需映射（Base: `0x4200000000000000000000000000000000000006`）
+- `native_token` ← 始终 `0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee`（用于 swap 和余额查询）
+- 其余参数 ← 根据 pool type 自动填入下表默认值
 
 ```json
 {
-  "investment_id": "<from search investmentId>",
-  "pool_chain": "<chain>",
-  "chain_id": "<from search chainIndex>",
-  "platform_id": "<from detail analysisPlatformId>",
+  "investment_id": "<auto>",
+  "pool_chain": "<auto>",
+  "chain_id": "<auto>",
+  "platform_id": "<auto>",
   "native_token": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-  "fee_tier": "<from search feeRate>",
-  "tick_spacing": "<derived from fee_tier>",
-  "token0": { "symbol": "<sym>", "address": "<WETH if native>", "decimals": <dec> },
-  "token1": { "symbol": "<sym>", "address": "<addr>", "decimals": <dec> },
+  "fee_tier": "<auto>",
+  "tick_spacing": "<auto>",
+  "token0": { "symbol": "<auto>", "address": "<auto>", "decimals": "<auto>" },
+  "token1": { "symbol": "<auto>", "address": "<auto>", "decimals": "<auto>" },
   "range_mult": { "low": 1.0, "medium": 1.2, "high": 1.5, "extreme": 2.0 },
   "min_range_pct": 2,
   "max_range_pct": 5,
@@ -166,7 +182,7 @@ After user confirms pool, fetch detail via `onchainos defi detail` and generate 
 }
 ```
 
-**Pool-type-specific defaults**:
+**Pool-type-specific defaults**（自动应用，无需用户选择）：
 
 | Parameter | 稳定币对 | Native/稳定币 | 非稳定币 | Meme 池 |
 |-----------|---------|-------------|---------|---------|
@@ -181,7 +197,7 @@ After user confirms pool, fetch detail via `onchainos defi detail` and generate 
 
 ### 0.6 Gate
 
-- [ ] `config.json` exists with valid `investment_id`, `token0`, `token1`
+- [ ] `config.json` written with valid `investment_id`, `token0`, `token1`
 - [ ] `.env` configured (copy from `.env.example`, fill in API credentials + `WALLET_ADDR`)
 - [ ] `onchainos wallet balance` returns valid balances for the target chain
 - [ ] If meme pool: user has explicitly confirmed risk warning
