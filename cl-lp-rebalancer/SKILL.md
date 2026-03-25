@@ -4,7 +4,7 @@ description: "Uniswap V3 集中流动性 LP 自动调仓策略。基于波动率
 license: Apache-2.0
 metadata:
   author: SynthThoughts
-  version: "2.4.0"
+  version: "2.5.0"
   pattern: "pipeline, tool-wrapper"
   steps: "5"
 ---
@@ -450,193 +450,18 @@ if __name__ == "__main__":
 
 ### Notification Tiers
 
-脚本通过 `---JSON---` 块输出结构化数据，由上层调度器（zeroclaw/openclaw）路由到部署平台的通信渠道（Discord/Telegram/Webhook 等）。
+脚本内部封装完整的消息格式化和可视化逻辑，通过 `---JSON---` 块输出结构化数据（含 `notification` 渲染块），由调度器路由到通信渠道。
 
-通知分 4 个层级，每层有独立的触发条件、内容密度和视觉格式：
+| Tier | 触发条件 | 推送 |
+|------|---------|------|
+| **Trade Alert** | 调仓成功或失败 | 每次交易立即推送 |
+| **Risk Alert** | 止损/熔断/连续错误 | 立即推送 |
+| **Hourly Pulse** | 距上次推送 ≥ `QUIET_INTERVAL` 且无交易 | 每小时推送 |
+| **Daily Report** | `report` 命令 (cron daily) | 每日推送 |
 
-| Tier | 触发 | 频率 | 优先级 | 内容 |
-|------|------|------|--------|------|
-| **🔔 Trade Alert** | 调仓成功或失败 | 每次交易 | HIGH | 价格、旧→新范围、费用、PnL、tx 链接 |
-| **⚠️ Risk Alert** | 止损/熔断/连续错误 | 即时 | CRITICAL | 触发原因、当前状态、建议操作 |
-| **📊 Hourly Pulse** | 每小时感知 | 1h | LOW | 价格、范围位置图、边缘距离、趋势、未领取费用 |
-| **📈 Daily Report** | 每日汇总 | 24h | MEDIUM | 完整统计、PnL、IL、费用、调仓次数、范围内时间 |
+`status`/`analyze` 命令为用户主动查询，直接输出到终端，不推送。
 
-On-demand（`status`/`analyze` 命令）不走推送，直接输出完整数据。
-
-### Output Protocol
-
-所有输出共享同一 JSON 结构，通过 `notification.tier` 区分：
-
-```
----JSON---
-{
-  "version": "1.0",
-  "status": "rebalanced" | "no_action" | "out_of_range" | "error" | "stopped",
-  "notification": {
-    "tier": "trade_alert" | "risk_alert" | "hourly_pulse" | "daily_report",
-    "title": "🔄 调仓成功 · ETH/USDC · Base",
-    "color": "green",
-    "fields": [
-      {"name": "价格", "value": "$2,090.45", "inline": true},
-      {"name": "新范围", "value": "$1,950 — $2,150", "inline": true},
-      {"name": "范围宽度", "value": "9.8% (10.2×)", "inline": true},
-      {"name": "费用已领", "value": "$1.25", "inline": true},
-      {"name": "PnL", "value": "+$12.50 (+1.85%)", "inline": true},
-      {"name": "IL", "value": "-$2.80", "inline": true}
-    ],
-    "visual": "[$1,950 ·····●····· $2,150] ← $2,090",
-    "footer": "调仓 #5 · 范围内 92.5% · 运行 3.2d"
-  },
-  "market": {
-    "price": 2090.45,
-    "atr_pct": 1.8,
-    "vol_class": "medium",
-    "trend": "bullish",
-    "trend_strength": 0.65,
-    "momentum_1h": 0.35,
-    "structure": "uptrend"
-  },
-  "position": {
-    "token_id": "123456",
-    "tick_lower": -198120,
-    "tick_upper": -197400,
-    "price_lower": 1950.0,
-    "price_upper": 2150.0,
-    "age_hours": 4.5,
-    "in_range": true,
-    "distance_to_edge": 0.35
-  },
-  "range": {
-    "current_width_pct": 9.8,
-    "optimal_width_pct": 10.2,
-    "capital_efficiency": 10.2
-  },
-  "trigger": "none" | "out_of_range" | "vol_shift" | "time_decay",
-  "rebalance": {
-    "executed": false,
-    "fees_claimed_usd": 1.25
-  },
-  "stats": {
-    "total_rebalances": 5,
-    "total_fees_claimed_usd": 15.30,
-    "time_in_range_pct": 92.5,
-    "pnl_usd": 12.50,
-    "pnl_pct": 1.85,
-    "il_usd": 2.80
-  }
-}
-```
-
-### Notification Rendering
-
-`notification` 块设计为可直接映射到各平台的可视化组件：
-
-| JSON 字段 | Discord Embed | Telegram | 终端 |
-|-----------|--------------|----------|------|
-| `title` | embed title | **bold** header | 首行 |
-| `color` | embed color bar | — | ANSI color |
-| `fields` | embed fields (inline) | key: value 列表 | 对齐表格 |
-| `visual` | code block | monospace | 原样输出 |
-| `footer` | embed footer | 尾行灰字 | 尾行 |
-
-**Color 映射**：
-- `green` — 调仓成功
-- `blue` — 首次部署
-- `grey` — 无操作（hourly pulse）
-- `red` — 错误/止损
-- `orange` — 调仓失败但有 fallback
-
-### Tier Detail: Trade Alert 🔔
-
-触发：`rebalance.executed == true` 或调仓失败
-
-```
-notification.tier = "trade_alert"
-notification.title = "🔄 调仓成功 · ETH/USDC · Base"  (or "❌ 调仓失败")
-notification.color = "green" (or "orange"/"red")
-notification.fields = [
-  价格, 旧范围→新范围, 触发原因, 费用已领, PnL, IL
-]
-notification.visual = "[$1,950 ·····●····· $2,150] ← $2,090"
-notification.footer = "调仓 #N · tx: 0xabc...def"
-```
-
-### Tier Detail: Risk Alert ⚠️
-
-触发：`stop_triggered != null` 或 `errors.consecutive >= MAX`
-
-```
-notification.tier = "risk_alert"
-notification.title = "🛑 止损触发 · ETH/USDC"  (or "⚡ 熔断")
-notification.color = "red"
-notification.fields = [
-  触发原因, 当前价格, 成本基准, 亏损幅度, 建议操作
-]
-notification.footer = "需要 resume-trading 恢复"
-```
-
-### Tier Detail: Hourly Pulse 📊
-
-触发：距上次推送 ≥ `QUIET_INTERVAL`（默认 1h），且无交易发生
-
-```
-notification.tier = "hourly_pulse"
-notification.title = "📊 ETH/USDC · Base · 运行中"
-notification.color = "grey"
-notification.fields = [
-  价格, 范围位置, 边缘距离, 波动率, 趋势, 未领取费用
-]
-notification.visual = "[$1,950 ·····●····· $2,150] ← $2,090  edge: 35%"
-notification.footer = "下次检查 5min · 今日调仓 0次"
-```
-
-### Tier Detail: Daily Report 📈
-
-触发：`report` 命令（cron 每日 00:00 UTC）
-
-```
-notification.tier = "daily_report"
-notification.title = "📈 日报 · ETH/USDC · 2026-03-26"
-notification.color = "blue"
-notification.fields = [
-  // 收益
-  { "name": "PnL", "value": "+$12.50 (+1.85%)" },
-  { "name": "LP 费用", "value": "$15.30 (已领) + $1.25 (未领)" },
-  { "name": "无常损失", "value": "-$2.80 (-0.42%)" },
-  // 运营
-  { "name": "调仓次数", "value": "2 次 (out_of_range ×1, vol_shift ×1)" },
-  { "name": "范围内时间", "value": "92.5%" },
-  { "name": "资本效率", "value": "10.2×" },
-  // 市场
-  { "name": "ETH 价格", "value": "$2,090 (24h: +1.2%)" },
-  { "name": "波动率", "value": "中 (ATR 1.8%)" },
-  { "name": "趋势", "value": "看涨 (强度 0.65)" }
-]
-notification.visual = """
-收益走势 (7d):
-  +2% |        ·*
-  +1% |    ·*··
-   0% |·*·
-  -1% |
-      └──────────
-       Mon  Wed  Fri
-"""
-notification.footer = "运行 3.2 天 · 累计调仓 5 次 · 成本基准 $675"
-```
-
-### On-Demand: status / analyze
-
-不走推送通知，直接输出到终端/AI agent。内容最全：
-
-```
-notification.tier = "on_demand"
-包含所有 market + position + range + stats 字段
-额外包含：
-  - 完整范围可视化（ASCII 图 + tick 标注）
-  - 趋势分析详情（MTF 各时间框架）
-  - 调仓历史摘要
-  - 参数健康检查（范围是否适配当前波动率）
-```
+脚本负责：消息标题、字段组织、范围位置可视化、颜色级别、footer 上下文。调度器只需透传 `notification` 块到通信平台。
 
 ## State Schema
 
