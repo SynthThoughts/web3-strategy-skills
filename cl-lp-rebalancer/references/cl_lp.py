@@ -1957,13 +1957,32 @@ def calc_pnl(stats: dict, current_usd: float) -> dict:
     }
 
 
-def estimate_il(entry_price: float, current_price: float) -> float:
-    """Estimate impermanent loss percentage for a CL position.
-    Simplified: IL = 2*sqrt(r)/(1+r) - 1, where r = current/entry."""
+def estimate_il(
+    entry_price: float,
+    current_price: float,
+    range_lower: float = 0,
+    range_upper: float = 0,
+) -> float:
+    """Estimate impermanent loss for a V3 concentrated liquidity position.
+
+    V2 IL = 2*sqrt(r)/(1+r) - 1, where r = current/entry.
+    V3 amplification = sqrt(p_b/p_a) / (sqrt(p_b/p_a) - 1) for range [p_a, p_b].
+    IL_v3 ≈ IL_v2 * amplification.
+    """
     if entry_price <= 0 or current_price <= 0:
         return 0.0
     r = current_price / entry_price
-    il = 2 * math.sqrt(r) / (1 + r) - 1
+    il_v2 = 2 * math.sqrt(r) / (1 + r) - 1
+
+    # Apply CL concentration amplification if range is provided
+    if range_lower > 0 and range_upper > range_lower:
+        ratio = range_upper / range_lower
+        sqrt_ratio = math.sqrt(ratio)
+        amplification = sqrt_ratio / (sqrt_ratio - 1) if sqrt_ratio > 1 else 1
+        il = il_v2 * amplification
+    else:
+        il = il_v2
+
     return round(il * 100, 2)
 
 
@@ -2241,7 +2260,12 @@ def _tick_inner():
     position = state.get("position")
     if position and position.get("created_at"):
         entry_price = state["stats"].get("initial_eth_price", price)
-        il_pct = estimate_il(entry_price, price)
+        il_pct = estimate_il(
+            entry_price,
+            price,
+            position.get("lower_price", 0),
+            position.get("upper_price", 0),
+        )
         state["stats"]["estimated_il_pct"] = il_pct
 
     # Risk checks (pre-trigger) — skip if balance query failed
@@ -2372,9 +2396,13 @@ def _tick_inner():
     unclaimed_fee_usd = stats.get("unclaimed_fee_usd", 0)
     claimed_fee_usd = stats.get("total_fees_claimed_usd", 0)
 
-    # IL estimation: geometric formula (price divergence from entry)
+    # IL estimation: V3 concentrated formula with range amplification
     entry_price = stats.get("initial_eth_price")
-    il_pct = estimate_il(entry_price, price) if entry_price else 0.0
+    pos_lower = position.get("lower_price", 0) if position else 0
+    pos_upper = position.get("upper_price", 0) if position else 0
+    il_pct = (
+        estimate_il(entry_price, price, pos_lower, pos_upper) if entry_price else 0.0
+    )
     il_usd = round(il_pct / 100 * total_usd, 2) if il_pct else 0.0
 
     tick_data = {
@@ -2611,9 +2639,15 @@ def report():
     # Recalculate PnL with fresh total_usd (includes LP value)
     pnl = calc_pnl(stats, total_usd)
 
-    # IL: geometric formula from entry price divergence
+    # IL: V3 concentrated formula with range amplification
     entry_price = stats.get("initial_eth_price")
-    il_pct = estimate_il(entry_price, price) if entry_price and price else 0.0
+    pos_lower = position.get("lower_price", 0) if position else 0
+    pos_upper = position.get("upper_price", 0) if position else 0
+    il_pct = (
+        estimate_il(entry_price, price, pos_lower, pos_upper)
+        if entry_price and price
+        else 0.0
+    )
     il_usd = round(il_pct / 100 * total_usd, 2) if il_pct else 0.0
 
     report_data = {
@@ -2792,9 +2826,12 @@ def analyze():
     # Current trigger status
     trigger = check_rebalance_triggers(price, state, atr_pct, mtf)
 
-    # IL
+    # IL (V3 concentrated)
     initial_price = stats.get("initial_eth_price", price)
-    il_pct = estimate_il(initial_price, price)
+    position = state.get("position")
+    pos_lower = position.get("lower_price", 0) if position else 0
+    pos_upper = position.get("upper_price", 0) if position else 0
+    il_pct = estimate_il(initial_price, price, pos_lower, pos_upper)
 
     analysis = {
         "version": "1.0",
