@@ -95,6 +95,80 @@ QUIET_INTERVAL = CFG["quiet_interval_seconds"]
 MAX_CONSECUTIVE_ERRORS = CFG["max_consecutive_errors"]
 COOLDOWN_AFTER_ERRORS = CFG["cooldown_after_errors_seconds"]
 
+
+# ── Notification credentials ───────────────────────────────────────────────
+
+
+def _resolve_discord_channel_id() -> str:
+    """Resolve Discord channel ID: env override > openclaw.json guilds config."""
+    env_id = os.environ.get("DISCORD_CHANNEL_ID", "")
+    if env_id:
+        return env_id
+    try:
+        cfg_path = Path.home() / ".openclaw" / "openclaw.json"
+        if cfg_path.exists():
+            cfg = json.loads(cfg_path.read_text())
+            guilds = cfg.get("channels", {}).get("discord", {}).get("guilds", {})
+            for _gid, guild_cfg in guilds.items():
+                channels = guild_cfg.get("channels", {})
+                for ch_id, ch_cfg in channels.items():
+                    if ch_cfg.get("allow"):
+                        return ch_id
+    except Exception:
+        pass
+    return ""
+
+
+DISCORD_CHANNEL_ID = _resolve_discord_channel_id()
+
+
+def _get_discord_token() -> str:
+    env_token = os.environ.get("DISCORD_BOT_TOKEN", "")
+    if env_token:
+        return env_token
+    cfg_path = Path.home() / ".openclaw" / "openclaw.json"
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text())
+            return cfg.get("channels", {}).get("discord", {}).get("token", "")
+        except Exception:
+            pass
+    return ""
+
+
+def _get_telegram_config() -> tuple:
+    """Return (bot_token, chat_id). Checks env first, then zeroclaw config."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if token and chat_id:
+        return token, chat_id
+    for cfg_dir in ["zeroclaw-strategy", "zeroclaw", "openclaw"]:
+        cfg_path = Path.home() / f".{cfg_dir}" / "config.toml"
+        if cfg_path.exists():
+            try:
+                text = cfg_path.read_text()
+                in_tg = False
+                for line in text.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("[") and "telegram" in stripped.lower():
+                        in_tg = True
+                        continue
+                    if stripped.startswith("[") and in_tg:
+                        break
+                    if in_tg and "=" in stripped:
+                        k, v = stripped.split("=", 1)
+                        k, v = k.strip(), v.strip().strip('"').strip("'")
+                        if k == "bot_token" and not token:
+                            token = v
+                        if k == "chat_id" and not chat_id:
+                            chat_id = v
+            except Exception:
+                pass
+    return token, chat_id
+
+
+TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID = _get_telegram_config()
+
 # ── Multi-Timeframe settings (from grid-trading) ───────────────────────────
 
 MTF_SHORT_PERIOD = 5
@@ -1728,12 +1802,78 @@ def _build_notification(tier: str, data: dict) -> dict:
     return None
 
 
+# ── Notification sending ───────────────────────────────────────────────────
+
+
+def _send_telegram(text: str) -> bool:
+    """Send a message via Telegram Bot API."""
+    import urllib.error
+    import urllib.request
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        return True
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+        log(f"Telegram send error: {exc}")
+        return False
+
+
+def _send_notification(notif: dict):
+    """Send notification to Discord (embed) and Telegram (text)."""
+    import urllib.error
+    import urllib.request
+
+    # Discord embed
+    discord_ok = False
+    token = _get_discord_token()
+    embed = notif.get("discord", {})
+    if token and DISCORD_CHANNEL_ID and embed:
+        url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages"
+        payload = {"embeds": [embed]}
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={
+                "Authorization": f"Bot {token}",
+                "Content-Type": "application/json",
+                "User-Agent": "DiscordBot (https://openclaw.ai, 1.0)",
+            },
+        )
+        try:
+            urllib.request.urlopen(req, timeout=10)
+            discord_ok = True
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+            log(f"Discord embed error: {exc}")
+
+    # Telegram text
+    tg_ok = False
+    text = notif.get("text", "")
+    if text and (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        tg_ok = _send_telegram(text)
+
+    if not discord_ok and not tg_ok:
+        log("No notification channel available (Discord + Telegram both failed)")
+
+
 def emit(event_type: str, data: dict, notify: bool = False, tier: str = ""):
     """Emit structured JSON event to stdout (one JSON line per event).
 
-    Strategy script is a headless engine. The hosting agent platform
-    (ZeroClaw, OpenClaw, etc.) reads stdout and routes notifications.
-    If tier is provided, builds dual-format notification block.
+    If tier is provided, builds dual-format notification and sends to
+    Discord (embed) + Telegram (markdown text).
     """
     payload = {
         "type": event_type,
@@ -1745,6 +1885,7 @@ def emit(event_type: str, data: dict, notify: bool = False, tier: str = ""):
         notif = _build_notification(tier, data)
         if notif:
             payload["notification"] = notif
+            _send_notification(notif)
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
