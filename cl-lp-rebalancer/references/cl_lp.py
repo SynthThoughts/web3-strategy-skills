@@ -31,7 +31,10 @@ def _load_env():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip())
+                k = k.strip()
+                if k.startswith("export "):
+                    k = k[7:].strip()
+                os.environ.setdefault(k, v.strip())
 
 
 _load_env()
