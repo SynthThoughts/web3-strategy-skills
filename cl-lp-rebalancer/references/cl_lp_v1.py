@@ -684,15 +684,21 @@ def check_rebalance_triggers(
                 "detail": f"{old_regime}->{new_regime} (delta {vol_change:.0%})",
             }
 
-    # [4] Time decay — maintenance (>24h since creation or last skip)
+    # [4] Time decay — maintenance (>24h first, 4h retry after skip)
     created_at = position.get("created_at")
     if created_at:
         created_dt = _safe_isoparse(created_at)
         last_skip = _safe_isoparse(state.get("_last_time_decay_skip", ""))
-        candidates = [d for d in (created_dt, last_skip) if d]
-        ref_dt = max(candidates) if candidates else None
-        age_seconds = (datetime.now() - ref_dt).total_seconds() if ref_dt else 0
-        if age_seconds > 86400:  # 24h
+        if last_skip:
+            age_seconds = (datetime.now() - last_skip).total_seconds()
+            threshold = 14400  # 4h retry
+        elif created_dt:
+            age_seconds = (datetime.now() - created_dt).total_seconds()
+            threshold = 86400  # 24h first trigger
+        else:
+            age_seconds = 0
+            threshold = 86400
+        if age_seconds > threshold:
             return {
                 "trigger": "time_decay",
                 "priority": "maintenance",
