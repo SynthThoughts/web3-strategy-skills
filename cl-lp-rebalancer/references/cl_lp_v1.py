@@ -1917,7 +1917,7 @@ def _tick_inner():
                         state.get("_last_skip_log", "")
                     )
                     now = datetime.now()
-                    if not last_skip or (now - last_skip).total_seconds() > 14400:
+                    if not last_skip or (now - last_skip).total_seconds() > 3600:
                         log(
                             f"Range change too small ({width_change:.1%} < 5%)"
                             f" — skipping [{trigger['trigger']}]"
