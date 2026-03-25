@@ -66,6 +66,8 @@ USDC_ADDR = TOKEN1["address"]
 CHAIN_ID = CFG.get("chain_id", "8453")
 PLATFORM_ID = CFG.get("platform_id", "68")  # onchainos defi platform ID
 NATIVE_TOKEN = CFG.get("native_token", "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+PAIR_NAME = f"{TOKEN0['symbol']}/{TOKEN1['symbol']}"
+CHAIN_LABEL = POOL_CHAIN.capitalize()
 
 _rm = CFG["range_mult"]
 RANGE_MULT = (
@@ -235,7 +237,11 @@ def onchainos_cmd(args: list[str], timeout: int = 30) -> dict | None:
 # ── Wallet Address ──────────────────────────────────────────────────────────
 
 # Auto-switch to the correct account if ACCOUNT_ID is set in config
-_cfg_account_id = CFG.get("account_id", "") or os.environ.get("ONCHAINOS_ACCOUNT_ID", "") or os.environ.get("ACCOUNT_ID", "")
+_cfg_account_id = (
+    CFG.get("account_id", "")
+    or os.environ.get("ONCHAINOS_ACCOUNT_ID", "")
+    or os.environ.get("ACCOUNT_ID", "")
+)
 if _cfg_account_id:
     try:
         result = subprocess.run(
@@ -322,7 +328,9 @@ def get_balances() -> tuple[float, float, bool]:
     """Get ETH and USDC balances via --all to avoid wallet-switch race condition."""
     account_id = _cfg_account_id
     if account_id:
-        data = onchainos_cmd(["wallet", "balance", "--all", "--chain", CHAIN_ID], timeout=15)
+        data = onchainos_cmd(
+            ["wallet", "balance", "--all", "--chain", CHAIN_ID], timeout=15
+        )
     else:
         data = onchainos_cmd(["wallet", "balance", "--chain", CHAIN_ID], timeout=15)
     if not data or not data.get("ok") or not data.get("data"):
@@ -1242,7 +1250,9 @@ def execute_rebalance(
             state["stats"]["total_fees_claimed_usd"] = round(
                 state["stats"].get("total_fees_claimed_usd", 0) + unclaimed, 2
             )
-            log(f"  Fees claimed: ${unclaimed:.2f} (total: ${state['stats']['total_fees_claimed_usd']:.2f})")
+            log(
+                f"  Fees claimed: ${unclaimed:.2f} (total: ${state['stats']['total_fees_claimed_usd']:.2f})"
+            )
     elif token_id:
         log(f"  Skip claim: unclaimed ${unclaimed:.2f} < ${MIN_TRADE_USD:.0f}")
 
@@ -1491,11 +1501,239 @@ def save_state(state: dict):
 # ── Structured Event Output ─────────────────────────────────────────────────
 
 
-def emit(event_type: str, data: dict, notify: bool = False):
+def _range_visual(price: float, lower: float, upper: float, width: int = 20) -> str:
+    """Build ASCII range position indicator.
+
+    Example: [$1,950 ·····●····· $2,150] ← $2,090
+    """
+    if not lower or not upper or upper <= lower:
+        return ""
+    clamped = max(lower, min(upper, price))
+    pos = int((clamped - lower) / (upper - lower) * width)
+    bar = "·" * pos + "●" + "·" * (width - pos)
+    return f"[${lower:,.0f} {bar} ${upper:,.0f}] ← ${price:,.0f}"
+
+
+def _build_notification(tier: str, data: dict) -> dict:
+    """Build dual-format notification block (discord embed + text markdown).
+
+    Returns {"tier": str, "discord": {...}, "text": str} or None if silent.
+    """
+    price = data.get("price", 0)
+    status = data.get("status", "")
+
+    # ── Trade Alert ──────────────────────────────────────────────────────
+    if tier == "trade_alert":
+        success = status in ("rebalanced", "first_deploy")
+        pos = data.get("position", {})
+        lower = pos.get("lower_price", 0)
+        upper = pos.get("upper_price", 0)
+        pnl_usd = data.get("pnl_usd", 0)
+        fees = data.get("fees_claimed_usd", 0)
+        trigger = data.get("trigger", "")
+        tx = data.get("tx_hash", "")
+
+        icon = "🔄" if success else "❌"
+        verb = "调仓成功" if success else "调仓失败"
+        color = 0x00CC66 if success else 0xFF6600  # green / orange
+
+        fields_discord = [
+            {"name": "价格", "value": f"${price:,.2f}", "inline": True},
+            {"name": "范围", "value": f"${lower:,.0f} — ${upper:,.0f}", "inline": True},
+            {"name": "触发", "value": trigger or "—", "inline": True},
+            {"name": "费用已领", "value": f"${fees:,.2f}", "inline": True},
+            {"name": "PnL", "value": f"${pnl_usd:+,.2f}", "inline": True},
+        ]
+        visual = _range_visual(price, lower, upper) if lower and upper else ""
+        footer = f"tx: {tx[:10]}...{tx[-6:]}" if tx else ""
+
+        text_lines = [
+            f"{icon} **{verb} · {PAIR_NAME} · {CHAIN_LABEL}**",
+            f"💰 价格: `${price:,.2f}`",
+            f"📐 范围: `${lower:,.0f} — ${upper:,.0f}`",
+            f"🎯 触发: `{trigger}`" if trigger else None,
+            f"💵 费用: `${fees:,.2f}`",
+            f"📈 PnL: `${pnl_usd:+,.2f}`",
+            f"`{visual}`" if visual else None,
+            f"_tx: {tx[:10]}...{tx[-6:]}_" if tx else None,
+        ]
+
+        return {
+            "tier": "trade_alert",
+            "discord": {
+                "title": f"{icon} {verb} · {PAIR_NAME} · {CHAIN_LABEL}",
+                "color": color,
+                "fields": fields_discord,
+                "footer": {"text": footer},
+            },
+            "text": "\n".join(ln for ln in text_lines if ln),
+        }
+
+    # ── Risk Alert ───────────────────────────────────────────────────────
+    if tier == "risk_alert":
+        trigger_msg = data.get("trigger", status)
+        portfolio = data.get("portfolio_usd", 0)
+        auto_resume = data.get("auto_resume", False)
+
+        fields_discord = [
+            {"name": "原因", "value": trigger_msg, "inline": False},
+            {"name": "价格", "value": f"${price:,.2f}", "inline": True},
+            {"name": "组合价值", "value": f"${portfolio:,.2f}", "inline": True},
+        ]
+        footer = "自动恢复已启用" if auto_resume else "使用 resume-trading 恢复"
+
+        text_lines = [
+            f"🛑 **交易停止 · {PAIR_NAME} · {CHAIN_LABEL}**",
+            f"⚠️ 原因: `{trigger_msg}`",
+            f"💰 价格: `${price:,.2f}` | 组合: `${portfolio:,.2f}`",
+            f"_{footer}_",
+        ]
+
+        return {
+            "tier": "risk_alert",
+            "discord": {
+                "title": f"🛑 交易停止 · {PAIR_NAME} · {CHAIN_LABEL}",
+                "color": 0xFF0000,
+                "fields": fields_discord,
+                "footer": {"text": footer},
+            },
+            "text": "\n".join(text_lines),
+        }
+
+    # ── Hourly Pulse ─────────────────────────────────────────────────────
+    if tier == "hourly_pulse":
+        pos = data.get("position", {})
+        lower = pos.get("lower_price", 0)
+        upper = pos.get("upper_price", 0)
+        atr = data.get("atr_pct", 0)
+        regime = data.get("regime", "")
+        trend = data.get("trend", "neutral")
+        strength = data.get("trend_strength", 0)
+        tir = data.get("time_in_range_pct", 0)
+        rebal = data.get("total_rebalances", 0)
+        pnl_usd = data.get("pnl_usd", 0)
+        unclaimed = data.get("unclaimed_fee_usd", 0)
+
+        visual = _range_visual(price, lower, upper) if lower and upper else ""
+        edge = ""
+        if lower and upper and upper > lower:
+            dist_low = (price - lower) / (upper - lower)
+            dist_high = (upper - price) / (upper - lower)
+            edge_pct = min(dist_low, dist_high) * 100
+            edge = f"{edge_pct:.0f}%"
+
+        fields_discord = [
+            {"name": "价格", "value": f"${price:,.2f}", "inline": True},
+            {"name": "边缘距离", "value": edge or "—", "inline": True},
+            {"name": "波动率", "value": f"{regime} ({atr:.1f}%)", "inline": True},
+            {"name": "趋势", "value": f"{trend} ({strength:.2f})", "inline": True},
+            {"name": "PnL", "value": f"${pnl_usd:+,.2f}", "inline": True},
+            {"name": "待领费用", "value": f"${unclaimed:,.2f}", "inline": True},
+        ]
+        footer = f"范围内 {tir:.0f}% · 累计调仓 {rebal}次"
+
+        text_lines = [
+            f"📊 **{PAIR_NAME} · {CHAIN_LABEL} · 运行中**",
+            f"`{visual}`" if visual else None,
+            f"💰 `${price:,.2f}` | 边缘 `{edge}` | 波动 `{regime}` | 趋势 `{trend}`",
+            f"📈 PnL `${pnl_usd:+,.2f}` | 待领费用 `${unclaimed:,.2f}`",
+            f"_{footer}_",
+        ]
+
+        return {
+            "tier": "hourly_pulse",
+            "discord": {
+                "title": f"📊 {PAIR_NAME} · {CHAIN_LABEL} · 运行中",
+                "color": 0x808080,
+                "fields": fields_discord,
+                "footer": {"text": footer},
+            },
+            "text": "\n".join(ln for ln in text_lines if ln),
+        }
+
+    # ── Daily Report ─────────────────────────────────────────────────────
+    if tier == "daily_report":
+        pnl_usd = data.get("pnl_usd", 0)
+        pnl_pct = data.get("pnl_pct", 0)
+        tir = data.get("time_in_range_pct", 0)
+        rebal = data.get("total_rebalances", 0)
+        atr = data.get("atr_pct", 0)
+        regime = data.get("regime", "")
+        trend = data.get("trend", "neutral")
+        strength = data.get("trend_strength", 0)
+        fees_claimed = data.get("total_fees_claimed_usd", 0)
+        unclaimed = data.get("unclaimed_fee_usd", 0)
+        il_usd = data.get("il_usd", 0)
+        today_rebal = data.get("today_rebalances", [])
+        started = data.get("started_at", "")
+        portfolio = data.get("portfolio_usd", 0)
+
+        today = datetime.now().date().isoformat()
+
+        fields_discord = [
+            {
+                "name": "📈 PnL",
+                "value": f"${pnl_usd:+,.2f} ({pnl_pct:+.1f}%)",
+                "inline": True,
+            },
+            {
+                "name": "💵 LP 费用",
+                "value": f"${fees_claimed + unclaimed:,.2f}",
+                "inline": True,
+            },
+            {"name": "📉 无常损失", "value": f"${il_usd:,.2f}", "inline": True},
+            {"name": "🔄 今日调仓", "value": f"{len(today_rebal)} 次", "inline": True},
+            {"name": "📊 范围内", "value": f"{tir:.0f}%", "inline": True},
+            {"name": "💰 组合价值", "value": f"${portfolio:,.2f}", "inline": True},
+            {"name": "📉 波动率", "value": f"{regime} ({atr:.1f}%)", "inline": True},
+            {"name": "📈 趋势", "value": f"{trend} ({strength:.2f})", "inline": True},
+            {"name": "🔄 累计调仓", "value": f"{rebal} 次", "inline": True},
+        ]
+
+        days = 0
+        started_dt = _safe_isoparse(started)
+        if started_dt:
+            days = max((datetime.now() - started_dt).total_seconds() / 86400, 0.01)
+        footer = f"运行 {days:.1f} 天 · 累计调仓 {rebal} 次"
+
+        text_lines = [
+            f"📈 **日报 · {PAIR_NAME} · {today}**",
+            "",
+            "**收益**",
+            f"  PnL: `${pnl_usd:+,.2f}` (`{pnl_pct:+.1f}%`)",
+            f"  LP 费用: `${fees_claimed + unclaimed:,.2f}` (已领 `${fees_claimed:,.2f}` + 待领 `${unclaimed:,.2f}`)",
+            f"  无常损失: `${il_usd:,.2f}`" if il_usd else None,
+            "",
+            "**运营**",
+            f"  今日调仓: `{len(today_rebal)}` 次 | 范围内: `{tir:.0f}%`",
+            f"  组合价值: `${portfolio:,.2f}`",
+            "",
+            "**市场**",
+            f"  价格: `${price:,.2f}` | 波动: `{regime}` | 趋势: `{trend}`",
+            "",
+            f"_{footer}_",
+        ]
+
+        return {
+            "tier": "daily_report",
+            "discord": {
+                "title": f"📈 日报 · {PAIR_NAME} · {today}",
+                "color": 0x3399FF,
+                "fields": fields_discord,
+                "footer": {"text": footer},
+            },
+            "text": "\n".join(ln for ln in text_lines if ln),
+        }
+
+    return None
+
+
+def emit(event_type: str, data: dict, notify: bool = False, tier: str = ""):
     """Emit structured JSON event to stdout (one JSON line per event).
 
     Strategy script is a headless engine. The hosting agent platform
     (ZeroClaw, OpenClaw, etc.) reads stdout and routes notifications.
+    If tier is provided, builds dual-format notification block.
     """
     payload = {
         "type": event_type,
@@ -1503,6 +1741,10 @@ def emit(event_type: str, data: dict, notify: bool = False):
         "notify": notify,
         **data,
     }
+    if tier:
+        notif = _build_notification(tier, data)
+        if notif:
+            payload["notification"] = notif
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
@@ -1522,7 +1764,12 @@ def calc_pnl(stats: dict, current_usd: float) -> dict:
     cost_basis = initial + deposits
     pnl_usd = round(current_usd - cost_basis, 2)
     pnl_pct = (pnl_usd / cost_basis * 100) if cost_basis > 0 else 0
-    return {"pnl_usd": pnl_usd, "pnl_pct": pnl_pct, "cost_basis": cost_basis, "valid": True}
+    return {
+        "pnl_usd": pnl_usd,
+        "pnl_pct": pnl_pct,
+        "cost_basis": cost_basis,
+        "valid": True,
+    }
 
 
 def estimate_il(entry_price: float, current_price: float) -> float:
@@ -1602,7 +1849,10 @@ def _tick_inner():
         state["errors"] = errors
         save_state(state)
         log("Failed to get price")
-        emit("tick", {"status": "error", "reason": "price_fetch_failed", "retriable": True})
+        emit(
+            "tick",
+            {"status": "error", "reason": "price_fetch_failed", "retriable": True},
+        )
         return
 
     errors["consecutive"] = 0
@@ -1764,15 +2014,13 @@ def _tick_inner():
                 state.pop("stop_notified", None)
                 state.pop("stop_triggered_at", None)
                 save_state(state)
-                emit(
-                    "stop_resumed",
-                    {
-                        "previous_trigger": trigger_msg,
-                        "drawdown_pct": round(current_drawdown * 100, 2),
-                        "price": round(price, 2),
-                    },
-                    notify=True,
-                )
+                resumed_data = {
+                    "status": "stop_resumed",
+                    "previous_trigger": trigger_msg,
+                    "drawdown_pct": round(current_drawdown * 100, 2),
+                    "price": round(price, 2),
+                }
+                emit("stop_resumed", resumed_data, notify=True, tier="trade_alert")
                 resumed = True
 
         if not resumed:
@@ -1790,15 +2038,18 @@ def _tick_inner():
                 state["stop_notified"] = True
                 state["stop_triggered_at"] = datetime.now().isoformat()
             save_state(state)
+            stop_data = {
+                "status": "stop_triggered" if first_notify else "stopped",
+                "trigger": trigger_msg,
+                "price": round(price, 2),
+                "portfolio_usd": round(total_usd, 2),
+                "auto_resume": STOP_AUTO_RESUME,
+            }
             emit(
                 "stop_triggered" if first_notify else "stopped",
-                {
-                    "trigger": trigger_msg,
-                    "price": round(price, 2),
-                    "portfolio_usd": round(total_usd, 2),
-                    "auto_resume": STOP_AUTO_RESUME,
-                },
+                stop_data,
                 notify=first_notify,
+                tier="risk_alert" if first_notify else "",
             )
             return
 
@@ -1859,9 +2110,7 @@ def _tick_inner():
                 width_change = abs(new_width - old_width) / old_width
                 if width_change < 0.05:
                     # Log at most once per 4h to avoid spam
-                    last_skip = _safe_isoparse(
-                        state.get("_last_skip_log", "")
-                    )
+                    last_skip = _safe_isoparse(state.get("_last_skip_log", ""))
                     now = datetime.now()
                     if not last_skip or (now - last_skip).total_seconds() > 3600:
                         log(
@@ -1921,11 +2170,25 @@ def _tick_inner():
     save_state(state)
 
     # Emit tick event
-    has_event = tick_status not in (
-        "in_range", "no_action", "risk_rejected", "skip_small_change",
+    is_trade = tick_status in (
+        "rebalanced",
+        "first_deploy",
+        "initial_deposit",
+        "rebalance_failed",
+        "initial_deposit_failed",
+    )
+    is_quiet = tick_status in (
+        "in_range",
+        "no_action",
+        "risk_rejected",
+        "skip_small_change",
     )
     stats = state.get("stats", {})
     pnl = calc_pnl(stats, total_usd)
+    unclaimed_fee = stats.get("unclaimed_fee_usd", 0)
+    total_fees = stats.get("total_fees_claimed_usd", 0) + unclaimed_fee
+    il_usd = (total_fees - pnl["pnl_usd"]) if pnl["valid"] and total_fees > 0 else 0
+
     tick_data = {
         "status": tick_status,
         "price": round(price, 2),
@@ -1935,6 +2198,9 @@ def _tick_inner():
         "trend_strength": round(mtf.get("strength", 0), 2),
         "portfolio_usd": round(total_usd, 2),
         "pnl_usd": pnl["pnl_usd"],
+        "unclaimed_fee_usd": round(unclaimed_fee, 2),
+        "total_fees_claimed_usd": round(stats.get("total_fees_claimed_usd", 0), 2),
+        "il_usd": round(il_usd, 2),
         "balances": {
             "eth": round(eth_bal, 6),
             "usdc": round(usdc_bal, 2),
@@ -1950,8 +2216,27 @@ def _tick_inner():
             "upper_price": position.get("upper_price"),
         }
     if trigger:
-        tick_data["trigger"] = trigger
-    emit("tick", tick_data, notify=has_event)
+        tick_data["trigger"] = trigger.get("trigger", str(trigger))
+
+    # Determine notification tier
+    tier = ""
+    if is_trade:
+        tier = "trade_alert"
+    elif not is_quiet:
+        pass  # non-quiet non-trade: emit without notification
+    else:
+        # Hourly pulse: push if QUIET_INTERVAL elapsed since last notification
+        last_notify = _safe_isoparse(state.get("_last_notify_ts", ""))
+        if (
+            not last_notify
+            or (datetime.now() - last_notify).total_seconds() >= QUIET_INTERVAL
+        ):
+            tier = "hourly_pulse"
+            state["_last_notify_ts"] = datetime.now().isoformat()
+            save_state(state)
+
+    notify = tier != ""
+    emit("tick", tick_data, notify=notify, tier=tier)
 
 
 # ── Sub-commands ────────────────────────────────────────────────────────────
@@ -2016,7 +2301,9 @@ def status():
             edge_str = f" | 边缘距离: `{edge_dist:.0%}`"
         else:
             edge_str = ""
-        print(f"> {status_emoji} 范围: `${lower_p:.2f}` - `${upper_p:.2f}` ({status_str}{edge_str})")
+        print(
+            f"> {status_emoji} 范围: `${lower_p:.2f}` - `${upper_p:.2f}` ({status_str}{edge_str})"
+        )
         # ASCII tick range visualization
         if price:
             bar_w = 30
@@ -2032,7 +2319,9 @@ def status():
             if created_dt:
                 age_h = (datetime.now() - created_dt).total_seconds() / 3600
                 rebal_count = stats.get("total_rebalances", 0)
-                print(f"> 头寸年龄: `{age_h:.1f}h` | 调仓: `{rebal_count}` 次 | token_id: `{position.get('token_id', 'N/A')}`")
+                print(
+                    f"> 头寸年龄: `{age_h:.1f}h` | 调仓: `{rebal_count}` 次 | token_id: `{position.get('token_id', 'N/A')}`"
+                )
     else:
         print("> 头寸: 未建立")
 
@@ -2067,7 +2356,9 @@ def status():
     # Fee income & derived IL
     total_fees = stats.get("total_fees_claimed_usd", 0) + unclaimed_fee
     if total_fees > 0.01:
-        print(f"> LP 手续费: `${total_fees:.2f}` (已领 `${stats.get('total_fees_claimed_usd', 0):.2f}` + 待领 `${unclaimed_fee:.2f}`)")
+        print(
+            f"> LP 手续费: `${total_fees:.2f}` (已领 `${stats.get('total_fees_claimed_usd', 0):.2f}` + 待领 `${unclaimed_fee:.2f}`)"
+        )
     # IL = fees - PnL (ignoring gas, small on L2)
     if pnl["valid"] and total_fees > 0:
         il_usd = total_fees - pnl["pnl_usd"]
@@ -2103,7 +2394,6 @@ def report():
     pnl = calc_pnl(stats, total_usd)
     tir = stats.get("time_in_range_pct", 0)
     total_rebal = stats.get("total_rebalances", 0)
-    il = stats.get("estimated_il_pct", 0)
 
     today = datetime.now().date().isoformat()
     today_rebal = [r for r in rebalances if r["time"].startswith(today)]
@@ -2111,6 +2401,10 @@ def report():
     mtf = {}
     if price and len(history) >= MTF_SHORT_PERIOD:
         mtf = analyze_multi_timeframe(history, price)
+
+    unclaimed_fee = stats.get("unclaimed_fee_usd", 0)
+    total_fees = stats.get("total_fees_claimed_usd", 0) + unclaimed_fee
+    il_usd = (total_fees - pnl["pnl_usd"]) if pnl["valid"] and total_fees > 0 else 0
 
     report_data = {
         "price": round(price, 2) if price else None,
@@ -2120,9 +2414,11 @@ def report():
         "portfolio_usd": round(total_usd, 2),
         "pnl_usd": pnl["pnl_usd"],
         "pnl_pct": round(pnl["pnl_pct"], 2),
+        "total_fees_claimed_usd": round(stats.get("total_fees_claimed_usd", 0), 2),
+        "unclaimed_fee_usd": round(unclaimed_fee, 2),
+        "il_usd": round(il_usd, 2),
         "time_in_range_pct": round(tir, 1),
         "total_rebalances": total_rebal,
-        "estimated_il_pct": round(il, 2),
         "today_rebalances": today_rebal[-5:],
         "trend": mtf.get("trend", "neutral"),
         "trend_strength": round(mtf.get("strength", 0), 2),
@@ -2135,7 +2431,7 @@ def report():
             "upper_price": position["upper_price"],
             "in_range": in_range,
         }
-    emit("report", report_data, notify=True)
+    emit("report", report_data, notify=True, tier="daily_report")
 
 
 def history_cmd():
