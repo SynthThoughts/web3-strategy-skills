@@ -1983,7 +1983,9 @@ def _tick_inner():
     save_state(state)
 
     # Output
-    has_event = tick_status not in ("in_range", "no_action", "risk_rejected")
+    has_event = tick_status not in (
+        "in_range", "no_action", "risk_rejected", "skip_small_change",
+    )
     should_print = True
     if not has_event:
         last_quiet = state.get("last_quiet_report")
@@ -2064,7 +2066,9 @@ def _print_tick_output(
     if position and position.get("lower_price"):
         range_str = f"${position['lower_price']:.2f}-${position['upper_price']:.2f}"
 
-    has_event = tick_status not in ("in_range", "no_action", "risk_rejected")
+    has_event = tick_status not in (
+        "in_range", "no_action", "risk_rejected", "skip_small_change",
+    )
 
     if has_event:
         action_cn = {
