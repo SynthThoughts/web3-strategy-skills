@@ -114,7 +114,7 @@ MAX_LOG_BYTES = 1_000_000
 def log(msg: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
-    print(line)
+    print(line, file=sys.stderr)
     try:
         if LOG_FILE.exists() and LOG_FILE.stat().st_size > MAX_LOG_BYTES:
             content = LOG_FILE.read_text()
@@ -1479,76 +1479,22 @@ def save_state(state: dict):
         log(f"CRITICAL: Failed to save state: {e}")
 
 
-# ── Discord Notification ────────────────────────────────────────────────────
+# ── Structured Event Output ─────────────────────────────────────────────────
 
 
-def _resolve_discord_channel_id() -> str:
-    env_id = os.environ.get("DISCORD_CHANNEL_ID", "")
-    if env_id:
-        return env_id
-    try:
-        cfg_path = Path.home() / ".openclaw" / "openclaw.json"
-        if cfg_path.exists():
-            cfg = json.loads(cfg_path.read_text())
-            guilds = cfg.get("channels", {}).get("discord", {}).get("guilds", {})
-            for guild_id, guild_cfg in guilds.items():
-                channels = guild_cfg.get("channels", {})
-                for ch_id, ch_cfg in channels.items():
-                    if ch_cfg.get("allow"):
-                        return ch_id
-    except Exception:
-        pass
-    return ""
+def emit(event_type: str, data: dict, notify: bool = False):
+    """Emit structured JSON event to stdout (one JSON line per event).
 
-
-DISCORD_CHANNEL_ID = _resolve_discord_channel_id()
-
-
-def _get_discord_token() -> str:
-    env_token = os.environ.get("DISCORD_BOT_TOKEN", "")
-    if env_token:
-        return env_token
-    cfg_path = Path.home() / ".openclaw" / "openclaw.json"
-    if cfg_path.exists():
-        cfg = json.loads(cfg_path.read_text())
-        return cfg.get("channels", {}).get("discord", {}).get("token", "")
-    return ""
-
-
-def _send_discord_embed(embeds: list[dict], content: str = ""):
-    import urllib.error
-    import urllib.request
-
-    token = _get_discord_token()
-    if not token:
-        return False
-    url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages"
-    payload = {"embeds": embeds}
-    if content:
-        payload["content"] = content
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Authorization": f"Bot {token}",
-            "Content-Type": "application/json",
-            "User-Agent": "DiscordBot (https://openclaw.ai, 1.0)",
-        },
-    )
-    try:
-        urllib.request.urlopen(req, timeout=10)
-        return True
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
-        log(f"Discord embed error: {e}")
-        return False
-
-
-# ── JSON Output ─────────────────────────────────────────────────────────────
-
-
-def _emit_json(data: dict):
-    print("---JSON---")
-    print(json.dumps(data, indent=2))
+    Strategy script is a headless engine. The hosting agent platform
+    (ZeroClaw, OpenClaw, etc.) reads stdout and routes notifications.
+    """
+    payload = {
+        "type": event_type,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "notify": notify,
+        **data,
+    }
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
 # ── IL Estimation ───────────────────────────────────────────────────────────
@@ -1578,7 +1524,7 @@ def tick():
     # Process lock — prevent concurrent ticks
     if not _acquire_lock():
         log("Another tick is already running — skipping")
-        _emit_json({"status": "locked", "retriable": False})
+        emit("tick", {"status": "locked", "retriable": False})
         return
     try:
         _tick_inner()
@@ -1606,12 +1552,13 @@ def _tick_inner():
         if cooldown_dt and cooldown_dt > datetime.now():
             remaining = int((cooldown_dt - datetime.now()).total_seconds()) // 60
             log(f"CIRCUIT BREAKER: cooldown {remaining}min remaining")
-            _emit_json(
+            emit(
+                "tick",
                 {
                     "status": "circuit_breaker",
                     "retriable": False,
                     "remaining_min": remaining,
-                }
+                },
             )
             return
         else:
@@ -1630,9 +1577,7 @@ def _tick_inner():
         state["errors"] = errors
         save_state(state)
         log("Failed to get price")
-        _emit_json(
-            {"status": "error", "reason": "price_fetch_failed", "retriable": True}
-        )
+        emit("tick", {"status": "error", "reason": "price_fetch_failed", "retriable": True})
         return
 
     errors["consecutive"] = 0
@@ -1655,27 +1600,15 @@ def _tick_inner():
                 f"Balance query failed {consec_bal_fail} consecutive times — "
                 f"pausing trading until balance recovers"
             )
-            if consec_bal_fail == MAX_BALANCE_FAILURES:
-                _send_discord_embed(
-                    [
-                        {
-                            "title": "LP 余额查询连续失败",
-                            "color": 0xFF9800,
-                            "description": (
-                                f"连续 {consec_bal_fail} 次失败\n"
-                                f"交易已暂停，等待恢复\n"
-                                f"价格: ${price:.2f}"
-                            ),
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                        }
-                    ]
-                )
             save_state(state)
-            _emit_json(
+            emit(
+                "tick",
                 {
                     "status": "balance_unavailable",
                     "consecutive_failures": consec_bal_fail,
-                }
+                    "price": round(price, 2),
+                },
+                notify=(consec_bal_fail == MAX_BALANCE_FAILURES),
             )
             return
         # Use last known balances for non-critical operations
@@ -1804,19 +1737,14 @@ def _tick_inner():
                 state.pop("stop_notified", None)
                 state.pop("stop_triggered_at", None)
                 save_state(state)
-                _send_discord_embed(
-                    [
-                        {
-                            "title": "LP 自动恢复",
-                            "color": 0x00C853,
-                            "description": (
-                                f"之前: {trigger_msg}\n"
-                                f"当前回撤: {current_drawdown:.1%}\n"
-                                f"价格: ${price:.2f}"
-                            ),
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                        }
-                    ]
+                emit(
+                    "stop_resumed",
+                    {
+                        "previous_trigger": trigger_msg,
+                        "drawdown_pct": round(current_drawdown * 100, 2),
+                        "price": round(price, 2),
+                    },
+                    notify=True,
                 )
                 resumed = True
 
@@ -1830,37 +1758,20 @@ def _tick_inner():
                 log(f"STOP ACTIVE: {trigger_msg}")
                 state["_last_stop_log"] = datetime.now().isoformat()
 
-            if not state.get("stop_notified"):
+            first_notify = not state.get("stop_notified")
+            if first_notify:
                 state["stop_notified"] = True
                 state["stop_triggered_at"] = datetime.now().isoformat()
-                save_state(state)
-                _send_discord_embed(
-                    [
-                        {
-                            "title": "LP 已停止",
-                            "color": 0xFF0000,
-                            "description": (
-                                f"触发: **{trigger_msg}**\n价格: ${price:.2f}\n"
-                                f"组合: ${total_usd:.0f}\n\n"
-                                + (
-                                    "自动恢复已启用，满足条件后将自动恢复"
-                                    if STOP_AUTO_RESUME
-                                    else "使用 `resume-trading` 恢复"
-                                )
-                            ),
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                        }
-                    ]
-                )
-            else:
-                save_state(state)
-            _emit_json(
+            save_state(state)
+            emit(
+                "stop_triggered" if first_notify else "stopped",
                 {
-                    "status": "stopped",
-                    "stop_triggered": trigger_msg,
-                    "portfolio_usd": round(total_usd, 2),
+                    "trigger": trigger_msg,
                     "price": round(price, 2),
-                }
+                    "portfolio_usd": round(total_usd, 2),
+                    "auto_resume": STOP_AUTO_RESUME,
+                },
+                notify=first_notify,
             )
             return
 
@@ -1982,181 +1893,40 @@ def _tick_inner():
         }
     save_state(state)
 
-    # Output
+    # Emit tick event
     has_event = tick_status not in (
         "in_range", "no_action", "risk_rejected", "skip_small_change",
     )
-    should_print = True
-    if not has_event:
-        last_quiet = state.get("last_quiet_report")
-        last_quiet_dt = _safe_isoparse(last_quiet) if last_quiet else None
-        if last_quiet_dt:
-            elapsed = (datetime.now() - last_quiet_dt).total_seconds()
-            if elapsed < QUIET_INTERVAL:
-                should_print = False
-        if should_print:
-            state["last_quiet_report"] = datetime.now().isoformat()
-            save_state(state)
-
-    if should_print:
-        _print_tick_output(
-            state,
-            price,
-            eth_bal,
-            usdc_bal,
-            total_usd,
-            mtf,
-            atr_pct,
-            tick_status,
-            trigger,
-            rebalanced,
-        )
-
-    # JSON output
-    if should_print:
-        json_data = {
-            "status": tick_status,
-            "version": "1.0",
-            "price": round(price, 2),
-            "atr_pct": round(atr_pct, 2),
-            "regime": classify_volatility(atr_pct),
-            "trend": mtf.get("trend", "neutral"),
-            "trend_strength": mtf.get("strength", 0),
-            "portfolio_usd": round(total_usd, 2),
-            "time_in_range_pct": state["stats"].get("time_in_range_pct", 0),
-            "total_rebalances": state["stats"].get("total_rebalances", 0),
-        }
-        if position and position.get("tick_lower"):
-            json_data["position"] = {
-                "tick_lower": position["tick_lower"],
-                "tick_upper": position["tick_upper"],
-                "lower_price": position.get("lower_price"),
-                "upper_price": position.get("upper_price"),
-            }
-        if trigger:
-            json_data["trigger"] = trigger
-        _emit_json(json_data)
-
-
-def _print_tick_output(
-    state,
-    price,
-    eth_bal,
-    usdc_bal,
-    total_usd,
-    mtf,
-    atr_pct,
-    tick_status,
-    trigger,
-    rebalanced,
-):
-    """Print human-readable + Discord output."""
-    position = state.get("position", {})
     stats = state.get("stats", {})
-    regime = classify_volatility(atr_pct)
-
     initial = stats.get("initial_portfolio_usd")
     deposits = stats.get("total_deposits_usd", 0)
     cost_basis = (initial or 0) + deposits
-    total_pnl = round(total_usd - cost_basis, 2) if initial else 0
-    tir = stats.get("time_in_range_pct", 0)
-    rebalances = stats.get("total_rebalances", 0)
-
-    range_str = "N/A"
-    if position and position.get("lower_price"):
-        range_str = f"${position['lower_price']:.2f}-${position['upper_price']:.2f}"
-
-    has_event = tick_status not in (
-        "in_range", "no_action", "risk_rejected", "skip_small_change",
-    )
-
-    if has_event:
-        action_cn = {
-            "rebalanced": "调仓完成",
-            "rebalance_failed": "调仓失败",
-            "initial_deposit": "首次建仓",
-            "initial_deposit_failed": "建仓失败",
-            "risk_rejected": "风控拒绝",
-            "skip_small_change": "变化太小跳过",
-        }.get(tick_status, tick_status)
-
-        trigger_str = trigger["trigger"] if trigger else "N/A"
-        color = 0x00C853 if rebalanced else 0xFF9800
-
-        fields = [
-            {"name": "价格", "value": f"${price:.2f}", "inline": True},
-            {"name": "范围", "value": range_str, "inline": True},
-            {"name": "波动", "value": f"{atr_pct:.1f}% ({regime})", "inline": True},
-            {
-                "name": "持仓",
-                "value": f"{eth_bal:.4f} ETH + ${usdc_bal:.1f} USDC",
-                "inline": False,
-            },
-            {"name": "总值", "value": f"${total_usd:.0f}", "inline": True},
-            {"name": "收益", "value": f"${total_pnl:+.2f}", "inline": True},
-            {"name": "触发", "value": trigger_str, "inline": True},
-            {"name": "范围内时间", "value": f"{tir:.0f}%", "inline": True},
-            {"name": "调仓次数", "value": str(rebalances), "inline": True},
-        ]
-        if mtf:
-            fields.append(
-                {
-                    "name": "趋势",
-                    "value": f"{mtf['trend']} ({mtf['strength']:.0%})",
-                    "inline": True,
-                }
-            )
-
-        embed = {
-            "title": f"LP {action_cn}",
-            "color": color,
-            "fields": fields,
-            "footer": {"text": f"CL LP v1 | {regime} | ATR {atr_pct:.1f}%"},
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+    tick_data = {
+        "status": tick_status,
+        "price": round(price, 2),
+        "atr_pct": round(atr_pct, 2),
+        "regime": classify_volatility(atr_pct),
+        "trend": mtf.get("trend", "neutral"),
+        "trend_strength": round(mtf.get("strength", 0), 2),
+        "portfolio_usd": round(total_usd, 2),
+        "pnl_usd": round(total_usd - cost_basis, 2) if initial else 0,
+        "balances": {
+            "eth": round(eth_bal, 6),
+            "usdc": round(usdc_bal, 2),
+        },
+        "time_in_range_pct": stats.get("time_in_range_pct", 0),
+        "total_rebalances": stats.get("total_rebalances", 0),
+    }
+    if position and position.get("tick_lower"):
+        tick_data["position"] = {
+            "tick_lower": position["tick_lower"],
+            "tick_upper": position["tick_upper"],
+            "lower_price": position.get("lower_price"),
+            "upper_price": position.get("upper_price"),
         }
-    else:
-        pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
-        desc = (
-            f"**${price:.2f}** | {range_str} | {regime}\n"
-            f"{eth_bal:.4f} ETH + ${usdc_bal:.1f} USDC = ${total_usd:.0f}\n"
-            f"收益 {pnl_str} | 范围内 {tir:.0f}% | 调仓 {rebalances}次"
-        )
-        embed = {
-            "title": "LP v1 -- 运行中",
-            "color": 0x9E9E9E,
-            "description": desc,
-            "footer": {
-                "text": f"ATR {atr_pct:.1f}% ({regime}) | {mtf.get('trend', 'N/A')}"
-            },
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    if has_event or datetime.now().minute < 5:
-        sent = _send_discord_embed([embed])
-        if not sent:
-            print("Failed to send Discord embed. Outputting to stdout instead:")
-            status_cn = "调仓" if rebalanced else "运行中"
-            summary = (
-                f"**LP** `${price:.2f}` | {range_str} | {regime} "
-                f"| `{eth_bal:.4f}` ETH + `${usdc_bal:.1f}` USDC (`${total_usd:.0f}`)"
-            )
-            pnl_sign = "+" if total_pnl >= 0 else ""
-            summary += f"\n> 收益 `{pnl_sign}${total_pnl:.2f}` | 范围内 `{tir:.0f}%` | 调仓 `{rebalances}` | {status_cn}"
-            if trigger:
-                summary += f" | 触发: {trigger['trigger']}"
-            print(summary)
-    else:
-        sent = False
-        status_cn = "调仓" if rebalanced else "运行中"
-        summary = (
-            f"**LP** `${price:.2f}` | {range_str} | {regime} "
-            f"| `{eth_bal:.4f}` ETH + `${usdc_bal:.1f}` USDC (`${total_usd:.0f}`)"
-        )
-        pnl_sign = "+" if total_pnl >= 0 else ""
-        summary += f"\n> 收益 `{pnl_sign}${total_pnl:.2f}` | 范围内 `{tir:.0f}%` | 调仓 `{rebalances}` | {status_cn}"
-        if trigger:
-            summary += f" | 触发: {trigger['trigger']}"
-        print(summary)
+    if trigger:
+        tick_data["trigger"] = trigger
+    emit("tick", tick_data, notify=has_event)
 
 
 # ── Sub-commands ────────────────────────────────────────────────────────────
@@ -2257,98 +2027,46 @@ def report():
     atr = kline_cache.get("atr_pct", 0) if kline_cache else 0
     regime = classify_volatility(atr)
 
-    fields = [
-        {"name": "价格", "value": f"${price:.2f}" if price else "N/A", "inline": True},
-        {"name": "ATR", "value": f"{atr:.2f}% ({regime})", "inline": True},
-    ]
-
-    if position and position.get("lower_price"):
-        in_range = position["lower_price"] <= (price or 0) <= position["upper_price"]
-        fields.append(
-            {
-                "name": "范围",
-                "value": f"${position['lower_price']:.2f}-${position['upper_price']:.2f} ({'范围内' if in_range else '范围外'})",
-                "inline": True,
-            }
-        )
-
-    fields.append(
-        {
-            "name": "持仓",
-            "value": f"{eth_bal:.4f} ETH + ${usdc_bal:.2f} USDC = **${total_usd:.0f}**",
-            "inline": False,
-        }
-    )
-
     initial = stats.get("initial_portfolio_usd")
     deposits = stats.get("total_deposits_usd", 0)
-    if initial and price:
-        cost_basis = initial + deposits
-        total_pnl = round(total_usd - cost_basis, 2)
-        pct = (total_pnl / cost_basis) * 100 if cost_basis else 0
-        fields.append(
-            {
-                "name": "总收益",
-                "value": f"${total_pnl:+.2f} ({pct:+.1f}%)",
-                "inline": True,
-            }
-        )
-
+    cost_basis = (initial or 0) + deposits
+    total_pnl = round(total_usd - cost_basis, 2) if initial else 0
+    pnl_pct = (total_pnl / cost_basis * 100) if cost_basis else 0
     tir = stats.get("time_in_range_pct", 0)
     total_rebal = stats.get("total_rebalances", 0)
     il = stats.get("estimated_il_pct", 0)
-    fields.append({"name": "范围内时间", "value": f"{tir:.0f}%", "inline": True})
-    fields.append({"name": "调仓次数", "value": str(total_rebal), "inline": True})
-    fields.append({"name": "估计 IL", "value": f"{il:.2f}%", "inline": True})
 
-    # Recent rebalances
     today = datetime.now().date().isoformat()
     today_rebal = [r for r in rebalances if r["time"].startswith(today)]
-    if today_rebal:
-        lines = []
-        for r in today_rebal[-5:]:
-            lines.append(f"`{r['time'][11:19]}` {r['trigger']} ({r.get('detail', '')})")
-        fields.append(
-            {
-                "name": f"今日调仓 ({len(today_rebal)}次)",
-                "value": "\n".join(lines),
-                "inline": False,
-            }
-        )
 
-    # MTF
-    footer_text = f"运行自 {stats.get('started_at', '?')[:10]}"
+    mtf = {}
     if price and len(history) >= MTF_SHORT_PERIOD:
         mtf = analyze_multi_timeframe(history, price)
-        footer_text = f"趋势 {mtf['trend']} ({mtf['strength']:.0%}) | {footer_text}"
 
-    embed = {
-        "title": "LP v1 -- 每日报告",
-        "color": 0x2196F3,
-        "fields": fields,
-        "footer": {"text": footer_text},
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+    report_data = {
+        "price": round(price, 2) if price else None,
+        "atr_pct": round(atr, 2),
+        "regime": regime,
+        "balances": {"eth": round(eth_bal, 6), "usdc": round(usdc_bal, 2)},
+        "portfolio_usd": round(total_usd, 2),
+        "pnl_usd": total_pnl,
+        "pnl_pct": round(pnl_pct, 2),
+        "time_in_range_pct": round(tir, 1),
+        "total_rebalances": total_rebal,
+        "estimated_il_pct": round(il, 2),
+        "today_rebalances": today_rebal[-5:],
+        "trend": mtf.get("trend", "neutral"),
+        "trend_strength": round(mtf.get("strength", 0), 2),
+        "started_at": stats.get("started_at", ""),
     }
-
-    sent = _send_discord_embed([embed])
-    if not sent:
-        print("**CL LP v1 -- 每日报告**")
-        print(f"> 价格: `${price:.2f}`" if price else "> 价格: N/A")
-        print(f"> ATR: `{atr:.2f}%` ({regime})")
-        if position and position.get("lower_price"):
-            print(
-                f"> 范围: `${position['lower_price']:.2f}` - `${position['upper_price']:.2f}`"
-            )
-        print(
-            f"> 持仓: `{eth_bal:.4f}` ETH + `${usdc_bal:.2f}` USDC = **`${total_usd:.0f}`**"
-        )
-        if initial and price:
-            cost_basis = initial + deposits
-            total_pnl = round(total_usd - cost_basis, 2)
-            pct = (total_pnl / cost_basis) * 100 if cost_basis else 0
-            print(f"> 收益: **`${total_pnl:+.2f}`** (`{pct:+.1f}%`)")
-        print(f"> 范围内: `{tir:.0f}%` | 调仓: `{total_rebal}` | IL: `{il:.2f}%`")
-        print(f"> 运行自: `{stats.get('started_at', '?')[:10]}`")
+    if position and position.get("lower_price"):
+        in_range = position["lower_price"] <= (price or 0) <= position["upper_price"]
+        report_data["position"] = {
+            "lower_price": position["lower_price"],
+            "upper_price": position["upper_price"],
+            "in_range": in_range,
+        }
+    emit("report", report_data, notify=True)
 
 
 def history_cmd():
@@ -2450,19 +2168,17 @@ def close():
         eth_bal, usdc_bal, _ = get_balances()
         price = get_eth_price()
         total = eth_bal * (price or 0) + usdc_bal
-        print(
-            f"头寸已关闭。余额: `{eth_bal:.4f}` ETH + `${usdc_bal:.2f}` USDC = `${total:.0f}`"
-        )
-
-        _send_discord_embed(
-            [
-                {
-                    "title": "LP 头寸已关闭",
-                    "color": 0xFF9800,
-                    "description": f"token_id: {token_id}\n余额: ${total:.0f}",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-            ]
+        emit(
+            "position_closed",
+            {
+                "token_id": token_id,
+                "portfolio_usd": round(total, 2),
+                "balances": {
+                    "eth": round(eth_bal, 6),
+                    "usdc": round(usdc_bal, 2),
+                },
+            },
+            notify=True,
         )
     else:
         print("关闭失败 — 请手动检查")
@@ -2598,16 +2314,10 @@ def resume_trading():
     state.pop("stop_notified", None)
     save_state(state)
     log(f"Trading resumed (was: {old_trigger})")
-    print(f"交易已恢复 (之前: {old_trigger})")
-    _send_discord_embed(
-        [
-            {
-                "title": "LP 交易已恢复",
-                "color": 0x00C853,
-                "description": f"之前停止原因: {old_trigger}",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-        ]
+    emit(
+        "trading_resumed",
+        {"previous_trigger": old_trigger},
+        notify=True,
     )
 
 
