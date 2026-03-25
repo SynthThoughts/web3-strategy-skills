@@ -29,7 +29,7 @@ AI/Agent/
 │   └── demo-dashboard/        # V3 LP 看板原型（React，仅参考）
 │
 └── Agentic Wallet/          # OKX onchainos CLI（独立项目，核心依赖）
-    ├── onchainos             #   本地二进制 (arm64, v2.0.0-beta)
+    ├── onchainos             #   本地二进制 (arm64, v2.1.0)
     ├── cli/                  #   Rust 源码
     └── skills/               #   12 个 onchainos Skill 定义
 ```
@@ -58,6 +58,23 @@ dashboard (可视化)
 | VPS (见 1Password "OpenClaw") | 实盘 + 看板 | `/usr/local/bin/onchainos` (amd64) |
 
 VPS 通过 SSH 部署，pm2 管理进程，OpenClaw 推送 Discord 通知。
+
+### VPS SSH 连接
+
+SSH 走本地 Stash 代理（HTTP `127.0.0.1:7890`）以保证稳定性，已配置在 `~/.ssh/config`：
+
+```
+Host 43.133.182.170
+  ProxyCommand /usr/bin/nc -X connect -x 127.0.0.1:7890 %h %p
+  ServerAliveInterval 10
+  ServerAliveCountMax 3
+  ControlMaster auto
+  ControlPath ~/.ssh/sockets/%r@%h-%p
+  ControlPersist 600
+```
+
+- 需要 Stash 保持运行，否则 SSH 连接会失败
+- ControlMaster 复用连接，避免频繁新建连接触发 VPS 的 MaxStartups 限制
 
 ## 已有策略
 

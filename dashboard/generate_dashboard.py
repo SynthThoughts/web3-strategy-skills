@@ -277,9 +277,9 @@ def render_grid_strategy(strategy_cfg: dict) -> dict:
     version = latest.get("version", "4.2")
 
     # Trades summary
-    total_trades = stats.get("total_trades", 0)
     buy_count = stats.get("buy_successes", 0)
     sell_count = stats.get("sell_successes", 0)
+    total_trades = stats.get("total_trades", 0) or (buy_count + sell_count)
 
     # Price history for chart — ensure full window by backfilling from OKX API
     _inst_id = strategy_cfg.get("inst_id", DEFAULT_INST_ID)
@@ -1093,7 +1093,7 @@ def _build_cl_lp_chart_svg(
         old_range = rb.get("old_range", [])
         new_range = rb.get("new_range", [])
         for ticks in [old_range, new_range]:
-            if len(ticks) == 2:
+            if len(ticks) == 2 and ticks[0] is not None and ticks[1] is not None:
                 all_prices.append(_tick_to_price(ticks[0]))
                 all_prices.append(_tick_to_price(ticks[1]))
 
@@ -1489,7 +1489,9 @@ def _build_cl_lp_log_html(rebalance_history: list[dict]) -> str:
         detail_parts = []
         if detail_dir:
             detail_parts.append(detail_dir)
-        if len(old_range) == 2 and len(new_range) == 2:
+        if len(old_range) == 2 and len(new_range) == 2 and all(
+            t is not None for t in old_range + new_range
+        ):
             old_lo = _tick_to_price(old_range[0])
             old_hi = _tick_to_price(old_range[1])
             new_lo = _tick_to_price(new_range[0])

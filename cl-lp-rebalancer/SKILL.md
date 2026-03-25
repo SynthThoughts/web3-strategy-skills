@@ -33,7 +33,7 @@ Cron 驱动的 Uniswap V3 集中流动性自动调仓机器人，运行在 EVM L
 ```
 Cron (5min) → Python script → onchainos CLI → OKX Web3 API → Chain
                   ↓                ↓
-            state_v1.json    Wallet (TEE signing)
+            cl_lp_state.json    Wallet (TEE signing)
                   ↓
             ┌──────────────┐
             │ Price Fetch   │ ← onchainos swap quote / market price
@@ -52,7 +52,7 @@ Cron (5min) → Python script → onchainos CLI → OKX Web3 API → Chain
             │ Add Liq       │ ← onchainos defi deposit
             └──────┬───────┘
                    ↓
-            Discord embed (notification)
+            Structured JSON output
 ```
 
 **OKX Skill Dependencies** (via `onchainos` CLI — 处理认证、链解析、错误重试):
@@ -71,7 +71,113 @@ Cron (5min) → Python script → onchainos CLI → OKX Web3 API → Chain
 - Positions: `onchainos defi positions --chain <chain>`
 - Position Detail: `onchainos defi position-detail --investment-id <id> --chain <chain> --token-id <id>`
 
-## Pipeline: Execution Steps
+## Step 0: Pool Selection (First-Time Setup)
+
+When user has no `config.json` or asks to set up a new pool, guide them through selection:
+
+### 0.1 Choose Chain
+
+Ask: "在哪条链上做 LP？"
+
+Supported chains (by `onchainos defi search`): Base, Ethereum, Arbitrum, Polygon, BSC, etc.
+- **推荐 Base / Arbitrum** — L2 gas 低，适合频繁调仓
+- Ethereum mainnet gas 高，调仓 4 步操作可能吃掉利润
+
+### 0.2 Choose Pool Type
+
+Ask: "想做哪类 LP 池？"
+
+| 类型 | 示例 | 风险 | 适用 |
+|------|------|------|------|
+| **稳定币对** | USDC/USDT, USDC/DAI | 极低 IL，低收益 | 保守，追求稳定 |
+| **Native/稳定币** | ETH/USDC, ETH/USDT | 中等 IL，中等收益 | 推荐，流动性好 |
+| **非稳定币对** | ETH/WBTC, ARB/ETH | 双边 IL，高波动 | 有经验的用户 |
+| **含 Meme 币** | PEPE/ETH, DEGEN/ETH | 极高风险 | 见下方警告 |
+
+### 0.3 Meme Coin Warning
+
+If user selects a pool containing meme/low-cap tokens, **MUST display warning**:
+
+```
+⚠️ 风险提示：Meme 币 LP 存在以下额外风险：
+1. 极端无常损失 — 价格可能单方向暴涨/暴跌 90%+，IL 远超手续费收入
+2. 流动性枯竭 — 池子 TVL 可能骤降，你的头寸可能无法正常退出
+3. 合约风险 — 代币可能有 honeypot/税收/暂停转账等恶意机制
+4. 调仓失败 — 低流动性导致 swap 滑点过大，调仓流水线中途失败
+
+```
+
+Ask user to explicitly confirm: "了解风险，继续设置" before proceeding.
+
+### 0.4 Search & Select Pool
+
+Use `onchainos defi search --chain <chain> --keyword "<token0> <token1>"` to find pools.
+
+Present results to user:
+- Pool name, fee tier (0.01% / 0.05% / 0.3% / 1%), TVL, APY
+- **Fee tier guidance**:
+  - 0.01%: 稳定币对
+  - 0.05%: 相关性高的对（ETH/stETH）
+  - 0.3%: 主流对（ETH/USDC）— 推荐
+  - 1%: 高波动/低流动性对
+
+### 0.5 Generate config.json
+
+After user confirms pool, fetch detail via `onchainos defi detail` and generate:
+
+```json
+{
+  "investment_id": "<from search result>",
+  "pool_chain": "<chain>",
+  "chain_id": "<chain_id>",
+  "fee_tier": <fee_tier>,
+  "tick_spacing": <from detail>,
+  "token0": { "symbol": "<sym>", "address": "<addr>", "decimals": <dec> },
+  "token1": { "symbol": "<sym>", "address": "<addr>", "decimals": <dec> },
+  "range_mult": { "low": 1.0, "medium": 1.2, "high": 1.5, "extreme": 2.0 },
+  "min_range_pct": 2,
+  "max_range_pct": 5,
+  "asym_factor": 0.3,
+  "min_position_age_seconds": 3600,
+  "max_rebalances_24h": 6,
+  "gas_to_fee_ratio": 0.5,
+  "max_il_tolerance_pct": 5.0,
+  "edge_proximity_threshold": 0.15,
+  "emergency_range_mult": 2.0,
+  "stop_loss_pct": 0.15,
+  "trailing_stop_pct": 0.1,
+  "slippage_pct": 1,
+  "gas_reserve_eth": 0.02,
+  "min_trade_usd": 5.0,
+  "quiet_interval_seconds": 1800,
+  "max_consecutive_errors": 5,
+  "cooldown_after_errors_seconds": 3600
+}
+```
+
+**Pool-type-specific defaults**:
+
+| Parameter | 稳定币对 | Native/稳定币 | 非稳定币 | Meme 池 |
+|-----------|---------|-------------|---------|---------|
+| `min_range_pct` | 0.5 | 2 | 3 | 5 |
+| `max_range_pct` | 2 | 5 | 8 | 15 |
+| `range_mult.low` | 0.5 | 1.0 | 1.2 | 1.5 |
+| `range_mult.extreme` | 1.0 | 2.0 | 2.5 | 3.0 |
+| `stop_loss_pct` | 0.05 | 0.15 | 0.20 | 0.30 |
+| `trailing_stop_pct` | 0.03 | 0.10 | 0.15 | 0.20 |
+| `max_il_tolerance_pct` | 1.0 | 5.0 | 8.0 | 15.0 |
+| `gas_reserve_eth` | 0.005 | 0.02 | 0.02 | 0.02 |
+
+### 0.6 Gate
+
+- [ ] `config.json` exists with valid `investment_id`, `token0`, `token1`
+- [ ] `.env` configured (copy from `.env.example`, fill in API credentials + `WALLET_ADDR`)
+- [ ] `onchainos wallet balance` returns valid balances for the target chain
+- [ ] If meme pool: user has explicitly confirmed risk warning
+
+---
+
+## Pipeline: Runtime Steps
 
 **CRITICAL RULE**: Steps MUST execute in order. Do NOT skip steps or proceed past a gate that has not been satisfied.
 
@@ -159,11 +265,10 @@ Cron (5min) → Python script → onchainos CLI → OKX Web3 API → Chain
 7. Record rebalance in state, update position info
 
 **Actions** (always):
-8. Calculate performance metrics (fees claimed, IL, net yield, time-in-range)
+8. Calculate performance metrics (PnL, fees claimed, IL, time-in-range)
 9. Build structured JSON output for AI agent parsing
-10. Send Discord embed (green=rebalance success, grey=no action, red=stop/error)
 
-**Output**: Discord notification + structured JSON
+**Output**: structured JSON (via `---JSON---` block)
 
 ## Tool Wrapper: onchainos CLI Reference
 
@@ -280,7 +385,7 @@ Rebalance failure fallback: if deposit fails after remove, emergency deploy at 3
 ## Risk Control Flow
 
 ```
-[1] stop_triggered → refuse all operations, alert Discord
+[1] stop_triggered → refuse all operations, emit alert JSON
 [2] circuit_breaker (consecutive_errors >= 5) → 1h cooldown, refuse
 [3] data validation (price/balance/position null) → refuse
 [4] stop-loss / trailing-stop / IL tolerance → set stop_triggered, alert
@@ -352,35 +457,27 @@ The `tick` command outputs a structured JSON block for AI agent parsing:
   "trigger": "none" | "out_of_range" | "vol_shift" | "time_decay",
   "rebalance": {
     "executed": false,
-    "fees_claimed_usd": 1.25,
-    "gas_cost_usd": 0.03,
-    "il_realized_pct": 0.12
+    "fees_claimed_usd": 1.25
   },
   "stats": {
     "total_rebalances": 5,
     "total_fees_claimed_usd": 15.30,
-    "total_gas_spent_usd": 0.45,
     "time_in_range_pct": 92.5,
-    "net_yield_usd": 14.85,
-    "net_yield_annualized_pct": 18.5
+    "pnl_usd": 12.50,
+    "pnl_pct": 1.85,
+    "il_usd": 2.80
   }
 }
 ```
 
-### Discord Notification
+### Notification
 
-Two formats:
+脚本通过 `---JSON---` 块输出结构化数据，由上层调度器（zeroclaw/openclaw）负责路由到 Discord/Telegram 等渠道。
 
-**Rebalance executed** (colored embed):
-- Green = successful rebalance
-- Fields: price, old range → new range, fees claimed, gas cost, IL, net yield, time-in-range %, capital efficiency
-
-**No action** (grey compact):
-- One-line: price · range · edge distance · vol class · trend · fees accrued
-- Sent once per `QUIET_INTERVAL` (default 1 hour)
-
-**Error/Stop** (red embed):
-- Error detail, stop reason, last known position
+`status` 字段决定通知级别：
+- `rebalanced` — 调仓成功，包含新范围、费用等
+- `no_action` — 静默，仅在 `QUIET_INTERVAL` 间隔后输出
+- `error` / `stopped` — 需关注
 
 ## State Schema
 
@@ -414,18 +511,16 @@ Two formats:
       "trigger": "out_of_range",
       "old_range": [-198120, -197400],
       "new_range": [-198300, -197100],
-      "fees_claimed_usd": 1.25,
-      "gas_cost_usd": 0.03,
-      "il_realized_pct": 0.12
+      "fees_claimed_usd": 1.25
     }
   ],
   "stats": {
     "total_rebalances": 0,
     "total_fees_claimed_usd": 0,
-    "total_gas_spent_usd": 0,
+    "unclaimed_fee_usd": 0,
     "time_in_range_pct": 100,
-    "net_yield_usd": 0,
     "initial_portfolio_usd": null,
+    "total_deposits_usd": 0,
     "portfolio_peak_usd": null,
     "started_at": null,
     "last_check": null
@@ -447,7 +542,8 @@ Key fields:
 - `position.created_atr_pct`: ATR at position creation (for vol shift detection)
 - `rebalance_history`: full audit trail of all rebalances with costs
 - `stats.time_in_range_pct`: key performance metric — % of ticks where price was in range
-- `stats.net_yield_usd`: fees claimed minus gas spent minus IL
+- `stats.initial_portfolio_usd` + `total_deposits_usd`: PnL 计算的成本基准
+- `stats.total_fees_claimed_usd` + `unclaimed_fee_usd`: LP 手续费总收入，用于推导 IL
 - `stop_triggered`: string describing trigger condition, or null
 
 ## Core Algorithm
@@ -473,7 +569,7 @@ Key fields:
     b. On failure: emergency fallback at 3× width
 11. Check stop conditions (stop-loss, trailing stop, IL tolerance)
 12. Calculate performance metrics
-13. Report status (JSON + Discord)
+13. Report status (structured JSON)
 ```
 
 ## Deployment
@@ -482,64 +578,40 @@ Key fields:
 
 ```bash
 # Register tick (every 5 minutes)
-openclaw cron add \
-  --name "cl-lp-tick" \
-  --schedule "*/5 * * * *" \
-  --command "cd ~/.openclaw/scripts && python3 cl_lp_v1.py tick"
+zeroclaw cron add '*/5 * * * *' \
+  'cd ~/.openclaw/skills/cl-lp-rebalancer/references && set -a && . ../.env && set +a && python3 cl_lp.py tick'
 
 # Register daily report (08:00 CST = 00:00 UTC)
-openclaw cron add \
-  --name "cl-lp-daily" \
-  --schedule "0 0 * * *" \
-  --command "cd ~/.openclaw/scripts && python3 cl_lp_v1.py report"
-```
-
-### Systemd
-
-```ini
-[Unit]
-Description=CL LP Rebalancer Tick
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/python3 /path/to/cl_lp_v1.py tick
-Environment=OKX_API_KEY=... OKX_SECRET_KEY=... OKX_PASSPHRASE=...
-```
-
-```ini
-[Unit]
-Description=CL LP Rebalancer Tick Timer
-[Timer]
-OnCalendar=*:0/5
-[Install]
-WantedBy=timers.target
+zeroclaw cron add '0 0 * * *' \
+  'cd ~/.openclaw/skills/cl-lp-rebalancer/references && set -a && . ../.env && set +a && python3 cl_lp.py report'
 ```
 
 ### Manual
 
 ```bash
 # Single tick
-python3 cl_lp_v1.py tick
+python3 cl_lp.py tick
 
 # Dry run (fetch real data, simulate operations)
-DRY_RUN=true python3 cl_lp_v1.py tick
+DRY_RUN=true python3 cl_lp.py tick
 
 # Status check
-python3 cl_lp_v1.py status
+python3 cl_lp.py status
 
 # Close position and exit
-python3 cl_lp_v1.py close
+python3 cl_lp.py close
 ```
 
 ## Failure & Rollback
 
 ```
 IF rebalance sub-step fails:
-  1. Log failure reason to cl_lp_v1.log
+  1. Log failure reason to cl_lp.log
   2. Increment errors.consecutive
   3. If errors.consecutive >= 5: trigger circuit breaker (1h cooldown)
   4. If failure after remove liquidity: emergency deploy at 3× normal width
      (priority: get funds back into a position, even if suboptimal)
-  5. Report failure via Discord + JSON output
+  5. Report failure via JSON output
   6. On next tick: retry from last successful sub-step if possible
 ```
 

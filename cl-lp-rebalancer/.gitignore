@@ -1,0 +1,7 @@
+.env
+cl_lp_state.json
+cl_lp.log
+.cl_lp.lock
+*.json.bak
+*.log.tmp
+__pycache__/

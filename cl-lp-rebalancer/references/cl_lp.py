@@ -104,7 +104,7 @@ EMA_PERIOD = 20
 # ── Paths ───────────────────────────────────────────────────────────────────
 
 STATE_FILE = SCRIPT_DIR / "cl_lp_state.json"
-LOG_FILE = SCRIPT_DIR / "cl_lp_v1.log"
+LOG_FILE = SCRIPT_DIR / "cl_lp.log"
 MAX_LOG_BYTES = 1_000_000
 
 
@@ -152,7 +152,7 @@ def _safe_isoparse(s: str, default: datetime | None = None) -> datetime | None:
 
 # ── Process lock ───────────────────────────────────────────────────────────
 
-LOCK_FILE = SCRIPT_DIR / ".cl_lp_v1.lock"
+LOCK_FILE = SCRIPT_DIR / ".cl_lp.lock"
 _lock_fd = None
 
 
@@ -235,11 +235,7 @@ def onchainos_cmd(args: list[str], timeout: int = 30) -> dict | None:
 # ── Wallet Address ──────────────────────────────────────────────────────────
 
 # Auto-switch to the correct account if ACCOUNT_ID is set in config
-_cfg_account_id = (
-    CFG.get("account_id", "")
-    or os.environ.get("ONCHAINOS_ACCOUNT_ID", "")
-    or os.environ.get("ACCOUNT_ID", "")
-)
+_cfg_account_id = CFG.get("account_id", "") or os.environ.get("ONCHAINOS_ACCOUNT_ID", "") or os.environ.get("ACCOUNT_ID", "")
 if _cfg_account_id:
     try:
         result = subprocess.run(
@@ -323,36 +319,36 @@ def get_eth_price() -> float | None:
 
 
 def get_balances() -> tuple[float, float, bool]:
-    """Get ETH and USDC balances. Returns (eth, usdc, failed)."""
-    data = onchainos_cmd(["wallet", "balance", "--chain", CHAIN_ID], timeout=15)
+    """Get ETH and USDC balances via --all to avoid wallet-switch race condition."""
+    account_id = _cfg_account_id
+    if account_id:
+        data = onchainos_cmd(["wallet", "balance", "--all", "--chain", CHAIN_ID], timeout=15)
+    else:
+        data = onchainos_cmd(["wallet", "balance", "--chain", CHAIN_ID], timeout=15)
     if not data or not data.get("ok") or not data.get("data"):
         log(f"Balance query failed, raw: {json.dumps(data)[:200] if data else 'None'}")
         return 0.0, 0.0, True
-    # Verify returned address matches configured wallet
-    # Address is inside details[].tokenAssets[].address, not at top level
-    details = data["data"].get("details", [])
-    if details and WALLET_ADDR:
-        first_addr = ""
+    eth, usdc = 0.0, 0.0
+    if account_id:
+        # --all returns {details: {accountId: {data: [{tokenAssets: [...]}]}}}
+        acct_data = data["data"].get("details", {}).get(account_id)
+        if not acct_data or not acct_data.get("data"):
+            log(f"Balance: account {account_id} not found in --all response")
+            return 0.0, 0.0, True
+        for chain_detail in acct_data["data"]:
+            for token in chain_detail.get("tokenAssets", []):
+                if token.get("tokenAddress") == "" and token.get("symbol") == "ETH":
+                    eth = float(token.get("balance", "0"))
+                elif token.get("tokenAddress", "").lower() == USDC_ADDR.lower():
+                    usdc = float(token.get("balance", "0"))
+    else:
+        details = data["data"].get("details", [])
         for chain_detail in details:
             for token in chain_detail.get("tokenAssets", []):
-                first_addr = token.get("address", "")
-                if first_addr:
-                    break
-            if first_addr:
-                break
-        if first_addr and first_addr.lower() != WALLET_ADDR.lower():
-            log(
-                f"Balance address mismatch: got {first_addr}, "
-                f"expected {WALLET_ADDR} — wrong account active"
-            )
-            return 0.0, 0.0, True
-    eth, usdc = 0.0, 0.0
-    for chain_detail in details:
-        for token in chain_detail.get("tokenAssets", []):
-            if token.get("tokenAddress") == "" and token.get("symbol") == "ETH":
-                eth = float(token.get("balance", "0"))
-            elif token.get("tokenAddress", "").lower() == USDC_ADDR.lower():
-                usdc = float(token.get("balance", "0"))
+                if token.get("tokenAddress") == "" and token.get("symbol") == "ETH":
+                    eth = float(token.get("balance", "0"))
+                elif token.get("tokenAddress", "").lower() == USDC_ADDR.lower():
+                    usdc = float(token.get("balance", "0"))
     return eth, usdc, False
 
 
@@ -755,12 +751,11 @@ def run_risk_checks(
     # Use smoothed portfolio value to avoid API glitch triggers
     value_history = state.get("_value_history", [])
     stats = state.get("stats", {})
-    initial = stats.get("initial_portfolio_usd")
-    if initial and initial > 0 and len(value_history) >= 3:
+    if stats.get("initial_portfolio_usd") and len(value_history) >= 3:
         # Median of recent values for stop decisions
         smooth_usd = sorted(value_history[-5:])[len(value_history[-5:]) // 2]
-        cost_basis = initial + stats.get("total_deposits_usd", 0)
-        peak = stats.get("portfolio_peak_usd", cost_basis)
+        pnl = calc_pnl(stats, smooth_usd)
+        peak = stats.get("portfolio_peak_usd", pnl["cost_basis"])
 
         # Peak only updates if confirmed by 2 consecutive readings above old peak
         prev_val = value_history[-2] if len(value_history) >= 2 else 0
@@ -768,7 +763,7 @@ def run_risk_checks(
             peak = smooth_usd
             stats["portfolio_peak_usd"] = round(peak, 2)
 
-        pnl_pct = (smooth_usd - cost_basis) / cost_basis if cost_basis > 0 else 0
+        pnl_pct = pnl["pnl_pct"] / 100  # convert to fraction for comparison
         if STOP_LOSS_PCT > 0 and pnl_pct <= -STOP_LOSS_PCT:
             state["stop_triggered"] = (
                 f"stop_loss ({pnl_pct * 100:+.1f}% <= -{STOP_LOSS_PCT * 100:.0f}%)"
@@ -859,9 +854,8 @@ def _broadcast_defi_txs(data: dict, label: str) -> bool:
         if not to_addr or not calldata:
             log(f"  {label} [{tx_type}]: missing to/data, skip")
             continue
-        # Convert hex value to decimal ETH
-        value_wei = int(value, 16) if value.startswith("0x") else int(value)
-        value_eth = str(value_wei / 1e18) if value_wei > 0 else "0"
+        # Convert hex value to decimal wei
+        value_wei = str(int(value, 16) if value.startswith("0x") else int(value))
         broadcast_data = onchainos_cmd(
             [
                 "wallet",
@@ -872,8 +866,8 @@ def _broadcast_defi_txs(data: dict, label: str) -> bool:
                 CHAIN_ID,
                 "--input-data",
                 calldata,
-                "--value",
-                value_eth,
+                "--amt",
+                value_wei,
             ],
             timeout=60,
         )
@@ -1029,8 +1023,7 @@ def defi_deposit(user_input: str, tick_lower: int, tick_upper: int) -> bool:
 
 
 def _wallet_contract_call(tx: dict) -> tuple[str | None, dict | None]:
-    value_wei = int(tx.get("value", "0"))
-    value_eth = str(value_wei / 1e18) if value_wei > 0 else "0"
+    value_wei = str(int(tx.get("value", "0")))
     args = [
         "wallet",
         "contract-call",
@@ -1040,8 +1033,8 @@ def _wallet_contract_call(tx: dict) -> tuple[str | None, dict | None]:
         CHAIN_ID,
         "--input-data",
         tx.get("data", "0x"),
-        "--value",
-        value_eth,
+        "--amt",
+        value_wei,
     ]
     try:
         data = onchainos_cmd(args, timeout=45)
@@ -1246,7 +1239,10 @@ def execute_rebalance(
     if token_id and unclaimed >= MIN_TRADE_USD:
         claimed = defi_claim_fees(token_id)
         if claimed:
-            log(f"  Fees claimed: {json.dumps(claimed)[:200]}")
+            state["stats"]["total_fees_claimed_usd"] = round(
+                state["stats"].get("total_fees_claimed_usd", 0) + unclaimed, 2
+            )
+            log(f"  Fees claimed: ${unclaimed:.2f} (total: ${state['stats']['total_fees_claimed_usd']:.2f})")
     elif token_id:
         log(f"  Skip claim: unclaimed ${unclaimed:.2f} < ${MIN_TRADE_USD:.0f}")
 
@@ -1513,6 +1509,22 @@ def emit(event_type: str, data: dict, notify: bool = False):
 # ── IL Estimation ───────────────────────────────────────────────────────────
 
 
+def calc_pnl(stats: dict, current_usd: float) -> dict:
+    """Calculate PnL in USD terms.
+
+    cost_basis = initial_portfolio_usd + total_deposits_usd (deposits positive, withdrawals negative)
+    pnl = current_usd - cost_basis
+    """
+    initial = stats.get("initial_portfolio_usd")
+    if not initial or initial <= 0:
+        return {"pnl_usd": 0, "pnl_pct": 0, "cost_basis": 0, "valid": False}
+    deposits = stats.get("total_deposits_usd", 0)
+    cost_basis = initial + deposits
+    pnl_usd = round(current_usd - cost_basis, 2)
+    pnl_pct = (pnl_usd / cost_basis * 100) if cost_basis > 0 else 0
+    return {"pnl_usd": pnl_usd, "pnl_pct": pnl_pct, "cost_basis": cost_basis, "valid": True}
+
+
 def estimate_il(entry_price: float, current_price: float) -> float:
     """Estimate impermanent loss percentage for a CL position.
     Simplified: IL = 2*sqrt(r)/(1+r) - 1, where r = current/entry."""
@@ -1590,10 +1602,7 @@ def _tick_inner():
         state["errors"] = errors
         save_state(state)
         log("Failed to get price")
-        emit(
-            "tick",
-            {"status": "error", "reason": "price_fetch_failed", "retriable": True},
-        )
+        emit("tick", {"status": "error", "reason": "price_fetch_failed", "retriable": True})
         return
 
     errors["consecutive"] = 0
@@ -1661,6 +1670,8 @@ def _tick_inner():
             balance_failed = True
             log("LP position query returned 0 value — treating as query failure")
     total_usd = wallet_usd + lp_value
+    # Track unclaimed fees in stats for IL derivation
+    state.setdefault("stats", {})["unclaimed_fee_usd"] = round(unclaimed_fee, 2)
     state["stats"]["unclaimed_fee_usd"] = round(unclaimed_fee, 4)
 
     # Track portfolio value history for smoothing (only when data is reliable)
@@ -1848,7 +1859,9 @@ def _tick_inner():
                 width_change = abs(new_width - old_width) / old_width
                 if width_change < 0.05:
                     # Log at most once per 4h to avoid spam
-                    last_skip = _safe_isoparse(state.get("_last_skip_log", ""))
+                    last_skip = _safe_isoparse(
+                        state.get("_last_skip_log", "")
+                    )
                     now = datetime.now()
                     if not last_skip or (now - last_skip).total_seconds() > 3600:
                         log(
@@ -1909,15 +1922,10 @@ def _tick_inner():
 
     # Emit tick event
     has_event = tick_status not in (
-        "in_range",
-        "no_action",
-        "risk_rejected",
-        "skip_small_change",
+        "in_range", "no_action", "risk_rejected", "skip_small_change",
     )
     stats = state.get("stats", {})
-    initial = stats.get("initial_portfolio_usd")
-    deposits = stats.get("total_deposits_usd", 0)
-    cost_basis = (initial or 0) + deposits
+    pnl = calc_pnl(stats, total_usd)
     tick_data = {
         "status": tick_status,
         "price": round(price, 2),
@@ -1926,7 +1934,7 @@ def _tick_inner():
         "trend": mtf.get("trend", "neutral"),
         "trend_strength": round(mtf.get("strength", 0), 2),
         "portfolio_usd": round(total_usd, 2),
-        "pnl_usd": round(total_usd - cost_basis, 2) if initial else 0,
+        "pnl_usd": pnl["pnl_usd"],
         "balances": {
             "eth": round(eth_bal, 6),
             "usdc": round(usdc_bal, 2),
@@ -1950,7 +1958,7 @@ def _tick_inner():
 
 
 def status():
-    """Print current status."""
+    """Print current status with full portfolio breakdown."""
     state = load_state()
     price = get_eth_price()
     eth_bal, usdc_bal, bal_failed = get_balances()
@@ -1959,34 +1967,72 @@ def status():
     wallet_usd = eth_bal * (price or 0) + usdc_bal
     position = state.get("position")
     lp_value = 0.0
+    unclaimed_fee = 0.0
+    lp_assets = []
     if position and position.get("token_id"):
-        lp_value = get_position_value(position["token_id"])
+        pos_detail = get_position_detail(position["token_id"])
+        lp_value = pos_detail["value"]
+        unclaimed_fee = pos_detail["unclaimed_fee_usd"]
+        lp_assets = pos_detail.get("assets", [])
     total_usd = wallet_usd + lp_value
     stats = state.get("stats", {})
     history = state.get("price_history", [])
 
     print("**CL LP Auto-Rebalancer v1 -- 状态**")
     print(f"> 价格: `${price:.2f}`" if price else "> 价格: 不可用")
-    lp_str = f" + LP `${lp_value:.0f}`" if lp_value > 0 else ""
-    print(
-        f"> 余额: `{eth_bal:.6f}` ETH + `${usdc_bal:.2f}` USDC{lp_str} = **`${total_usd:.0f}`**"
-    )
+
+    # Wallet breakdown
+    print(f"> 钱包: `{eth_bal:.6f}` ETH + `${usdc_bal:.2f}` USDC (`${wallet_usd:.0f}`)")
+
+    # LP breakdown with asset detail
+    if lp_value > 0:
+        lp_detail_parts = []
+        for asset in lp_assets:
+            sym = asset.get("tokenSymbol", "")
+            amt = asset.get("balance", "0")
+            if sym and float(amt) > 0:
+                lp_detail_parts.append(f"{float(amt):.4f} {sym}")
+        lp_detail = " + ".join(lp_detail_parts) if lp_detail_parts else ""
+        lp_line = f"> LP 头寸: `${lp_value:.0f}`"
+        if lp_detail:
+            lp_line += f" ({lp_detail})"
+        if unclaimed_fee > 0.01:
+            lp_line += f" | 待领手续费: `${unclaimed_fee:.2f}`"
+        print(lp_line)
+
+    print(f"> **总价值: `${total_usd:.0f}`**")
 
     if position and position.get("tick_lower"):
         lower_p = position.get("lower_price", tick_to_price(position["tick_lower"]))
         upper_p = position.get("upper_price", tick_to_price(position["tick_upper"]))
         in_range = lower_p <= (price or 0) <= upper_p
+        status_emoji = "✅" if in_range else "⚠️"
         status_str = "范围内" if in_range else "范围外"
-        print(f"> 范围: `${lower_p:.2f}` - `${upper_p:.2f}` ({status_str})")
-        print(
-            f"> Tick: `{position['tick_lower']}` - `{position['tick_upper']}` "
-            f"| token_id: `{position.get('token_id', 'N/A')}`"
-        )
+        # Edge proximity
+        if in_range and price:
+            dist_lower = (price - lower_p) / (upper_p - lower_p)
+            dist_upper = (upper_p - price) / (upper_p - lower_p)
+            edge_dist = min(dist_lower, dist_upper)
+            edge_str = f" | 边缘距离: `{edge_dist:.0%}`"
+        else:
+            edge_str = ""
+        print(f"> {status_emoji} 范围: `${lower_p:.2f}` - `${upper_p:.2f}` ({status_str}{edge_str})")
+        # ASCII tick range visualization
+        if price:
+            bar_w = 30
+            pos_ratio = max(0.0, min(1.0, (price - lower_p) / (upper_p - lower_p)))
+            cursor = round(pos_ratio * (bar_w - 1))
+            bar = list("░" * bar_w)
+            if 0 <= cursor < bar_w:
+                bar[cursor] = "█"
+            print(f"> `${lower_p:.0f} [{''.join(bar)}] ${upper_p:.0f}`")
+            print(f"> `{' ' * (len(f'${lower_p:.0f} [') + cursor)}▲${price:.0f}`")
         if position.get("created_at"):
             created_dt = _safe_isoparse(position["created_at"])
             if created_dt:
                 age_h = (datetime.now() - created_dt).total_seconds() / 3600
-                print(f"> 头寸年龄: `{age_h:.1f}h`")
+                rebal_count = stats.get("total_rebalances", 0)
+                print(f"> 头寸年龄: `{age_h:.1f}h` | 调仓: `{rebal_count}` 次 | token_id: `{position.get('token_id', 'N/A')}`")
     else:
         print("> 头寸: 未建立")
 
@@ -2007,25 +2053,35 @@ def status():
             f"> 动量: 1h `{mtf['momentum_1h']:+.2f}%` | 4h `{mtf['momentum_4h']:+.2f}%`"
         )
 
-    # PnL
-    initial = stats.get("initial_portfolio_usd")
-    deposits = stats.get("total_deposits_usd", 0)
-    print("\n**统计**")
-    if initial and price:
-        cost_basis = initial + deposits
-        total_pnl = round(total_usd - cost_basis, 2)
-        pct = (total_pnl / cost_basis) * 100 if cost_basis else 0
-        print(f"> 总收益: **`${total_pnl:+.2f}`** (`{pct:+.1f}%`)")
+    # PnL & Yield
+    pnl = calc_pnl(stats, total_usd)
+    print("\n**收益**")
+    if pnl["valid"] and price:
+        print(f"> 总收益: **`${pnl['pnl_usd']:+.2f}`** (`{pnl['pnl_pct']:+.1f}%`)")
+        started = _safe_isoparse(stats.get("started_at", ""))
+        if started:
+            days = max((datetime.now() - started).total_seconds() / 86400, 0.01)
+            daily_pct = pnl["pnl_pct"] / days
+            annual_pct = daily_pct * 365
+            print(f"> 日化: `{daily_pct:+.2f}%` | 年化: `{annual_pct:+.1f}%`")
+    # Fee income & derived IL
+    total_fees = stats.get("total_fees_claimed_usd", 0) + unclaimed_fee
+    if total_fees > 0.01:
+        print(f"> LP 手续费: `${total_fees:.2f}` (已领 `${stats.get('total_fees_claimed_usd', 0):.2f}` + 待领 `${unclaimed_fee:.2f}`)")
+    # IL = fees - PnL (ignoring gas, small on L2)
+    if pnl["valid"] and total_fees > 0:
+        il_usd = total_fees - pnl["pnl_usd"]
+        il_pct = (il_usd / pnl["cost_basis"] * 100) if pnl["cost_basis"] > 0 else 0
+        print(f"> 无常损失: `${il_usd:.2f}` (`{il_pct:.2f}%`)")
 
+    print("\n**运行**")
     tir = stats.get("time_in_range_pct", 0)
     rebalances = stats.get("total_rebalances", 0)
-    il = stats.get("estimated_il_pct", 0)
     print(f"> 范围内时间: `{tir:.0f}%` | 调仓次数: `{rebalances}`")
-    print(f"> 估计 IL: `{il:.2f}%`")
 
     stop = state.get("stop_triggered")
     if stop:
-        print(f"\n> **交易已停止**: `{stop}`")
+        print(f"\n> 🔴 **交易已停止**: `{stop}`")
         print("> 使用 `resume-trading` 恢复")
 
 
@@ -2044,11 +2100,7 @@ def report():
     atr = kline_cache.get("atr_pct", 0) if kline_cache else 0
     regime = classify_volatility(atr)
 
-    initial = stats.get("initial_portfolio_usd")
-    deposits = stats.get("total_deposits_usd", 0)
-    cost_basis = (initial or 0) + deposits
-    total_pnl = round(total_usd - cost_basis, 2) if initial else 0
-    pnl_pct = (total_pnl / cost_basis * 100) if cost_basis else 0
+    pnl = calc_pnl(stats, total_usd)
     tir = stats.get("time_in_range_pct", 0)
     total_rebal = stats.get("total_rebalances", 0)
     il = stats.get("estimated_il_pct", 0)
@@ -2066,8 +2118,8 @@ def report():
         "regime": regime,
         "balances": {"eth": round(eth_bal, 6), "usdc": round(usdc_bal, 2)},
         "portfolio_usd": round(total_usd, 2),
-        "pnl_usd": total_pnl,
-        "pnl_pct": round(pnl_pct, 2),
+        "pnl_usd": pnl["pnl_usd"],
+        "pnl_pct": round(pnl["pnl_pct"], 2),
         "time_in_range_pct": round(tir, 1),
         "total_rebalances": total_rebal,
         "estimated_il_pct": round(il, 2),
@@ -2273,14 +2325,7 @@ def analyze():
             "total_rebalances": stats.get("total_rebalances", 0),
             "time_in_range_pct": stats.get("time_in_range_pct", 0),
             "estimated_il_pct": il_pct,
-            "total_pnl": round(
-                total_usd
-                - (
-                    (stats.get("initial_portfolio_usd") or 0)
-                    + stats.get("total_deposits_usd", 0)
-                ),
-                2,
-            ),
+            "total_pnl": calc_pnl(stats, total_usd)["pnl_usd"],
         },
         "rebalance_history": rebalances[-10:],
     }
@@ -2291,7 +2336,7 @@ def analyze():
 def deposit():
     """Manually record deposit/withdrawal."""
     if len(sys.argv) < 3:
-        print("用法: cl_lp_v1.py deposit <金额USD>")
+        print("用法: cl_lp.py deposit <金额USD>")
         print("正数=存入, 负数=取出")
         return
 
