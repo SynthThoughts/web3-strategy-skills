@@ -1413,6 +1413,9 @@ def execute_rebalance(
     current_atr = calc_kline_volatility(candles) if candles else 0
 
     state.pop("_rebalance_in_progress", None)
+    # Get current price for IL tracking
+    rebal_price = get_eth_price() or 0
+
     state["position"] = {
         "token_id": new_token_id,
         "tick_lower": new_tick_lower,
@@ -1421,6 +1424,7 @@ def execute_rebalance(
         "upper_price": new_range["upper_price"],
         "created_at": now_iso,
         "created_atr_pct": round(current_atr, 3),
+        "entry_price": round(rebal_price, 2),
     }
 
     # Record rebalance
@@ -1428,6 +1432,7 @@ def execute_rebalance(
         "time": now_iso,
         "trigger": trigger["trigger"],
         "detail": trigger.get("detail", ""),
+        "price": round(rebal_price, 2),
         "old_range": [old_tick_lower, old_tick_upper],
         "new_range": [new_tick_lower, new_tick_upper],
     }
@@ -1492,7 +1497,8 @@ def _emergency_deposit(state: dict, price: float, trigger: dict) -> bool:
             "lower_price": round(lower_price, 2),
             "upper_price": round(upper_price, 2),
             "created_at": datetime.now().isoformat(),
-            "created_atr_pct": round(half_width, 2),  # already in percentage
+            "created_atr_pct": round(half_width, 2),
+            "entry_price": round(price, 2),
         }
         log(
             f"  Emergency deposit OK: [{tick_lower},{tick_upper}] "
@@ -1963,26 +1969,53 @@ def estimate_il(
     range_lower: float = 0,
     range_upper: float = 0,
 ) -> float:
-    """Estimate impermanent loss for a V3 concentrated liquidity position.
+    """Exact V3 impermanent loss for concentrated liquidity position.
 
-    V2 IL = 2*sqrt(r)/(1+r) - 1, where r = current/entry.
-    V3 amplification = sqrt(p_b/p_a) / (sqrt(p_b/p_a) - 1) for range [p_a, p_b].
-    IL_v3 ≈ IL_v2 * amplification.
+    Compares LP position value vs HODL value at current price.
+    If range bounds not provided, falls back to V2 full-range formula.
+    Handles in-range, below-range, and above-range cases.
+    Returns negative percentage (loss) or 0.
     """
     if entry_price <= 0 or current_price <= 0:
         return 0.0
-    r = current_price / entry_price
-    il_v2 = 2 * math.sqrt(r) / (1 + r) - 1
 
-    # Apply CL concentration amplification if range is provided
-    if range_lower > 0 and range_upper > range_lower:
-        ratio = range_upper / range_lower
-        sqrt_ratio = math.sqrt(ratio)
-        amplification = sqrt_ratio / (sqrt_ratio - 1) if sqrt_ratio > 1 else 1
-        il = il_v2 * amplification
+    # V2 fallback if no range provided
+    if not (range_lower > 0 and range_upper > range_lower):
+        r = current_price / entry_price
+        il = 2 * math.sqrt(r) / (1 + r) - 1
+        return round(il * 100, 2)
+
+    sp0 = math.sqrt(entry_price)  # sqrt of entry price
+    sp1 = math.sqrt(current_price)  # sqrt of current price
+    spa = math.sqrt(range_lower)  # sqrt of range lower
+    spb = math.sqrt(range_upper)  # sqrt of range upper
+
+    # Clamp entry price to range (should be in-range at deposit time)
+    sp0 = max(spa, min(spb, sp0))
+
+    # Token amounts at entry (per unit liquidity L=1)
+    x0 = 1 / sp0 - 1 / spb  # token0 (ETH)
+    y0 = sp0 - spa  # token1 (USDC)
+
+    # HODL value at current price
+    v_hold = x0 * current_price + y0
+    if v_hold <= 0:
+        return 0.0
+
+    # LP position value at current price (handle out-of-range)
+    if current_price <= range_lower:
+        # All token0 (ETH), no token1
+        x1 = 1 / spa - 1 / spb
+        v_lp = x1 * current_price
+    elif current_price >= range_upper:
+        # All token1 (USDC), no token0
+        y1 = spb - spa
+        v_lp = y1
     else:
-        il = il_v2
+        # In range
+        v_lp = 2 * sp1 - current_price / spb - spa
 
+    il = v_lp / v_hold - 1
     return round(il * 100, 2)
 
 
@@ -2256,10 +2289,12 @@ def _tick_inner():
             )
             return
 
-    # IL estimation
+    # IL estimation (use position entry_price, fallback to initial)
     position = state.get("position")
     if position and position.get("created_at"):
-        entry_price = state["stats"].get("initial_eth_price", price)
+        entry_price = position.get("entry_price") or state["stats"].get(
+            "initial_eth_price", price
+        )
         il_pct = estimate_il(
             entry_price,
             price,
@@ -2396,8 +2431,9 @@ def _tick_inner():
     unclaimed_fee_usd = stats.get("unclaimed_fee_usd", 0)
     claimed_fee_usd = stats.get("total_fees_claimed_usd", 0)
 
-    # IL estimation: V3 concentrated formula with range amplification
-    entry_price = stats.get("initial_eth_price")
+    # IL estimation: exact V3 formula, position entry price > initial price
+    pos_entry = position.get("entry_price", 0) if position else 0
+    entry_price = pos_entry or stats.get("initial_eth_price", 0)
     pos_lower = position.get("lower_price", 0) if position else 0
     pos_upper = position.get("upper_price", 0) if position else 0
     il_pct = (
@@ -2584,10 +2620,11 @@ def status():
         print(
             f"> LP 手续费: `${total_fees:.2f}` (已领 `${claimed_fee:.2f}` + 待领 `${unclaimed_fee:.2f}`)"
         )
-    # IL: V3 concentrated formula
+    # IL: exact V3 formula, position entry price > initial price
     pos_lower = position.get("lower_price", 0) if position else 0
     pos_upper = position.get("upper_price", 0) if position else 0
-    entry_price = stats.get("initial_eth_price")
+    pos_entry = position.get("entry_price", 0) if position else 0
+    entry_price = pos_entry or stats.get("initial_eth_price")
     if entry_price and price:
         il_pct = estimate_il(entry_price, price, pos_lower, pos_upper)
         il_usd = round(il_pct / 100 * total_usd, 2)
@@ -2644,8 +2681,9 @@ def report():
     # Recalculate PnL with fresh total_usd (includes LP value)
     pnl = calc_pnl(stats, total_usd)
 
-    # IL: V3 concentrated formula with range amplification
-    entry_price = stats.get("initial_eth_price")
+    # IL: exact V3 formula, position entry price > initial price
+    pos_entry = position.get("entry_price", 0) if position else 0
+    entry_price = pos_entry or stats.get("initial_eth_price")
     pos_lower = position.get("lower_price", 0) if position else 0
     pos_upper = position.get("upper_price", 0) if position else 0
     il_pct = (
@@ -2831,9 +2869,10 @@ def analyze():
     # Current trigger status
     trigger = check_rebalance_triggers(price, state, atr_pct, mtf)
 
-    # IL (V3 concentrated)
-    initial_price = stats.get("initial_eth_price", price)
+    # IL (exact V3, position entry price > initial price)
     position = state.get("position")
+    pos_entry = position.get("entry_price", 0) if position else 0
+    initial_price = pos_entry or stats.get("initial_eth_price", price)
     pos_lower = position.get("lower_price", 0) if position else 0
     pos_upper = position.get("upper_price", 0) if position else 0
     il_pct = estimate_il(initial_price, price, pos_lower, pos_upper)
