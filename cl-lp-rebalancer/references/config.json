@@ -38,5 +38,6 @@
   "min_trade_usd": 5.0,
   "quiet_interval_seconds": 1800,
   "max_consecutive_errors": 5,
-  "cooldown_after_errors_seconds": 3600
+  "cooldown_after_errors_seconds": 3600,
+  "initial_investment_usd": 440
 }

@@ -2168,15 +2168,17 @@ def _tick_inner():
             value_history = value_history[-12:]
         state["_value_history"] = value_history
 
-    # Initial snapshot — only when both wallet and LP data are reliable
-    if (
-        state["stats"].get("initial_portfolio_usd") is None
-        and total_usd > 0
-        and not balance_failed
-    ):
-        state["stats"]["initial_portfolio_usd"] = round(total_usd, 2)
-        state["stats"]["initial_eth_price"] = round(price, 2)
-        log(f"Initial portfolio: ${total_usd:.2f} @ ETH ${price:.2f}")
+    # Initial snapshot — config override > runtime snapshot
+    if state["stats"].get("initial_portfolio_usd") is None and not balance_failed:
+        cfg_initial = CFG.get("initial_investment_usd")
+        if cfg_initial and cfg_initial > 0:
+            state["stats"]["initial_portfolio_usd"] = float(cfg_initial)
+            state["stats"]["initial_eth_price"] = round(price, 2)
+            log(f"Initial portfolio (config): ${cfg_initial} @ ETH ${price:.2f}")
+        elif total_usd > 0:
+            state["stats"]["initial_portfolio_usd"] = round(total_usd, 2)
+            state["stats"]["initial_eth_price"] = round(price, 2)
+            log(f"Initial portfolio (snapshot): ${total_usd:.2f} @ ETH ${price:.2f}")
 
     # MTF analysis
     mtf = analyze_multi_timeframe(history, price)
