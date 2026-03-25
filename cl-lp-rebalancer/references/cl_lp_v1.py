@@ -235,7 +235,11 @@ def onchainos_cmd(args: list[str], timeout: int = 30) -> dict | None:
 # ── Wallet Address ──────────────────────────────────────────────────────────
 
 # Auto-switch to the correct account if ACCOUNT_ID is set in config
-_cfg_account_id = CFG.get("account_id", "") or os.environ.get("ACCOUNT_ID", "")
+_cfg_account_id = (
+    CFG.get("account_id", "")
+    or os.environ.get("ONCHAINOS_ACCOUNT_ID", "")
+    or os.environ.get("ACCOUNT_ID", "")
+)
 if _cfg_account_id:
     try:
         result = subprocess.run(
@@ -325,15 +329,24 @@ def get_balances() -> tuple[float, float, bool]:
         log(f"Balance query failed, raw: {json.dumps(data)[:200] if data else 'None'}")
         return 0.0, 0.0, True
     # Verify returned address matches configured wallet
-    returned_addr = data["data"].get("evmAddress", "")
-    if returned_addr.lower() != WALLET_ADDR.lower():
-        log(
-            f"Balance address mismatch: got {returned_addr}, "
-            f"expected {WALLET_ADDR} — wrong account active"
-        )
-        return 0.0, 0.0, True
-    eth, usdc = 0.0, 0.0
+    # Address is inside details[].tokenAssets[].address, not at top level
     details = data["data"].get("details", [])
+    if details and WALLET_ADDR:
+        first_addr = ""
+        for chain_detail in details:
+            for token in chain_detail.get("tokenAssets", []):
+                first_addr = token.get("address", "")
+                if first_addr:
+                    break
+            if first_addr:
+                break
+        if first_addr and first_addr.lower() != WALLET_ADDR.lower():
+            log(
+                f"Balance address mismatch: got {first_addr}, "
+                f"expected {WALLET_ADDR} — wrong account active"
+            )
+            return 0.0, 0.0, True
+    eth, usdc = 0.0, 0.0
     for chain_detail in details:
         for token in chain_detail.get("tokenAssets", []):
             if token.get("tokenAddress") == "" and token.get("symbol") == "ETH":
@@ -1577,7 +1590,10 @@ def _tick_inner():
         state["errors"] = errors
         save_state(state)
         log("Failed to get price")
-        emit("tick", {"status": "error", "reason": "price_fetch_failed", "retriable": True})
+        emit(
+            "tick",
+            {"status": "error", "reason": "price_fetch_failed", "retriable": True},
+        )
         return
 
     errors["consecutive"] = 0
@@ -1832,9 +1848,7 @@ def _tick_inner():
                 width_change = abs(new_width - old_width) / old_width
                 if width_change < 0.05:
                     # Log at most once per 4h to avoid spam
-                    last_skip = _safe_isoparse(
-                        state.get("_last_skip_log", "")
-                    )
+                    last_skip = _safe_isoparse(state.get("_last_skip_log", ""))
                     now = datetime.now()
                     if not last_skip or (now - last_skip).total_seconds() > 3600:
                         log(
@@ -1895,7 +1909,10 @@ def _tick_inner():
 
     # Emit tick event
     has_event = tick_status not in (
-        "in_range", "no_action", "risk_rejected", "skip_small_change",
+        "in_range",
+        "no_action",
+        "risk_rejected",
+        "skip_small_change",
     )
     stats = state.get("stats", {})
     initial = stats.get("initial_portfolio_usd")
