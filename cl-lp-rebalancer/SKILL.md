@@ -62,7 +62,7 @@ Cron (5min) → Python script → onchainos CLI → OKX Web3 API → Chain
 - Quote: `onchainos swap quote --from <A> --to <B> --amount <amt> --chain <chain>`
 - Swap: `onchainos swap swap --from <A> --to <B> --amount <amt> --chain <chain> --wallet <addr> --slippage <pct>`
 - Approve: `onchainos swap approve --token <addr> --amount <amt> --chain <chain>`
-- Pool Search: `onchainos defi search --chain <chain> --keyword <pair>`
+- Pool Search: `onchainos defi search --chain <chain> --token "<token0>,<token1>" --product-group DEX_POOL`
 - Pool Detail: `onchainos defi detail --investment-id <id> --chain <chain>`
 - Calculate Entry: `onchainos defi calculate-entry --investment-id <id> --chain <chain> --tick-lower <tick> --tick-upper <tick>`
 - Deposit: `onchainos defi deposit --investment-id <id> --chain <chain> --amount0 <amt> --amount1 <amt> --tick-lower <tick> --tick-upper <tick>`
@@ -111,10 +111,10 @@ Ask user to explicitly confirm: "了解风险，继续设置" before proceeding.
 
 ### 0.4 Search & Select Pool
 
-Use `onchainos defi search --chain <chain> --keyword "<token0> <token1>"` to find pools.
+Use `onchainos defi search --chain <chain> --token "<token0>,<token1>" --product-group DEX_POOL` to find pools.
 
 Present results to user:
-- Pool name, fee tier (0.01% / 0.05% / 0.3% / 1%), TVL, APY
+- Pool name, fee tier (0.01% / 0.05% / 0.3% / 1%), TVL, 预估池 APY（`rate` 字段）
 - **Fee tier guidance**:
   - 0.01%: 稳定币对
   - 0.05%: 相关性高的对（ETH/stETH）
@@ -123,16 +123,27 @@ Present results to user:
 
 ### 0.5 Generate config.json
 
-After user confirms pool, fetch detail via `onchainos defi detail` and generate:
+After user confirms pool, fetch detail via `onchainos defi detail` and generate config:
+
+**字段映射**:
+- `investment_id` ← search result `investmentId`
+- `chain_id` ← search result `chainIndex`
+- `platform_id` ← detail `analysisPlatformId`（注意不是 `platformId`）
+- `fee_tier` ← search result `feeRate`
+- `tick_spacing` ← 根据 fee tier 推导：0.01%→1, 0.05%→10, 0.3%→60, 1%→200
+- `token0/token1` ← detail `underlyingToken`。**注意**：如果 token 是 native ETH（`0xeee...`），LP 合约实际用 WETH，需映射为链对应的 WETH 地址（Base: `0x4200000000000000000000000000000000000006`）
+- `native_token` ← 始终为 `0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee`（用于 swap 和余额查询）
 
 ```json
 {
-  "investment_id": "<from search result>",
+  "investment_id": "<from search investmentId>",
   "pool_chain": "<chain>",
-  "chain_id": "<chain_id>",
-  "fee_tier": <fee_tier>,
-  "tick_spacing": <from detail>,
-  "token0": { "symbol": "<sym>", "address": "<addr>", "decimals": <dec> },
+  "chain_id": "<from search chainIndex>",
+  "platform_id": "<from detail analysisPlatformId>",
+  "native_token": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "fee_tier": "<from search feeRate>",
+  "tick_spacing": "<derived from fee_tier>",
+  "token0": { "symbol": "<sym>", "address": "<WETH if native>", "decimals": <dec> },
   "token1": { "symbol": "<sym>", "address": "<addr>", "decimals": <dec> },
   "range_mult": { "low": 1.0, "medium": 1.2, "high": 1.5, "extreme": 2.0 },
   "min_range_pct": 2,
@@ -286,7 +297,7 @@ OKX_PASSPHRASE=...
 
 | Operation | Command | Key Parameters |
 |---|---|---|
-| Search Pools | `onchainos defi search --chain base --keyword "ETH USDC"` | chain, keyword |
+| Search Pools | `onchainos defi search --chain base --token "ETH,USDC" --product-group DEX_POOL` | chain, token, product-group |
 | Pool Detail | `onchainos defi detail --investment-id <id> --chain base` | investment-id |
 | Calculate Entry | `onchainos defi calculate-entry --investment-id <id> --chain base --tick-lower <t> --tick-upper <t>` | ticks, amounts |
 | Deposit | `onchainos defi deposit --investment-id <id> --chain base --amount0 <a> --amount1 <a> --tick-lower <t> --tick-upper <t>` | amounts, ticks |
