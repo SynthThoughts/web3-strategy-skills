@@ -2566,26 +2566,31 @@ def status():
         )
 
     # PnL & Yield
+    # Update unclaimed in stats so calc_pnl includes it for APY
+    stats["unclaimed_fee_usd"] = round(unclaimed_fee, 2)
     pnl = calc_pnl(stats, total_usd)
     print("\n**收益**")
     if pnl["valid"] and price:
-        print(f"> 总收益: **`${pnl['pnl_usd']:+.2f}`** (`{pnl['pnl_pct']:+.1f}%`)")
-        started = _safe_isoparse(stats.get("started_at", ""))
-        if started:
-            days = max((datetime.now() - started).total_seconds() / 86400, 0.01)
-            daily_pct = pnl["pnl_pct"] / days
-            annual_pct = daily_pct * 365
-            print(f"> 日化: `{daily_pct:+.2f}%` | 年化: `{annual_pct:+.1f}%`")
-    # Fee income & derived IL
-    total_fees = stats.get("total_fees_claimed_usd", 0) + unclaimed_fee
+        print(f"> PnL: **`${pnl['pnl_usd']:+.2f}`** (`{pnl['pnl_pct']:+.1f}%`)")
+        print(
+            f"> 年化 APY: Fee `{pnl['fee_apy']:+.1f}%` | Net `{pnl['net_apy']:+.1f}%` (运行 `{pnl['days_running']:.1f}` 天)"
+        )
+    else:
+        print("> PnL: 数据不足")
+    # Fee income
+    claimed_fee = stats.get("total_fees_claimed_usd", 0)
+    total_fees = claimed_fee + unclaimed_fee
     if total_fees > 0.01:
         print(
-            f"> LP 手续费: `${total_fees:.2f}` (已领 `${stats.get('total_fees_claimed_usd', 0):.2f}` + 待领 `${unclaimed_fee:.2f}`)"
+            f"> LP 手续费: `${total_fees:.2f}` (已领 `${claimed_fee:.2f}` + 待领 `${unclaimed_fee:.2f}`)"
         )
-    # IL = fees - PnL (ignoring gas, small on L2)
-    if pnl["valid"] and total_fees > 0:
-        il_usd = total_fees - pnl["pnl_usd"]
-        il_pct = (il_usd / pnl["cost_basis"] * 100) if pnl["cost_basis"] > 0 else 0
+    # IL: V3 concentrated formula
+    pos_lower = position.get("lower_price", 0) if position else 0
+    pos_upper = position.get("upper_price", 0) if position else 0
+    entry_price = stats.get("initial_eth_price")
+    if entry_price and price:
+        il_pct = estimate_il(entry_price, price, pos_lower, pos_upper)
+        il_usd = round(il_pct / 100 * total_usd, 2)
         print(f"> 无常损失: `${il_usd:.2f}` (`{il_pct:.2f}%`)")
 
     print("\n**运行**")
