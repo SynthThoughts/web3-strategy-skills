@@ -1618,7 +1618,7 @@ def _build_notification(tier: str, data: dict) -> dict:
             {"name": "价格", "value": f"${price:,.2f}", "inline": True},
             {"name": "范围", "value": f"${lower:,.0f} — ${upper:,.0f}", "inline": True},
             {"name": "触发", "value": trigger or "—", "inline": True},
-            {"name": "费用已领", "value": f"${fees:,.2f}", "inline": True},
+            {"name": "Fee Claimed", "value": f"${fees:,.2f}", "inline": True},
             {"name": "PnL", "value": f"${pnl_usd:+,.2f}", "inline": True},
         ]
         visual = _range_visual(price, lower, upper) if lower and upper else ""
@@ -1629,7 +1629,7 @@ def _build_notification(tier: str, data: dict) -> dict:
             f"💰 价格: `${price:,.2f}`",
             f"📐 范围: `${lower:,.0f} — ${upper:,.0f}`",
             f"🎯 触发: `{trigger}`" if trigger else None,
-            f"💵 费用: `${fees:,.2f}`",
+            f"💵 Fee Claimed: `${fees:,.2f}`",
             f"📈 PnL: `${pnl_usd:+,.2f}`",
             f"`{visual}`" if visual else None,
             f"_tx: {tx[:10]}...{tx[-6:]}_" if tx else None,
