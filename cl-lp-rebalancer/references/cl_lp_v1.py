@@ -684,21 +684,12 @@ def check_rebalance_triggers(
                 "detail": f"{old_regime}->{new_regime} (delta {vol_change:.0%})",
             }
 
-    # [4] Time decay — maintenance (>24h first, 4h retry after skip)
+    # [4] Time decay — maintenance (>24h)
     created_at = position.get("created_at")
     if created_at:
         created_dt = _safe_isoparse(created_at)
-        last_skip = _safe_isoparse(state.get("_last_time_decay_skip", ""))
-        if last_skip:
-            age_seconds = (datetime.now() - last_skip).total_seconds()
-            threshold = 14400  # 4h retry
-        elif created_dt:
-            age_seconds = (datetime.now() - created_dt).total_seconds()
-            threshold = 86400  # 24h first trigger
-        else:
-            age_seconds = 0
-            threshold = 86400
-        if age_seconds > threshold:
+        age_seconds = (datetime.now() - created_dt).total_seconds() if created_dt else 0
+        if age_seconds > 86400:  # 24h
             return {
                 "trigger": "time_decay",
                 "priority": "maintenance",
@@ -1921,12 +1912,17 @@ def _tick_inner():
             if old_width > 0:
                 width_change = abs(new_width - old_width) / old_width
                 if width_change < 0.05:
-                    log(
-                        f"Range change too small ({width_change:.1%} < 5%) — skipping "
-                        f"[{trigger['trigger']}]"
+                    # Log at most once per 4h to avoid spam
+                    last_skip = _safe_isoparse(
+                        state.get("_last_skip_log", "")
                     )
-                    if trigger["trigger"] == "time_decay":
-                        state["_last_time_decay_skip"] = datetime.now().isoformat()
+                    now = datetime.now()
+                    if not last_skip or (now - last_skip).total_seconds() > 14400:
+                        log(
+                            f"Range change too small ({width_change:.1%} < 5%)"
+                            f" — skipping [{trigger['trigger']}]"
+                        )
+                        state["_last_skip_log"] = now.isoformat()
                     trigger = None
                     tick_status = "skip_small_change"
 
