@@ -1,0 +1,5 @@
+.env
+grid_state_v1.json
+grid_bot_v1.log
+*.json.bak
+__pycache__/

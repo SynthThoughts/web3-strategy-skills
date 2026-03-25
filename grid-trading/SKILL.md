@@ -4,9 +4,28 @@ description: "Dynamic grid trading strategy for any token pair on EVM L2 chains 
 license: Apache-2.0
 metadata:
   author: SynthThoughts
-  version: "1.3.0"
+  version: "1.4.0"
   pattern: "pipeline, tool-wrapper"
   steps: "5"
+  openclaw:
+    requires:
+      env:
+        - OKX_API_KEY
+        - OKX_SECRET_KEY
+        - OKX_PASSPHRASE
+        - WALLET_ADDR
+      optional_env:
+        - ONCHAINOS_ACCOUNT_ID
+        - DISCORD_CHANNEL_ID
+        - DISCORD_BOT_TOKEN
+      bins:
+        - onchainos
+        - python3
+    primaryEnv: OKX_API_KEY
+    entrypoint: references/eth_grid_v1.py
+    os:
+      - darwin
+      - linux
 ---
 
 # Dynamic Grid Trading Strategy v1.0

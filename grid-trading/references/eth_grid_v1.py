@@ -26,13 +26,16 @@ from pathlib import Path
 
 
 def _load_env():
-    env_file = Path(__file__).parent / ".env"
-    if env_file.exists():
-        for line in env_file.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip())
+    # Check script dir first, then parent (skill root for openclaw installs)
+    for base in [Path(__file__).parent, Path(__file__).parent.parent]:
+        env_file = base / ".env"
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+            return
 
 
 _load_env()
@@ -81,10 +84,15 @@ if _account_id:
     try:
         _sw = subprocess.run(
             ["onchainos", "wallet", "switch", _account_id],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if _sw.returncode != 0:
-            print(f"WARN: onchainos account switch failed: {_sw.stderr.strip()}", file=sys.stderr)
+            print(
+                f"WARN: onchainos account switch failed: {_sw.stderr.strip()}",
+                file=sys.stderr,
+            )
     except Exception as e:
         print(f"WARN: onchainos account switch error: {e}", file=sys.stderr)
 
@@ -127,7 +135,9 @@ TRAILING_STOP_PCT = 0.10  # stop at 10% drawdown from peak
 STOP_AUTO_RESUME = True  # enable automatic recovery after stop
 STOP_COOLDOWN_MINUTES = 60  # minimum wait time after stop before considering resume
 STOP_RESUME_BOUNCE_PCT = 0.01  # price must recover 1% from stop price
-STOP_RESUME_MAX_BEARISH = 0.5  # resume only if trend strength < this (not strongly bearish)
+STOP_RESUME_MAX_BEARISH = (
+    0.5  # resume only if trend strength < this (not strongly bearish)
+)
 
 
 # Position limits (trend-asymmetric)
@@ -266,9 +276,7 @@ def get_balances() -> tuple[float, float] | None:
     """Get ETH and USDC balances. Returns None on query failure."""
     data = onchainos_cmd(["wallet", "balance", "--chain", CHAIN_ID], timeout=15)
     if not data or not data.get("ok") or not data.get("data"):
-        log(
-            f"Balance query failed, raw: {json.dumps(data)[:200] if data else 'None'}"
-        )
+        log(f"Balance query failed, raw: {json.dumps(data)[:200] if data else 'None'}")
         return None
     eth, usdc = 0.0, 0.0
     details = data["data"].get("details", [])
@@ -1568,20 +1576,32 @@ def tick():
             stop_time_str = state.get("stop_time")
             cooldown_ok = True
             if stop_time_str:
-                elapsed_min = (datetime.now() - datetime.fromisoformat(stop_time_str)).total_seconds() / 60
+                elapsed_min = (
+                    datetime.now() - datetime.fromisoformat(stop_time_str)
+                ).total_seconds() / 60
                 cooldown_ok = elapsed_min >= STOP_COOLDOWN_MINUTES
                 if not cooldown_ok:
-                    resume_reasons.append(f"冷却中 {elapsed_min:.0f}/{STOP_COOLDOWN_MINUTES}min")
+                    resume_reasons.append(
+                        f"冷却中 {elapsed_min:.0f}/{STOP_COOLDOWN_MINUTES}min"
+                    )
 
             bounce_pct = (price - stop_price) / stop_price if stop_price > 0 else 0
             bounce_ok = bounce_pct >= STOP_RESUME_BOUNCE_PCT
             if not bounce_ok:
-                resume_reasons.append(f"反弹 {bounce_pct*100:+.1f}% < {STOP_RESUME_BOUNCE_PCT*100:.0f}%")
+                resume_reasons.append(
+                    f"反弹 {bounce_pct * 100:+.1f}% < {STOP_RESUME_BOUNCE_PCT * 100:.0f}%"
+                )
 
             trend_ok = True
-            if mtf and mtf.get("trend") == "bearish" and mtf.get("strength", 0) >= STOP_RESUME_MAX_BEARISH:
+            if (
+                mtf
+                and mtf.get("trend") == "bearish"
+                and mtf.get("strength", 0) >= STOP_RESUME_MAX_BEARISH
+            ):
                 trend_ok = False
-                resume_reasons.append(f"趋势仍强熊 strength={mtf.get('strength', 0):.2f}")
+                resume_reasons.append(
+                    f"趋势仍强熊 strength={mtf.get('strength', 0):.2f}"
+                )
 
             can_resume = cooldown_ok and bounce_ok and trend_ok
 
@@ -1606,7 +1626,7 @@ def tick():
                         "color": 0x00C853,
                         "description": (
                             f"止损原因: {old_trigger}\n"
-                            f"恢复价格: ${price:.2f} (反弹 {bounce_pct*100:+.1f}%)\n"
+                            f"恢复价格: ${price:.2f} (反弹 {bounce_pct * 100:+.1f}%)\n"
                             f"新基准: ${total_usd:.0f}\n"
                             f"将以当前价格重建网格"
                         ),
@@ -1616,7 +1636,9 @@ def tick():
             )
             # Fall through to normal tick logic (grid rebuild etc.)
         else:
-            reason_str = ", ".join(resume_reasons) if resume_reasons else "auto-resume disabled"
+            reason_str = (
+                ", ".join(resume_reasons) if resume_reasons else "auto-resume disabled"
+            )
             log(f"Auto-resume not ready: {reason_str}")
             # Update balances to prevent repeated withdrawal detection
             state["last_balances"] = {
@@ -1799,7 +1821,7 @@ def tick():
         skip_reason = None
 
         # ── Zone filter: block BUY at top, block SELL at bottom ──
-        buy_ceil = 4   # BUY allowed at L0-L4, blocked at L5-L6
+        buy_ceil = 4  # BUY allowed at L0-L4, blocked at L5-L6
         sell_floor = 1  # SELL allowed at L1-L6, blocked at L0
         if direction == "BUY" and current_level > buy_ceil:
             skip_reason = f"above buy-zone (L{current_level} > L{buy_ceil})"
@@ -2767,6 +2789,27 @@ def retry():
         save_state(state)
         print(f"**重试成功**: {dir_cn} `${trade_usd:.2f}` @ `${price:.2f}`")
         log(f"RETRY TX: https://basescan.org/tx/{tx_hash}")
+        # Discord notification for retry success
+        retry_embed = {
+            "title": f"\u267b\ufe0f 重试{dir_cn}成功",
+            "color": 0x00C853 if direction == "SELL" else 0x2979FF,
+            "fields": [
+                {"name": "价格", "value": f"${price:.2f}", "inline": True},
+                {"name": "金额", "value": f"${trade_usd:.2f}", "inline": True},
+                {
+                    "name": "层级",
+                    "value": f"L{last_fail['grid_from']}→L{last_fail['grid_to']}",
+                    "inline": True,
+                },
+                {
+                    "name": "交易",
+                    "value": f"[BaseScan](https://basescan.org/tx/{tx_hash})",
+                    "inline": False,
+                },
+            ],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        _send_discord_embed([retry_embed])
         _emit_json(
             {
                 "status": "retry_success",
