@@ -1651,9 +1651,9 @@ class CrossFundingEngine:
         self.bn = bn_client
         self.scanner = scanner
         self.cfg = cfg
-        self.hl_budget: float = cfg["hl_budget_usd"]
-        self.bn_budget: float = cfg["bn_budget_usd"]
-        self.leverage: int = cfg["leverage"]
+        self.hl_budget_cfg: float = cfg.get("hl_budget_usd", 0)
+        self.bn_budget_cfg: float = cfg.get("bn_budget_usd", 0)
+        self.leverage: int = cfg.get("leverage", 1)
         self.min_apr: float = cfg["min_apr_pct"]
         self.stability_snapshots: int = cfg.get("stability_snapshots", 3)
         self.close_spread_threshold: float = cfg.get("close_spread_threshold", 0.0001)
@@ -1669,6 +1669,16 @@ class CrossFundingEngine:
     def _save(self, state: dict) -> None:
         state["last_tick"] = datetime.now(timezone.utc).isoformat()
         save_state(STATE_NAME, state)
+
+    def _get_budgets(self) -> tuple[float, float]:
+        """Return (hl_budget, bn_budget). If config is 0, read actual balance."""
+        hl = (
+            self.hl_budget_cfg if self.hl_budget_cfg > 0 else self.hl.get_usdc_balance()
+        )
+        bn = (
+            self.bn_budget_cfg if self.bn_budget_cfg > 0 else self.bn.get_usdt_balance()
+        )
+        return hl, bn
 
     # ---- Client routing ----
 
@@ -1812,7 +1822,8 @@ class CrossFundingEngine:
             emit_error("price", RuntimeError(f"invalid price for {coin}: {price}"))
             return False
 
-        budget = min(self.hl_budget, self.bn_budget)
+        hl_budget, bn_budget = self._get_budgets()
+        budget = min(hl_budget, bn_budget)
         conservative = budget * 0.5
         raw_size = self._calculate_size(conservative, price)
 
@@ -1938,8 +1949,8 @@ class CrossFundingEngine:
             "entry_bn_rate": bn_rate,
             "size": size,
             "entry_price": price,
-            "budget_hl": self.hl_budget,
-            "budget_bn": self.bn_budget,
+            "budget_hl": hl_budget,
+            "budget_bn": bn_budget,
             "entry_hl_balance": entry_hl_balance,
             "entry_bn_balance": entry_bn_balance,
             "entry_total_balance": round(entry_hl_balance + entry_bn_balance, 2),

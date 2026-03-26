@@ -211,11 +211,11 @@ bn.close_position("ETH")
 
 | Parameter | Default | Description |
 |---|---|---|
-| `hl_budget_usd` | `300` | Hyperliquid 单边预算 (USDC) |
-| `bn_budget_usd` | `450` | Binance 单边预算 (USDT) |
+| `hl_budget_usd` | `0` | Hyperliquid 单边预算 (USDC)，0 = 自动读取账户余额 |
+| `bn_budget_usd` | `0` | Binance 单边预算 (USDT)，0 = 自动读取账户余额 |
 | `min_apr_pct` | `10.0` | 最低年化收益率门槛 (%) |
 | `min_confidence` | `"medium"` | VarFunding 最低置信度 (low/medium/high) |
-| `leverage` | `3` | 杠杆倍数 |
+| `leverage` | `1` | 杠杆倍数（默认无杠杆） |
 | `stability_snapshots` | `3` | 稳定性验证所需快照数 |
 | `stability_max_std_ratio` | `0.3` | Spread 标准差/均值上限 |
 | `close_spread_threshold` | `0.0001` | 平仓 spread 下限（8h 费率差，≈10.95% APR） |
