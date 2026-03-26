@@ -427,7 +427,7 @@ while IFS= read -r f; do
 done <<< "$SCAN_FILES"
 
 # 3. .env 文件不应被发布
-if find "$SKILL_DIR" -name '.env' -o -name '.env.*' -o -name 'env.local*' 2>/dev/null | grep -q .; then
+if find "$SKILL_DIR" \( -name '.env' -o -name '.env.*' -o -name 'env.local*' \) ! -name '.env.example' ! -name '.env.template' 2>/dev/null | grep -q .; then
     fail "Skill 目录包含 .env 文件，禁止发布"
     SECRETS_FOUND=$((SECRETS_FOUND + 1))
 fi

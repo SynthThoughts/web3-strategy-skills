@@ -65,6 +65,13 @@
 
 - 清理旧备份（保留最近 3 个）
 - 向 Lead 报告结果 + 更新 state.json
+- **写入 memory**：部署成功后，必须将以下信息保存到 memory（key 建议: `core_strategy_deployment_paths`），供后续查询策略状态时使用：
+  - 策略名称、状态（LIVE/STOPPED）
+  - 脚本路径、配置文件路径、状态文件路径
+  - 调度方式（cron 表达式）
+  - tick / report 的完整执行命令（含 `cd` + `source .env` + 运行命令）
+  - 关联钱包地址
+  - 如果 memory 中已有同 key 的条目，**更新而非新增**，保持单一信源
 
 ## 回滚
 

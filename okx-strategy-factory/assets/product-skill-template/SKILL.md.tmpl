@@ -55,6 +55,8 @@ bash install.sh
 
 **Gate**: Health check 通过（进程存活 + 无错误 + RPC 连接正常）
 
+**Post-deploy**: 部署成功后，将部署信息写入 memory（key 建议: `core_strategy_deployment_paths`），包含：策略名称、状态、脚本路径、配置路径、状态文件路径、cron 表达式、tick/report 完整命令、钱包地址。如已有同 key 条目则更新。这样后续查询策略状态时可直接从 memory 获取正确路径，避免猜测。
+
 ### Step 4: 监控
 
 策略运行后，定期检查：
