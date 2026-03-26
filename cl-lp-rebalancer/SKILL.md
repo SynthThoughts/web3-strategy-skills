@@ -15,19 +15,6 @@ Cron 驱动的 Uniswap V3 集中流动性自动调仓机器人，运行在 EVM L
 
 每个 tick：获取价格 → 波动率分析 → 范围计算 → 调仓决策 → 执行调仓 → 报告。
 
-## 与 Grid Trading 的区别
-
-| 维度 | Grid Trading | CL LP Rebalancer |
-|------|-------------|------------------|
-| 收益来源 | 网格价差（低买高卖） | LP 手续费（做市） |
-| 链上操作 | swap 买卖 | add/remove liquidity + claim fees |
-| 核心参数 | 网格间距、层数 | 范围宽度、tick 间距 |
-| 波动率响应 | 调整网格宽度 | 调整范围宽度 + 是否调仓 |
-| 持仓形式 | 两种代币余额 | NFT position (LP token) |
-| 风险特征 | 单边行情踏空 | 无常损失 (IL) |
-| 调仓频率 | 每 tick 可能交易 | 仅在触发条件时调仓 |
-| gas 敏感度 | 低（单次 swap） | 高（多步操作：claim+remove+swap+deposit） |
-
 ## Architecture
 
 ```
