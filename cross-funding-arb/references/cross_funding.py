@@ -422,6 +422,39 @@ def _build_notification(tier: str, data: dict) -> dict | None:
             "text": "\n".join(text_lines),
         }
 
+    # ── Opportunity Alert (APR ≥ 20%) ───────────────────────────────────
+    if tier == "opportunity_alert":
+        opps = data.get("opportunities", [])
+        count = data.get("count", 0)
+
+        lines = [f"🔍 **{count} 个套利机会 · APR ≥ 20%**"]
+        fields = []
+        for o in opps:
+            coin = o["coin"]
+            apr = o["apr"]
+            long_ex = _EX_SHORT.get(o["long"], o["long"])
+            short_ex = _EX_SHORT.get(o["short"], o["short"])
+            lines.append(
+                f"• `{coin}` — `{apr:.1f}%` APR · Long `{long_ex}` / Short `{short_ex}`"
+            )
+            fields.append(
+                {
+                    "name": coin,
+                    "value": f"{apr:.1f}% APR · L:{long_ex} S:{short_ex}",
+                    "inline": True,
+                }
+            )
+
+        return {
+            "tier": "opportunity_alert",
+            "discord": {
+                "title": f"🔍 {count} 个套利机会 · APR ≥ 20%",
+                "color": 0x3498DB,
+                "fields": fields,
+            },
+            "text": "\n".join(lines),
+        }
+
     # ── Hourly Pulse ─────────────────────────────────────────────────────
     if tier == "hourly_pulse":
         coin = data.get("coin", "?")
@@ -1602,6 +1635,9 @@ class VarFundingScanner:
 
         results.sort(key=lambda x: x["estimated_apr"], reverse=True)
 
+        # Filter high-APR opportunities for notification
+        hot = [r for r in results if r["estimated_apr"] >= 20.0]
+
         emit(
             "varfunding_scan",
             {
@@ -1612,6 +1648,25 @@ class VarFundingScanner:
                 ],
             },
         )
+
+        if hot:
+            emit(
+                "opportunity_alert",
+                {
+                    "count": len(hot),
+                    "opportunities": [
+                        {
+                            "coin": r["coin"],
+                            "apr": round(r["estimated_apr"], 1),
+                            "spread": round(r["spread"], 6),
+                            "long": r["long_exchange"],
+                            "short": r["short_exchange"],
+                        }
+                        for r in hot[:5]
+                    ],
+                },
+                tier="opportunity_alert",
+            )
 
         return results
 
@@ -2334,7 +2389,8 @@ def tick() -> None:
                 cb.record_error("open_position")
                 return
         else:
-            # Has position: health check + switch evaluation
+            # Has position: health check + switch evaluation + scan opportunities
+            engine.scan_opportunities()  # always scan (triggers opportunity_alert)
             switched = engine.check_and_switch()
             if not switched:
                 health = engine.check_health()
