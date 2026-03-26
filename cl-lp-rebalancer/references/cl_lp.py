@@ -172,6 +172,91 @@ def _get_telegram_config() -> tuple:
 
 TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID = _get_telegram_config()
 
+# ── External portfolio (optional) ─────────────────────────────────────────
+
+HL_WALLET_ADDR = os.environ.get("HL_WALLET_ADDR", "")
+BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
+BINANCE_SECRET_KEY = os.environ.get("BINANCE_SECRET_KEY", "")
+
+
+def _query_hl_balance() -> float:
+    """Query Hyperliquid account value via public info API (no auth needed)."""
+    if not HL_WALLET_ADDR:
+        return 0.0
+    try:
+        import urllib.request
+
+        payload = json.dumps(
+            {"type": "clearinghouseState", "user": HL_WALLET_ADDR}
+        ).encode()
+        req = urllib.request.Request(
+            "https://api.hyperliquid.xyz/info",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        value = float(data.get("marginSummary", {}).get("accountValue", 0))
+        # Also check spot balances
+        try:
+            spot_payload = json.dumps(
+                {"type": "spotClearinghouseState", "user": HL_WALLET_ADDR}
+            ).encode()
+            spot_req = urllib.request.Request(
+                "https://api.hyperliquid.xyz/info",
+                data=spot_payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(spot_req, timeout=10) as resp2:
+                spot_data = json.loads(resp2.read())
+            for bal in spot_data.get("balances", []):
+                if bal.get("coin") == "USDC":
+                    value += float(bal.get("total", 0))
+        except Exception:
+            pass
+        return value
+    except Exception:
+        return 0.0
+
+
+def _query_binance_balance() -> float:
+    """Query Binance Futures USDT balance (signed request)."""
+    if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
+        return 0.0
+    try:
+        import hashlib
+        import hmac
+        import urllib.request
+
+        ts = int(time.time() * 1000)
+        query = f"timestamp={ts}&recvWindow=10000"
+        sig = hmac.new(
+            BINANCE_SECRET_KEY.encode(), query.encode(), hashlib.sha256
+        ).hexdigest()
+        url = f"https://fapi.binance.com/fapi/v2/balance?{query}&signature={sig}"
+        req = urllib.request.Request(url, headers={"X-MBX-APIKEY": BINANCE_API_KEY})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        for asset in data:
+            if asset.get("asset") == "USDT":
+                return float(asset.get("balance", 0))
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def query_external_portfolio() -> dict:
+    """Query all external platform balances. Returns {platform: usd_value}."""
+    result = {}
+    hl = _query_hl_balance()
+    if hl > 0:
+        result["HL"] = round(hl, 2)
+    bn = _query_binance_balance()
+    if bn > 0:
+        result["Binance"] = round(bn, 2)
+    return result
+
+
 # ── Multi-Timeframe settings (from grid-trading) ───────────────────────────
 
 MTF_SHORT_PERIOD = 5
@@ -2549,8 +2634,9 @@ def _tick_inner():
     notify = tier != ""
     emit("tick", tick_data, notify=notify, tier=tier)
 
-    # Cache snapshot for fast status queries
+    # Cache snapshot for fast status queries (includes external portfolio)
     tick_data["_cached_at"] = datetime.now().isoformat()
+    tick_data["external_portfolio"] = query_external_portfolio()
     state["_cached_snapshot"] = tick_data
     save_state(state)
 
@@ -2570,6 +2656,20 @@ def _print_status_from_snapshot(snap: dict, state: dict, cached_age_s: float = 0
     lp_assets = bals.get("lp_assets", [])
     total_usd = snap.get("portfolio_usd", 0)
     unclaimed_fee = snap.get("unclaimed_fee_usd", 0)
+
+    # ── Portfolio (cross-platform) ──
+    ext = snap.get("external_portfolio", {})
+    if ext or total_usd > 0:
+        print("**Portfolio**")
+        grand_total = 0.0
+        for platform, value in ext.items():
+            print(f"> {platform}: `${value:,.2f}`")
+            grand_total += value
+        if total_usd > 0:
+            print(f"> Base (CL-LP): `${total_usd:,.2f}`")
+            grand_total += total_usd
+        print(f"> **Total: `${grand_total:,.2f}`**")
+        print()
 
     header = "**CL LP Auto-Rebalancer v1 -- 状态**"
     if cached_age_s > 0:
@@ -2785,6 +2885,8 @@ def status():
             "lower_price": position.get("lower_price"),
             "upper_price": position.get("upper_price"),
         }
+
+    live_snap["external_portfolio"] = query_external_portfolio()
 
     _print_status_from_snapshot(live_snap, state)
 
