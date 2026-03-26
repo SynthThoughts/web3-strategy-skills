@@ -417,13 +417,22 @@ cp .env.example ~/.zeroclaw-strategy/skills/cross-funding-arb/references/.env
 ```bash
 SKILL_DIR=~/.openclaw/skills/cross-funding-arb/references
 
-# tick: 每 5 分钟
-openclaw cron add --expr "*/5 * * * *" --shell \
-  "cd $SKILL_DIR && set -a && . ./.env && set +a && python3 cross_funding.py tick"
+# tick: 每 5 分钟（主会话执行 shell 命令）
+openclaw cron add \
+  --name "cross-funding-tick" \
+  --cron "*/5 * * * *" \
+  --session main \
+  --system-event "cd $SKILL_DIR && set -a && . ./.env && set +a && python3 cross_funding.py tick"
 
-# 日报: 每天 00:00 UTC
-openclaw cron add --expr "0 0 * * *" --agent \
-  "执行跨交易所资金费率套利日报: cd $SKILL_DIR && set -a && . ./.env && set +a && python3 cross_funding.py report。将完整输出结果总结后回复我。"
+# 日报: 每天 00:00 UTC（隔离会话，结果投递到 Discord）
+openclaw cron add \
+  --name "cross-funding-report" \
+  --cron "0 0 * * *" \
+  --tz "UTC" \
+  --session isolated \
+  --message "执行跨交易所资金费率套利日报: cd $SKILL_DIR && set -a && . ./.env && set +a && python3 cross_funding.py report。将完整输出结果总结后回复我。" \
+  --announce \
+  --channel discord
 ```
 
 ### ZeroClaw Cron
