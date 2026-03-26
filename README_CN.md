@@ -11,6 +11,7 @@
 | [okx-strategy-factory](./okx-strategy-factory/) | v1.0.0 | 本地 (Claude Code / Cursor / Gemini CLI / Codex) | 元技能：协调 5 个 AI 智能体，完成 OKX OnchainOS 交易策略的开发、回测、部署、发布和迭代全流程。 |
 | [grid-trading](./grid-trading/) | v1.0.0 | 服务器 (OpenClaw / VPS cron) | EVM L2 链上动态网格交易。多时间框架分析、趋势自适应仓位、非对称网格步长。 |
 | [cl-lp-rebalancer](./cl-lp-rebalancer/) | v1.0.0 | 服务器 (OpenClaw / VPS cron) | DEX 集中流动性 LP 区间再平衡器。 |
+| [cross-funding-arb](./cross-funding-arb/) | v1.0.0 | 服务器 (OpenClaw / VPS cron) | 跨交易所永续合约资金费率套利。Hyperliquid + Binance Delta 中性对冲。 |
 | [polymarket-arb-scanner](./polymarket-arb-scanner/) | v1.0.0 | 服务器 (OpenClaw / VPS cron) | Polymarket CLOB 三层套利检测：单条件、负风险多结果、跨市场隐含关系。 |
 
 ## 整体架构
@@ -32,6 +33,8 @@
 │  服务器: VPS / OpenClaw                                    │
 │                                                            │
 │  grid-trading           (每 5 分钟 cron → tick → 交易)     │
+│  cl-lp-rebalancer       (每 5 分钟 cron → 调仓)            │
+│  cross-funding-arb      (每 5 分钟 cron → 套利)            │
 │  polymarket-arb-scanner (cron → 扫描 → 告警)               │
 │                                                            │
 └────────────────────────────────────────────────────────────┘
@@ -79,6 +82,8 @@ cp -r okx-strategy-factory /path/to/project/.gemini/skills/
 **ClawHub**（推荐）:
 ```bash
 npx clawhub install grid-trading
+npx clawhub install cl-lp-rebalancer
+npx clawhub install cross-funding-arb
 npx clawhub install polymarket-arb-scanner
 ```
 
@@ -131,9 +136,11 @@ cat grid-trading/SKILL.md | pbcopy   # macOS 复制到剪贴板
 
 | 依赖 | 用途 | 安装方式 |
 |------|------|----------|
-| onchainos CLI | grid-trading, strategy-factory | `npx skills add okx/onchainos-skills` |
-| OKX API Key | 所有交易技能 | 通过 1Password 或环境变量 |
-| OnchainOS 钱包 | grid-trading | `onchainos wallet login` |
+| onchainos CLI | grid-trading, cl-lp-rebalancer, strategy-factory | `npx skills add okx/onchainos-skills` |
+| OKX API Key | grid-trading, cl-lp-rebalancer | 通过 1Password 或环境变量 |
+| OnchainOS 钱包 | grid-trading, cl-lp-rebalancer | `onchainos wallet login` |
+| Hyperliquid 私钥 | cross-funding-arb | EIP-712 签名密钥或 Agent Wallet |
+| Binance Futures API Key | cross-funding-arb | 需开通 USDT-M 合约权限 |
 | Python 3.10+ | 策略脚本 | 系统包管理器 |
 | VPS（可选） | 7×24 交易 | 任意 Linux 服务器 |
 | 1Password CLI（可选） | 安全凭证管理 | `brew install 1password-cli` |

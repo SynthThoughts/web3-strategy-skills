@@ -11,6 +11,7 @@ Reusable Web3 trading skills for AI coding agents. Each skill is a self-containe
 | [okx-strategy-factory](./okx-strategy-factory/) | v1.0.0 | Local (Claude Code / Cursor / Gemini CLI / Codex) | Meta-skill: coordinates 5 AI agents to develop, backtest, deploy, publish, and iterate OKX OnchainOS trading strategies. |
 | [grid-trading](./grid-trading/) | v1.0.0 | Server (OpenClaw / VPS cron) | Dynamic grid trading on EVM L2 chains. Multi-timeframe analysis, trend-adaptive sizing, asymmetric grid steps. |
 | [cl-lp-rebalancer](./cl-lp-rebalancer/) | v1.0.0 | Server (OpenClaw / VPS cron) | Concentrated liquidity LP range rebalancer for DEX positions. |
+| [cross-funding-arb](./cross-funding-arb/) | v1.0.0 | Server (OpenClaw / VPS cron) | Cross-exchange perpetual funding rate arbitrage. Delta-neutral positions across Hyperliquid and Binance. |
 | [polymarket-arb-scanner](./polymarket-arb-scanner/) | v1.0.0 | Server (OpenClaw / VPS cron) | Three-layer arbitrage detection on Polymarket CLOB: single-condition, neg-risk multi-outcome, and cross-market implication. |
 
 ## How They Fit Together
@@ -31,7 +32,9 @@ Reusable Web3 trading skills for AI coding agents. Each skill is a self-containe
 ┌──────────────────────────────────────────────────────▼────┐
 │  SERVER: VPS / OpenClaw                                   │
 │                                                           │
-│  grid-trading          (cron every 5min → tick → trade)   │
+│  grid-trading           (cron every 5min → tick → trade)  │
+│  cl-lp-rebalancer       (cron every 5min → rebalance)     │
+│  cross-funding-arb      (cron every 5min → arb)           │
 │  polymarket-arb-scanner (cron → scan → alert)             │
 │                                                           │
 └───────────────────────────────────────────────────────────┘
@@ -79,6 +82,8 @@ Install on your **server / VPS** to run strategies 24/7:
 **ClawHub** (recommended):
 ```bash
 npx clawhub install grid-trading
+npx clawhub install cl-lp-rebalancer
+npx clawhub install cross-funding-arb
 npx clawhub install polymarket-arb-scanner
 ```
 
@@ -131,9 +136,11 @@ cat grid-trading/SKILL.md | pbcopy   # Copy to clipboard on macOS
 
 | Requirement | For | Install |
 |-------------|-----|---------|
-| onchainos CLI | grid-trading, strategy-factory | `npx skills add okx/onchainos-skills` |
-| OKX API Key | All trading skills | Via 1Password or env vars |
-| OnchainOS Wallet | grid-trading | `onchainos wallet login` |
+| onchainos CLI | grid-trading, cl-lp-rebalancer, strategy-factory | `npx skills add okx/onchainos-skills` |
+| OKX API Key | grid-trading, cl-lp-rebalancer | Via 1Password or env vars |
+| OnchainOS Wallet | grid-trading, cl-lp-rebalancer | `onchainos wallet login` |
+| Hyperliquid Private Key | cross-funding-arb | EIP-712 signing key or Agent Wallet |
+| Binance Futures API Key | cross-funding-arb | Binance account with USDT-M permission |
 | Python 3.10+ | Strategy scripts | System package manager |
 | VPS (optional) | 24/7 trading | Any Linux server |
 | 1Password CLI (optional) | Secure credential management | `brew install 1password-cli` |
