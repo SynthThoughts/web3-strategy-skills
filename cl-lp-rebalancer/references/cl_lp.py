@@ -1713,30 +1713,31 @@ def _build_notification(tier: str, data: dict) -> dict:
         net_apy = data.get("net_apy", 0)
 
         visual = _range_visual(price, lower, upper) if lower and upper else ""
-        edge = ""
-        if lower and upper and upper > lower:
-            dist_low = (price - lower) / (upper - lower)
-            dist_high = (upper - price) / (upper - lower)
-            edge_pct = min(dist_low, dist_high) * 100
-            edge = f"{edge_pct:.0f}%"
+
+        # Token breakdown
+        bals = data.get("balances", {})
+        eth_amt = bals.get("eth", 0)
+        usdc_amt = bals.get("usdc", 0)
+        wallet_usd = eth_amt * price + usdc_amt
+        lp_usd = portfolio - wallet_usd
 
         pnl_str = f"${pnl_usd:+,.2f} ({pnl_pct:+.1f}%)" if pnl_valid else "—"
         apy_str = f"Fee {fee_apy:+.1f}% / Net {net_apy:+.1f}%" if pnl_valid else "—"
 
         fields_discord = [
-            {"name": "价格", "value": f"${price:,.2f}", "inline": True},
-            {"name": "边缘距离", "value": edge or "—", "inline": True},
-            {"name": "组合价值", "value": f"${portfolio:,.2f}", "inline": True},
+            {"name": "ETH", "value": f"{eth_amt:.4f} (${eth_amt * price:,.0f})", "inline": True},
+            {"name": "USDC", "value": f"${usdc_amt:,.2f}", "inline": True},
+            {"name": "LP", "value": f"${lp_usd:,.0f}", "inline": True},
             {"name": "PnL", "value": pnl_str, "inline": True},
             {"name": "年化 APY", "value": apy_str, "inline": True},
             {"name": "待领费用", "value": f"${unclaimed:,.2f}", "inline": True},
         ]
-        footer = f"范围内 {tir:.0f}% · {regime} · {trend}"
+        footer = f"${portfolio:,.0f} · 范围内 {tir:.0f}% · {regime} · {trend}"
 
         text_lines = [
             f"📊 **{PAIR_NAME} · {CHAIN_LABEL} · 运行中**",
             f"`{visual}`" if visual else None,
-            f"💰 `${price:,.2f}` | 组合 `${portfolio:,.2f}` | 边缘 `{edge}`",
+            f"💰 `{eth_amt:.4f}` ETH (`${eth_amt * price:,.0f}`) + `${usdc_amt:,.2f}` USDC + LP `${lp_usd:,.0f}` = **`${portfolio:,.0f}`**",
             f"📈 PnL `{pnl_str}` | APY `{apy_str}`" if pnl_valid else None,
             f"💵 待领费用 `${unclaimed:,.2f}`",
             f"_{footer}_",
