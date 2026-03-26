@@ -1714,30 +1714,44 @@ def _build_notification(tier: str, data: dict) -> dict:
 
         visual = _range_visual(price, lower, upper) if lower and upper else ""
 
-        # Token breakdown
+        # Token breakdown (wallet + LP)
         bals = data.get("balances", {})
-        eth_amt = bals.get("eth", 0)
-        usdc_amt = bals.get("usdc", 0)
-        wallet_usd = eth_amt * price + usdc_amt
-        lp_usd = portfolio - wallet_usd
+        eth_wallet = bals.get("eth", 0)
+        usdc_wallet = bals.get("usdc", 0)
+        lp_assets = bals.get("lp_assets", [])
+
+        # Parse LP token amounts
+        lp_eth = 0.0
+        lp_usdc = 0.0
+        for a in lp_assets:
+            sym = a.get("symbol", "").upper()
+            amt = a.get("amount", 0)
+            if sym in ("WETH", "ETH"):
+                lp_eth = amt
+            elif sym in ("USDC", "USDT"):
+                lp_usdc = amt
+
+        total_eth = eth_wallet + lp_eth
+        total_usdc = usdc_wallet + lp_usdc
 
         pnl_str = f"${pnl_usd:+,.2f} ({pnl_pct:+.1f}%)" if pnl_valid else "—"
         apy_str = f"Fee {fee_apy:+.1f}% / Net {net_apy:+.1f}%" if pnl_valid else "—"
 
         fields_discord = [
-            {"name": "ETH", "value": f"{eth_amt:.4f} (${eth_amt * price:,.0f})", "inline": True},
-            {"name": "USDC", "value": f"${usdc_amt:,.2f}", "inline": True},
-            {"name": "LP", "value": f"${lp_usd:,.0f}", "inline": True},
+            {"name": "ETH", "value": f"{total_eth:.4f} (${total_eth * price:,.0f})", "inline": True},
+            {"name": "USDC", "value": f"${total_usdc:,.2f}", "inline": True},
+            {"name": "总价值", "value": f"${portfolio:,.0f}", "inline": True},
             {"name": "PnL", "value": pnl_str, "inline": True},
             {"name": "年化 APY", "value": apy_str, "inline": True},
             {"name": "待领费用", "value": f"${unclaimed:,.2f}", "inline": True},
         ]
-        footer = f"${portfolio:,.0f} · 范围内 {tir:.0f}% · {regime} · {trend}"
+        footer = f"钱包 {eth_wallet:.4f} ETH + ${usdc_wallet:,.0f} | LP {lp_eth:.4f} ETH + ${lp_usdc:,.0f} · {regime} · {trend}"
 
         text_lines = [
             f"📊 **{PAIR_NAME} · {CHAIN_LABEL} · 运行中**",
             f"`{visual}`" if visual else None,
-            f"💰 `{eth_amt:.4f}` ETH (`${eth_amt * price:,.0f}`) + `${usdc_amt:,.2f}` USDC + LP `${lp_usd:,.0f}` = **`${portfolio:,.0f}`**",
+            f"💰 `{total_eth:.4f}` ETH (`${total_eth * price:,.0f}`) + `${total_usdc:,.2f}` USDC = **`${portfolio:,.0f}`**",
+            f"  钱包: `{eth_wallet:.4f}` ETH + `${usdc_wallet:,.2f}` | LP: `{lp_eth:.4f}` ETH + `${lp_usdc:,.0f}` USDC",
             f"📈 PnL `{pnl_str}` | APY `{apy_str}`" if pnl_valid else None,
             f"💵 待领费用 `${unclaimed:,.2f}`",
             f"_{footer}_",
@@ -2161,6 +2175,7 @@ def _tick_inner():
     position = state.get("position")
     lp_value = 0.0
     unclaimed_fee = 0.0
+    lp_assets = []
     # Recover token_id if missing but position exists
     if position and not position.get("token_id") and position.get("tick_lower"):
         recovered_id = find_latest_token_id()
@@ -2171,6 +2186,7 @@ def _tick_inner():
         pos_detail = get_position_detail(position["token_id"])
         lp_value = pos_detail["value"]
         unclaimed_fee = pos_detail["unclaimed_fee_usd"]
+        lp_assets = pos_detail.get("assets", [])
         if lp_value == 0.0 and position.get("tick_lower"):
             # Position exists in state but API returned 0 — treat as query failure
             balance_failed = True
@@ -2484,6 +2500,15 @@ def _tick_inner():
         "balances": {
             "eth": round(eth_bal, 6),
             "usdc": round(usdc_bal, 2),
+            "lp_usd": round(lp_value, 2),
+            "lp_assets": [
+                {
+                    "symbol": a.get("tokenSymbol", ""),
+                    "amount": float(a.get("balance", 0)),
+                }
+                for a in lp_assets
+                if float(a.get("balance", 0)) > 0
+            ],
         },
         "time_in_range_pct": stats.get("time_in_range_pct", 0),
         "total_rebalances": stats.get("total_rebalances", 0),
