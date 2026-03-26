@@ -431,22 +431,19 @@ def _build_notification(tier: str, data: dict) -> dict | None:
         opps = data.get("opportunities", [])
         count = data.get("count", 0)
 
-        lines = [f"🔍 **{count} 个套利机会 · APR ≥ 20%**"]
-        fields = []
+        # Build per-line list sorted by APR descending (already sorted)
+        desc_lines = []
+        text_lines = [f"🔍 **{count} 个套利机会 · APR ≥ 20%**"]
         for o in opps:
             coin = o["coin"]
             apr = o["apr"]
             long_ex = _EX_SHORT.get(o["long"], o["long"])
             short_ex = _EX_SHORT.get(o["short"], o["short"])
-            lines.append(
-                f"• `{coin}` — `{apr:.1f}%` APR · Long `{long_ex}` / Short `{short_ex}`"
+            desc_lines.append(
+                f"`{coin}` — **{apr:.1f}%** APR · L:{long_ex} S:{short_ex}"
             )
-            fields.append(
-                {
-                    "name": coin,
-                    "value": f"{apr:.1f}% APR · L:{long_ex} S:{short_ex}",
-                    "inline": True,
-                }
+            text_lines.append(
+                f"• `{coin}` — `{apr:.1f}%` APR · Long `{long_ex}` / Short `{short_ex}`"
             )
 
         return {
@@ -454,9 +451,9 @@ def _build_notification(tier: str, data: dict) -> dict | None:
             "discord": {
                 "title": f"🔍 {count} 个套利机会 · APR ≥ 20%",
                 "color": 0x3498DB,
-                "fields": fields,
+                "description": "\n".join(desc_lines),
             },
-            "text": "\n".join(lines),
+            "text": "\n".join(text_lines),
         }
 
     # ── Hourly Pulse ─────────────────────────────────────────────────────
