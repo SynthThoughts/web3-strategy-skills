@@ -401,7 +401,10 @@ def _build_notification(tier: str, data: dict) -> dict | None:
             from_apr = data.get("from_apr", 0)
             to_apr = data.get("to_apr", 0)
             apr_gain = data.get("apr_gain", 0)
-            cost = data.get("switch_cost_apr", 0)
+            trading_cost = data.get("trading_cost_pct", 0)
+            sunk_cost = data.get("sunk_cost_pct", 0)
+            total_cost = data.get("total_switch_cost", 0)
+            bn_elapsed = data.get("bn_elapsed_h", 0)
 
             fields = [
                 {
@@ -411,12 +414,27 @@ def _build_notification(tier: str, data: dict) -> dict | None:
                 },
                 {"name": "To", "value": f"{to_coin} ({to_apr:.1f}%)", "inline": True},
                 {"name": "净收益", "value": f"+{apr_gain:.1f}% APR", "inline": True},
-                {"name": "换仓成本", "value": f"{cost:.1f}% APR", "inline": True},
+                {
+                    "name": "交易成本",
+                    "value": f"{trading_cost:.2f}%",
+                    "inline": True,
+                },
+                {
+                    "name": "沉没成本",
+                    "value": f"{sunk_cost:.2f}% (BN {bn_elapsed:.1f}h/{8}h)",
+                    "inline": True,
+                },
+                {
+                    "name": "总成本",
+                    "value": f"{total_cost:.2f}%",
+                    "inline": True,
+                },
             ]
             text_lines = [
                 f"🔄 **换仓 · {STRATEGY_LABEL}**",
                 f"📉 `{from_coin}` ({from_apr:.1f}%) → 📈 `{to_coin}` ({to_apr:.1f}%)",
-                f"💰 净收益: `+{apr_gain:.1f}%` APR · 成本: `{cost:.1f}%` APR",
+                f"💰 净收益: `+{apr_gain:.1f}%` APR",
+                f"💸 成本: 交易 `{trading_cost:.2f}%` + 沉没 `{sunk_cost:.2f}%` (BN {bn_elapsed:.1f}h/8h) = `{total_cost:.2f}%`",
             ]
             return {
                 "tier": "trade_alert",
@@ -2240,15 +2258,38 @@ class CrossFundingEngine:
             return False
 
         current_apr = health.get("current_apr", 0.0)
-        # Cost to switch = close current + open new = 2x round_trip (one-time %)
-        switch_cost_apr = self.round_trip_cost_pct * 2  # e.g. 0.24%
+        current_spread = health.get("current_spread", 0.0)
+
+        # --- Switching cost components ---
+        # a) Trading costs: close current + open new = 2x round_trip
+        trading_cost_pct = self.round_trip_cost_pct * 2  # e.g. 0.24%
+
+        # b) Sunk funding cost: unrealized funding accumulated since last settlement
+        #    HL settles every 1h, BN settles every 8h.
+        #    If we close before next settlement, we lose the accrued funding.
+        now = datetime.now(timezone.utc)
+        # BN: last settlement was at most recent 0/8/16 UTC
+        bn_period_hours = 8
+        hour_in_cycle = now.hour % bn_period_hours
+        bn_elapsed_h = hour_in_cycle + now.minute / 60
+        # Sunk = current_spread × elapsed fraction of each period
+        # Both legs accrue funding independently; total sunk = sum of both
+        # spread is per-8h rate, so BN sunk = spread × (bn_elapsed / 8)
+        # HL sunk ≈ spread × (hl_elapsed / 1) but HL is per-1h, rate is similar
+        # Simplify: main sunk cost is from BN (8h period, more at stake)
+        sunk_cost_pct = abs(current_spread) * (bn_elapsed_h / bn_period_hours) * 100
+
+        total_switch_cost_pct = trading_cost_pct + sunk_cost_pct
+        # Convert one-time cost to APR-equivalent for comparison
+        # (one-time cost vs ongoing APR gain — use raw comparison)
+        effective_threshold = max(total_switch_cost_pct, self.switch_threshold_apr)
 
         best = None
         for opp in opportunities:
             if opp["coin"] == coin:
                 continue  # skip current coin
             apr_gain = opp["estimated_apr"] - current_apr
-            if apr_gain > max(switch_cost_apr, self.switch_threshold_apr):
+            if apr_gain > effective_threshold:
                 best = opp
                 break  # already sorted desc by APR
 
@@ -2274,14 +2315,15 @@ class CrossFundingEngine:
 
         verified_apr = verification["net_apr_after_costs"]
         apr_gain = verified_apr - current_apr
-        if apr_gain <= max(switch_cost_apr, self.switch_threshold_apr):
+        if apr_gain <= effective_threshold:
             emit(
                 "switch_rejected",
                 {
                     "from": coin,
                     "to": best["coin"],
                     "reason": f"verified APR gain too small: {apr_gain:.1f}% "
-                    f"(need > {max(switch_cost_apr, self.switch_threshold_apr):.1f}%)",
+                    f"(need > {effective_threshold:.1f}%, "
+                    f"trading={trading_cost_pct:.2f}%, sunk={sunk_cost_pct:.2f}%)",
                 },
             )
             return False
@@ -2295,7 +2337,10 @@ class CrossFundingEngine:
                 "to": best["coin"],
                 "to_apr": verified_apr,
                 "apr_gain": round(apr_gain, 1),
-                "switch_cost_apr": round(switch_cost_apr, 1),
+                "trading_cost_pct": round(trading_cost_pct, 2),
+                "sunk_cost_pct": round(sunk_cost_pct, 2),
+                "total_switch_cost": round(total_switch_cost_pct, 2),
+                "bn_elapsed_h": round(bn_elapsed_h, 1),
             },
             notify=True,
             tier="trade_alert",
