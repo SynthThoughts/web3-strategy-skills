@@ -402,9 +402,17 @@ def _build_notification(tier: str, data: dict) -> dict | None:
             to_apr = data.get("to_apr", 0)
             apr_gain = data.get("apr_gain", 0)
             trading_cost = data.get("trading_cost_pct", 0)
+            bn_unreal = data.get("bn_unrealized_pct", 0)
+            hl_unreal = data.get("hl_unrealized_pct", 0)
             sunk_cost = data.get("sunk_cost_pct", 0)
             total_cost = data.get("total_switch_cost", 0)
             bn_elapsed = data.get("bn_elapsed_h", 0)
+            hl_elapsed = data.get("hl_elapsed_m", 0)
+
+            # Show sunk sign: positive = forfeit earnings, negative = avoid losses
+            bn_sign = "+" if bn_unreal >= 0 else ""
+            hl_sign = "+" if hl_unreal >= 0 else ""
+            sunk_sign = "+" if sunk_cost >= 0 else ""
 
             fields = [
                 {
@@ -420,21 +428,27 @@ def _build_notification(tier: str, data: dict) -> dict | None:
                     "inline": True,
                 },
                 {
-                    "name": "沉没成本",
-                    "value": f"{sunk_cost:.2f}% (BN {bn_elapsed:.1f}h/{8}h)",
+                    "name": "BN 未实现",
+                    "value": f"{bn_sign}{bn_unreal:.4f}% ({bn_elapsed:.1f}h/8h)",
+                    "inline": True,
+                },
+                {
+                    "name": "HL 未实现",
+                    "value": f"{hl_sign}{hl_unreal:.4f}% ({hl_elapsed:.0f}m/60m)",
                     "inline": True,
                 },
                 {
                     "name": "总成本",
-                    "value": f"{total_cost:.2f}%",
-                    "inline": True,
+                    "value": f"{total_cost:.2f}% (交易{trading_cost:.2f} + 沉没{sunk_sign}{sunk_cost:.4f})",
+                    "inline": False,
                 },
             ]
             text_lines = [
                 f"🔄 **换仓 · {STRATEGY_LABEL}**",
                 f"📉 `{from_coin}` ({from_apr:.1f}%) → 📈 `{to_coin}` ({to_apr:.1f}%)",
                 f"💰 净收益: `+{apr_gain:.1f}%` APR",
-                f"💸 成本: 交易 `{trading_cost:.2f}%` + 沉没 `{sunk_cost:.2f}%` (BN {bn_elapsed:.1f}h/8h) = `{total_cost:.2f}%`",
+                f"💸 交易: `{trading_cost:.2f}%` · BN未实现: `{bn_sign}{bn_unreal:.4f}%` ({bn_elapsed:.1f}h/8h) · HL未实现: `{hl_sign}{hl_unreal:.4f}%` ({hl_elapsed:.0f}m/60m)",
+                f"📊 总成本: `{total_cost:.2f}%`",
             ]
             return {
                 "tier": "trade_alert",
@@ -2258,30 +2272,45 @@ class CrossFundingEngine:
             return False
 
         current_apr = health.get("current_apr", 0.0)
-        current_spread = health.get("current_spread", 0.0)
+        hl_rate = health.get("hl_rate", 0.0)
+        bn_rate = health.get("bn_rate", 0.0)
+        long_ex = health.get("long_exchange", "binance")
 
         # --- Switching cost components ---
         # a) Trading costs: close current + open new = 2x round_trip
         trading_cost_pct = self.round_trip_cost_pct * 2  # e.g. 0.24%
 
-        # b) Sunk funding cost: unrealized funding accumulated since last settlement
-        #    HL settles every 1h, BN settles every 8h.
-        #    If we close before next settlement, we lose the accrued funding.
+        # b) Sunk funding: unrealized funding per leg since last settlement.
+        #    Funding convention: rate > 0 → longs pay shorts, rate < 0 → shorts pay longs.
+        #    Long earning = -rate (earn when rate < 0, pay when rate > 0).
+        #    Short earning = +rate (earn when rate > 0, pay when rate < 0).
+        #    Positive = we're accumulating earnings (closing forfeits them → cost).
+        #    Negative = we're accumulating losses (closing avoids them → benefit).
         now = datetime.now(timezone.utc)
-        # BN: last settlement was at most recent 0/8/16 UTC
-        bn_period_hours = 8
-        hour_in_cycle = now.hour % bn_period_hours
-        bn_elapsed_h = hour_in_cycle + now.minute / 60
-        # Sunk = current_spread × elapsed fraction of each period
-        # Both legs accrue funding independently; total sunk = sum of both
-        # spread is per-8h rate, so BN sunk = spread × (bn_elapsed / 8)
-        # HL sunk ≈ spread × (hl_elapsed / 1) but HL is per-1h, rate is similar
-        # Simplify: main sunk cost is from BN (8h period, more at stake)
-        sunk_cost_pct = abs(current_spread) * (bn_elapsed_h / bn_period_hours) * 100
+
+        # BN settles every 8h at 00:00/08:00/16:00 UTC
+        bn_elapsed_h = (now.hour % 8) + now.minute / 60
+        bn_fraction = bn_elapsed_h / 8.0
+        # HL settles every 1h at xx:00 UTC
+        hl_elapsed_m = now.minute + now.second / 60
+        hl_fraction = hl_elapsed_m / 60.0
+
+        # Per-leg unrealized funding (as % of position value)
+        if long_ex == "binance":
+            # Long BN, Short HL
+            bn_unrealized = -bn_rate * bn_fraction * 100  # long earning
+            hl_unrealized = hl_rate * hl_fraction * 100  # short earning
+        else:
+            # Long HL, Short BN
+            hl_unrealized = -hl_rate * hl_fraction * 100  # long earning
+            bn_unrealized = bn_rate * bn_fraction * 100  # short earning
+
+        # Net sunk = what we forfeit by closing now.
+        # Positive → we lose earnings (increases cost).
+        # Negative → we avoid losses (decreases cost, can go below zero).
+        sunk_cost_pct = bn_unrealized + hl_unrealized
 
         total_switch_cost_pct = trading_cost_pct + sunk_cost_pct
-        # Convert one-time cost to APR-equivalent for comparison
-        # (one-time cost vs ongoing APR gain — use raw comparison)
         effective_threshold = max(total_switch_cost_pct, self.switch_threshold_apr)
 
         best = None
@@ -2338,9 +2367,12 @@ class CrossFundingEngine:
                 "to_apr": verified_apr,
                 "apr_gain": round(apr_gain, 1),
                 "trading_cost_pct": round(trading_cost_pct, 2),
-                "sunk_cost_pct": round(sunk_cost_pct, 2),
+                "bn_unrealized_pct": round(bn_unrealized, 4),
+                "hl_unrealized_pct": round(hl_unrealized, 4),
+                "sunk_cost_pct": round(sunk_cost_pct, 4),
                 "total_switch_cost": round(total_switch_cost_pct, 2),
                 "bn_elapsed_h": round(bn_elapsed_h, 1),
+                "hl_elapsed_m": round(hl_elapsed_m, 1),
             },
             notify=True,
             tier="trade_alert",
