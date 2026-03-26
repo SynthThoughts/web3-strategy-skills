@@ -1,10 +1,10 @@
 ---
 name: cl-lp-rebalancer
-description: "Uniswap V3 集中流动性 LP 自动调仓策略。基于波动率自适应范围宽度：低波动率收紧范围（高资本效率），高波动率放宽范围（减少调仓和 IL）。支持趋势不对称调整、多时间框架分析、自动 claim/remove/swap/deposit 全流程。适用于 EVM L2 链上 CL LP 管理、调仓、范围优化、手续费最大化场景。"
+description: "Uniswap V3 集中流动性 LP 自动调仓策略。基于波动率自适应范围宽度：低波动率收紧范围（高资本效率），高波动率放宽范围（减少调仓和 IL）。支持趋势不对称调整、多时间框架分析、自动 claim/remove/swap/deposit 全流程。适用于 EVM L2 链上 CL LP 管理、调仓、范围优化、手续费最大化场景。用户查询收益、PnL、仓位、头寸状态、LP 状况、年化、手续费、无常损失时，调用 status 子命令即可获取（每 5 分钟缓存一次，秒级响应）。"
 license: Apache-2.0
 metadata:
   author: SynthThoughts
-  version: "2.6.0"
+  version: "3.2.1"
   pattern: "pipeline, tool-wrapper"
   steps: "5"
 ---
@@ -429,13 +429,21 @@ Rebalance failure fallback: if deposit fails after remove, emergency deploy at 3
 
 | Command | Purpose | Trigger | Notification |
 |---|---|---|---|
-| `tick` | 主循环：采集→分析→决策→执行 | Cron 每 5min | 🔔 Trade Alert / ⚠️ Risk Alert / 📊 Hourly Pulse |
-| `status` | 当前头寸、范围、指标、趋势 | 用户主动 | 终端输出（不推送） |
+| `tick` | 主循环：采集→分析→决策→执行，结果缓存到 `_cached_snapshot` | Cron 每 5min | 🔔 Trade Alert / ⚠️ Risk Alert / 📊 Hourly Pulse |
+| `status` | **用户查询入口**：Portfolio 总览 + 头寸 + 收益 + 范围。优先读 5min 缓存（秒级响应），过期才实时查询 | 用户主动 | 终端输出（不推送） |
 | `report` | 每日绩效报告 | Cron 每日 00:00 UTC | 📈 Daily Report |
 | `history` | 调仓历史 | 用户主动 | 终端输出（不推送） |
 | `analyze` | 详细 JSON 分析（波动率、范围、效率） | AI agent | 终端输出（不推送） |
 | `reset` | 关闭头寸并重新部署 | 手动 | 🔔 Trade Alert |
 | `close` | 完全退出头寸 | 手动 | 🔔 Trade Alert |
+
+**`status` 触发词**（用户说以下任意内容时应调用 `status`）：
+- 查询收益、收益怎么样、赚了多少、PnL、盈亏
+- 查询仓位、头寸状态、LP 状况、仓位情况
+- 年化多少、APY、费用收入、手续费
+- 无常损失、IL
+- 总资产、Portfolio、余额
+- LP 里有多少 ETH / USDC
 
 ```python
 COMMANDS = {
@@ -459,7 +467,7 @@ if __name__ == "__main__":
 | **Hourly Pulse** | 距上次推送 ≥ `QUIET_INTERVAL` 且无交易 | 每小时推送 |
 | **Daily Report** | `report` 命令 (cron daily) | 每日推送 |
 
-`status`/`analyze` 命令为用户主动查询，直接输出到终端，不推送。
+`status`/`analyze` 命令为用户主动查询，直接输出到终端，不推送。`status` 优先从 `_cached_snapshot`（每 5min tick 时写入）读取已计算好的数据，无需任何 API 调用即可返回完整状态（Portfolio 跨平台总览 + 头寸 + PnL + IL + APY + LP 代币拆分）。缓存过期（>360s）时自动 fallback 到实时查询。
 
 脚本负责：消息标题、字段组织、范围位置可视化、颜色级别、footer 上下文。调度器只需透传 `notification` 块到通信平台。
 
