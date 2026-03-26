@@ -644,44 +644,6 @@ if abs(unexplained_change) > $100:
 - Rotation: simple half-file rotation at 1MB
 - Format: `[YYYY-MM-DD HH:MM:SS] message`
 
-## Backtest Results Summary
-
-Based on 10-day backtest (2026-03-06 to 2026-03-16, ETH +9.00%):
-
-### Best Configuration: 6 Levels + trend_adaptive
-
-| Metric | Value |
-|---|---|
-| Initial Capital | $511.44 |
-| Final Value | $513.66 |
-| Total Return | +0.43% |
-| Annualized Return | +17.13% |
-| **Sharpe Ratio** | **4.45** |
-| Sortino Ratio | 4.04 |
-| Max Drawdown | 11.92% ($61.72) |
-| Total Trades | 54 |
-| Total Costs | $42.09 (1.32%) |
-
-### HODL Comparison
-
-| Strategy | Return | Final Value |
-|---|---|---|
-| Grid | +0.43% | $513.66 |
-| HODL | +5.48% | $539.47 |
-| Alpha | -5.05% | -$25.81 |
-
-Note: In a +9% uptrend, grid strategies naturally underperform HODL because they sell into the rise. The trend-adaptive features (wider grid, sell delay, momentum protection) aim to reduce this gap.
-
-### Parameter Scan Key Findings
-
-| Finding | Detail |
-|---|---|
-| `trend_adaptive` > `equal` | +1.8% better return across all grid level configs |
-| 6 levels optimal | Best Sharpe (4.45) vs 4 levels (2.05) or 8 levels (4.46 but -0.84% return) |
-| `step_min_pct` insensitive | 0.006-0.012 gave identical results at 6 levels — vol floor binding |
-| 8 levels + 0.012 step | Sharpe 9.63 but -0.03% return — fewer, higher-quality trades |
-| Cost impact | ~1.3% of traded volume — critical to maintain step > 3x DEX cost |
-
 ## Adapting to Different Pairs
 
 | Consideration | What to adjust |
