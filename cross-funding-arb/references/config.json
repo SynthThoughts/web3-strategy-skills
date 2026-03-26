@@ -1,0 +1,21 @@
+{
+  "shared": {
+    "max_consecutive_errors": 5,
+    "cooldown_after_errors": 3600,
+    "min_order_usd": 10
+  },
+  "cross_funding": {
+    "enabled": true,
+    "hl_budget_usd": 300,
+    "bn_budget_usd": 450,
+    "min_apr_pct": 10.0,
+    "min_confidence": "medium",
+    "leverage": 3,
+    "stability_snapshots": 3,
+    "stability_max_std_ratio": 0.3,
+    "close_spread_threshold": 0.00005,
+    "switch_threshold_apr": 5.0,
+    "max_price_basis_pct": 0.5,
+    "round_trip_cost_pct": 0.12
+  }
+}

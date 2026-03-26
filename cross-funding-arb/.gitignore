@@ -1,0 +1,5 @@
+.env
+*_state.json
+__pycache__/
+*.pyc
+.*.lock
