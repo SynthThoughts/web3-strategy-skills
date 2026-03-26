@@ -2079,7 +2079,65 @@ class CrossFundingEngine:
             except Exception as re:
                 emit_error("rollback_hl", re, notify=True)
             return False
-        time.sleep(1)
+        time.sleep(2)
+
+        # Verify both legs are filled before saving state
+        hl_pos = self.hl.get_position(coin)
+        bn_pos = self.bn.get_position(coin)
+        hl_filled = abs(hl_pos["size"]) if hl_pos else 0
+        bn_filled = abs(bn_pos["size"]) if bn_pos else 0
+
+        if hl_filled == 0 or bn_filled == 0:
+            missing = "HL" if hl_filled == 0 else "BN"
+            emit_error(
+                "position_verify",
+                RuntimeError(
+                    f"leg verification failed: {missing} has no position "
+                    f"(HL={hl_filled}, BN={bn_filled})"
+                ),
+                notify=True,
+            )
+            # Rollback: close whichever leg exists
+            if hl_filled > 0:
+                try:
+                    self.hl.close_position(coin)
+                except Exception as re:
+                    emit_error("rollback_hl", re, notify=True)
+            if bn_filled > 0:
+                try:
+                    self.bn.close_position(coin)
+                except Exception as re:
+                    emit_error("rollback_bn", re, notify=True)
+            return False
+
+        # Check delta — tolerate up to 10% size mismatch
+        avg_size = (hl_filled + bn_filled) / 2
+        delta_pct = abs(hl_filled - bn_filled) / avg_size * 100 if avg_size else 0
+        if delta_pct > 10:
+            emit(
+                "position_verify_warn",
+                {
+                    "coin": coin,
+                    "hl_size": hl_filled,
+                    "bn_size": bn_filled,
+                    "delta_pct": round(delta_pct, 2),
+                    "msg": "size mismatch >10%, closing both legs",
+                },
+                notify=True,
+                tier="risk_alert",
+            )
+            try:
+                self.hl.close_position(coin)
+            except Exception as re:
+                emit_error("rollback_hl", re, notify=True)
+            try:
+                self.bn.close_position(coin)
+            except Exception as re:
+                emit_error("rollback_bn", re, notify=True)
+            return False
+
+        # Use verified size (smaller of the two, in case of rounding diffs)
+        size = min(hl_filled, bn_filled)
 
         # Save state
         hl_rate = self.hl.get_funding_rate(coin)
