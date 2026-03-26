@@ -8,9 +8,9 @@
 
 | 技能 | 版本 | 运行环境 | 说明 |
 |------|------|----------|------|
-| [okx-strategy-factory](./okx-strategy-factory/) | v1.0.0 | 本地 (Claude Code / Cursor / Gemini CLI / Codex) | 元技能：协调 5 个 AI 智能体，完成 OKX OnchainOS 交易策略的开发、回测、部署、发布和迭代全流程。 |
-| [grid-trading](./grid-trading/) | v1.0.0 | 服务器 (OpenClaw / VPS cron) | EVM L2 链上动态网格交易。多时间框架分析、趋势自适应仓位、非对称网格步长。 |
-| [cl-lp-rebalancer](./cl-lp-rebalancer/) | v1.0.0 | 服务器 (OpenClaw / VPS cron) | DEX 集中流动性 LP 区间再平衡器。 |
+| [okx-strategy-factory](./okx-strategy-factory/) | v2.0.0 | 本地 (Claude Code / Cursor / Gemini CLI / Codex) | 元技能：协调 5 个 AI 智能体，完成 OKX OnchainOS 交易策略的开发、回测、部署、发布和迭代全流程。 |
+| [grid-trading](./grid-trading/) | v1.5.0 | 服务器 (OpenClaw / VPS cron) | EVM L2 链上动态网格交易。多时间框架分析、趋势自适应仓位、非对称网格步长。 |
+| [cl-lp-rebalancer](./cl-lp-rebalancer/) | v3.2.1 | 服务器 (OpenClaw / VPS cron) | DEX 集中流动性 LP 区间再平衡器。 |
 | [cross-funding-arb](./cross-funding-arb/) | v1.0.0 | 服务器 (OpenClaw / VPS cron) | 跨交易所永续合约资金费率套利。Hyperliquid + Binance Delta 中性对冲。 |
 | [polymarket-arb-scanner](./polymarket-arb-scanner/) | v1.0.0 | 服务器 (OpenClaw / VPS cron) | Polymarket CLOB 三层套利检测：单条件、负风险多结果、跨市场隐含关系。 |
 

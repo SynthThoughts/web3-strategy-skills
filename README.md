@@ -8,9 +8,9 @@ Reusable Web3 trading skills for AI coding agents. Each skill is a self-containe
 
 | Skill | Version | Runtime | Description |
 |-------|---------|---------|-------------|
-| [okx-strategy-factory](./okx-strategy-factory/) | v1.0.0 | Local (Claude Code / Cursor / Gemini CLI / Codex) | Meta-skill: coordinates 5 AI agents to develop, backtest, deploy, publish, and iterate OKX OnchainOS trading strategies. |
-| [grid-trading](./grid-trading/) | v1.0.0 | Server (OpenClaw / VPS cron) | Dynamic grid trading on EVM L2 chains. Multi-timeframe analysis, trend-adaptive sizing, asymmetric grid steps. |
-| [cl-lp-rebalancer](./cl-lp-rebalancer/) | v1.0.0 | Server (OpenClaw / VPS cron) | Concentrated liquidity LP range rebalancer for DEX positions. |
+| [okx-strategy-factory](./okx-strategy-factory/) | v2.0.0 | Local (Claude Code / Cursor / Gemini CLI / Codex) | Meta-skill: coordinates 5 AI agents to develop, backtest, deploy, publish, and iterate OKX OnchainOS trading strategies. |
+| [grid-trading](./grid-trading/) | v1.5.0 | Server (OpenClaw / VPS cron) | Dynamic grid trading on EVM L2 chains. Multi-timeframe analysis, trend-adaptive sizing, asymmetric grid steps. |
+| [cl-lp-rebalancer](./cl-lp-rebalancer/) | v3.2.1 | Server (OpenClaw / VPS cron) | Concentrated liquidity LP range rebalancer for DEX positions. |
 | [cross-funding-arb](./cross-funding-arb/) | v1.0.0 | Server (OpenClaw / VPS cron) | Cross-exchange perpetual funding rate arbitrage. Delta-neutral positions across Hyperliquid and Binance. |
 | [polymarket-arb-scanner](./polymarket-arb-scanner/) | v1.0.0 | Server (OpenClaw / VPS cron) | Three-layer arbitrage detection on Polymarket CLOB: single-condition, neg-risk multi-outcome, and cross-market implication. |
 
