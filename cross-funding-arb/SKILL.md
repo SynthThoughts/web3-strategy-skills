@@ -391,56 +391,65 @@ Response: {
 
 ## Deployment
 
+安装后脚本位于标准 skill 目录，无需手动拷贝。
+
+```
+# OpenClaw 安装路径
+~/.openclaw/skills/cross-funding-arb/references/cross_funding.py
+
+# ZeroClaw 安装路径
+~/.zeroclaw-strategy/skills/cross-funding-arb/references/cross_funding.py
+```
+
+**安装后配置**：将 `.env` 放到 `references/` 目录（与 `cross_funding.py` 同级）：
+
+```bash
+# OpenClaw
+cp .env.example ~/.openclaw/skills/cross-funding-arb/references/.env
+# 编辑填入 HL_PRIVATE_KEY, BINANCE_API_KEY, BINANCE_SECRET_KEY
+
+# ZeroClaw
+cp .env.example ~/.zeroclaw-strategy/skills/cross-funding-arb/references/.env
+```
+
 ### OpenClaw Cron
 
 ```bash
+SKILL_DIR=~/.openclaw/skills/cross-funding-arb/references
+
 # tick: 每 5 分钟
 openclaw cron add --expr "*/5 * * * *" --shell \
-  "cd ~/scripts/cross-funding && set -a && . ./.env && set +a && python3 cross_funding.py tick"
+  "cd $SKILL_DIR && set -a && . ./.env && set +a && python3 cross_funding.py tick"
 
 # 日报: 每天 00:00 UTC
 openclaw cron add --expr "0 0 * * *" --agent \
-  "执行跨交易所资金费率套利日报: cd ~/scripts/cross-funding && set -a && . ./.env && set +a && python3 cross_funding.py report。将完整输出结果总结后回复我。"
+  "执行跨交易所资金费率套利日报: cd $SKILL_DIR && set -a && . ./.env && set +a && python3 cross_funding.py report。将完整输出结果总结后回复我。"
 ```
 
 ### ZeroClaw Cron
 
 ```bash
+SKILL_DIR=~/.zeroclaw-strategy/skills/cross-funding-arb/references
+
 # tick: 每 5 分钟
 zeroclaw cron add --expr "*/5 * * * *" --shell \
-  "cd ~/scripts/cross-funding && set -a && . ./.env && set +a && python3 cross_funding.py tick"
+  "cd $SKILL_DIR && set -a && . ./.env && set +a && python3 cross_funding.py tick"
 
 # 日报: 每天 00:00 UTC
 zeroclaw cron add --expr "0 0 * * *" --agent \
-  "执行跨交易所资金费率套利日报: cd ~/scripts/cross-funding && set -a && . ./.env && set +a && python3 cross_funding.py report。将完整输出结果总结后回复我。"
-```
-
-### Systemd Timer
-
-```ini
-[Unit]
-Description=Cross Funding Arb Tick
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/python3 cross_funding.py tick
-WorkingDirectory=/path/to/cross-funding
-EnvironmentFile=/path/to/cross-funding/.env
+  "执行跨交易所资金费率套利日报: cd $SKILL_DIR && set -a && . ./.env && set +a && python3 cross_funding.py report。将完整输出结果总结后回复我。"
 ```
 
 ### Manual
 
 ```bash
-# 单次 tick
-python3 cross_funding.py tick
+cd ~/.openclaw/skills/cross-funding-arb/references
+set -a && . ./.env && set +a
 
-# 状态查询
-python3 cross_funding.py status
-
-# 日报
-python3 cross_funding.py report
+python3 cross_funding.py tick      # 单次 tick
+python3 cross_funding.py status    # 状态查询
+python3 cross_funding.py report    # 日报
 ```
-
-**Post-deploy**: 部署成功后，将部署信息写入 memory（key 建议: `core_strategy_deployment_paths`），包含：策略名称、状态、脚本路径、配置路径、状态文件路径、cron 表达式、tick/report 完整命令、钱包地址。如已有同 key 条目则更新。
 
 ## Install
 
