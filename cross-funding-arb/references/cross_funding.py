@@ -395,6 +395,39 @@ def _build_notification(tier: str, data: dict) -> dict | None:
                 "text": "\n".join(text_lines),
             }
 
+        if event == "switch_start":
+            from_coin = data.get("from", "?")
+            to_coin = data.get("to", "?")
+            from_apr = data.get("from_apr", 0)
+            to_apr = data.get("to_apr", 0)
+            apr_gain = data.get("apr_gain", 0)
+            cost = data.get("switch_cost_apr", 0)
+
+            fields = [
+                {
+                    "name": "From",
+                    "value": f"{from_coin} ({from_apr:.1f}%)",
+                    "inline": True,
+                },
+                {"name": "To", "value": f"{to_coin} ({to_apr:.1f}%)", "inline": True},
+                {"name": "净收益", "value": f"+{apr_gain:.1f}% APR", "inline": True},
+                {"name": "换仓成本", "value": f"{cost:.1f}% APR", "inline": True},
+            ]
+            text_lines = [
+                f"🔄 **换仓 · {STRATEGY_LABEL}**",
+                f"📉 `{from_coin}` ({from_apr:.1f}%) → 📈 `{to_coin}` ({to_apr:.1f}%)",
+                f"💰 净收益: `+{apr_gain:.1f}%` APR · 成本: `{cost:.1f}%` APR",
+            ]
+            return {
+                "tier": "trade_alert",
+                "discord": {
+                    "title": f"🔄 换仓 · {from_coin} → {to_coin} · {STRATEGY_LABEL}",
+                    "color": 0x9B59B6,
+                    "fields": fields,
+                },
+                "text": "\n".join(text_lines),
+            }
+
         return None
 
     # ── Risk Alert ───────────────────────────────────────────────────────
@@ -2155,16 +2188,23 @@ class CrossFundingEngine:
 
     # ---- Switch position ----
 
-    def check_and_switch(self) -> bool:
+    def check_and_switch(self, opportunities: list[dict] | None = None) -> bool:
+        """Check if we should switch position.
+
+        Triggers:
+          1. Unhealthy: spread unfavorable or missing leg → close immediately
+          2. Better opportunity: best scanned APR - current APR > switch cost → switch
+
+        Switch cost = 2x round_trip (close current + open new), annualized.
+        """
         state = self._load()
         coin = state.get("current_coin")
         if not coin:
             return False
 
         health = self.check_health()
-        if health["healthy"]:
-            return False
 
+        # 1) Unhealthy → close immediately
         if not health["spread_favorable"]:
             emit(
                 "switch_close",
@@ -2195,7 +2235,83 @@ class CrossFundingEngine:
             self.close_position(coin)
             return True
 
-        return False
+        # 2) Better opportunity → switch if APR gain exceeds switching cost
+        if not opportunities:
+            return False
+
+        current_apr = health.get("current_apr", 0.0)
+        # Cost to switch = close current + open new = 2x round_trip (one-time %)
+        switch_cost_apr = self.round_trip_cost_pct * 2  # e.g. 0.24%
+
+        best = None
+        for opp in opportunities:
+            if opp["coin"] == coin:
+                continue  # skip current coin
+            apr_gain = opp["estimated_apr"] - current_apr
+            if apr_gain > max(switch_cost_apr, self.switch_threshold_apr):
+                best = opp
+                break  # already sorted desc by APR
+
+        if not best:
+            return False
+
+        # Deep-verify the candidate
+        direction = {
+            "long_exchange": best["long_exchange"],
+            "short_exchange": best["short_exchange"],
+        }
+        verification = self.verify_opportunity(best["coin"], direction)
+        if not verification["valid"]:
+            emit(
+                "switch_rejected",
+                {
+                    "from": coin,
+                    "to": best["coin"],
+                    "reason": verification["reject_reason"],
+                },
+            )
+            return False
+
+        verified_apr = verification["net_apr_after_costs"]
+        apr_gain = verified_apr - current_apr
+        if apr_gain <= max(switch_cost_apr, self.switch_threshold_apr):
+            emit(
+                "switch_rejected",
+                {
+                    "from": coin,
+                    "to": best["coin"],
+                    "reason": f"verified APR gain too small: {apr_gain:.1f}% "
+                    f"(need > {max(switch_cost_apr, self.switch_threshold_apr):.1f}%)",
+                },
+            )
+            return False
+
+        # Execute switch: close current → open new
+        emit(
+            "switch_start",
+            {
+                "from": coin,
+                "from_apr": current_apr,
+                "to": best["coin"],
+                "to_apr": verified_apr,
+                "apr_gain": round(apr_gain, 1),
+                "switch_cost_apr": round(switch_cost_apr, 1),
+            },
+            notify=True,
+            tier="trade_alert",
+        )
+
+        self.close_position(coin)
+        time.sleep(2)
+        success = self.open_position(best["coin"], direction)
+        if not success:
+            emit(
+                "switch_failed",
+                {"from": coin, "to": best["coin"], "reason": "open_position failed"},
+                notify=True,
+                tier="risk_alert",
+            )
+        return True
 
     # ---- Report ----
 
@@ -2391,8 +2507,8 @@ def tick() -> None:
                 return
         else:
             # Has position: health check + switch evaluation + scan opportunities
-            engine.scan_opportunities()  # always scan (triggers opportunity_alert)
-            switched = engine.check_and_switch()
+            opportunities = engine.scan_opportunities()
+            switched = engine.check_and_switch(opportunities)
             if not switched:
                 health = engine.check_health()
                 report_data = engine.get_report()
