@@ -1738,7 +1738,11 @@ def _build_notification(tier: str, data: dict) -> dict:
         apy_str = f"Fee {fee_apy:+.1f}% / Net {net_apy:+.1f}%" if pnl_valid else "—"
 
         fields_discord = [
-            {"name": "ETH", "value": f"{total_eth:.4f} (${total_eth * price:,.0f})", "inline": True},
+            {
+                "name": "ETH",
+                "value": f"{total_eth:.4f} (${total_eth * price:,.0f})",
+                "inline": True,
+            },
             {"name": "USDC", "value": f"${total_usdc:,.2f}", "inline": True},
             {"name": "总价值", "value": f"${portfolio:,.0f}", "inline": True},
             {"name": "PnL", "value": pnl_str, "inline": True},
@@ -1839,7 +1843,9 @@ def _build_notification(tier: str, data: dict) -> dict:
         pos = data.get("position", {})
         d_lower = pos.get("lower_price", 0)
         d_upper = pos.get("upper_price", 0)
-        daily_visual = _range_visual(price, d_lower, d_upper) if d_lower and d_upper else ""
+        daily_visual = (
+            _range_visual(price, d_lower, d_upper) if d_lower and d_upper else ""
+        )
 
         discord_embed = {
             "title": f"📈 日报 · {PAIR_NAME} · {today}",
@@ -2504,10 +2510,10 @@ def _tick_inner():
             "lp_assets": [
                 {
                     "symbol": a.get("tokenSymbol", ""),
-                    "amount": float(a.get("balance", 0)),
+                    "amount": float(a.get("coinAmount", 0)),
                 }
                 for a in lp_assets
-                if float(a.get("balance", 0)) > 0
+                if float(a.get("coinAmount", 0)) > 0
             ],
         },
         "time_in_range_pct": stats.get("time_in_range_pct", 0),
@@ -2579,7 +2585,7 @@ def status():
         lp_detail_parts = []
         for asset in lp_assets:
             sym = asset.get("tokenSymbol", "")
-            amt = asset.get("balance", "0")
+            amt = asset.get("coinAmount", "0")
             if sym and float(amt) > 0:
                 lp_detail_parts.append(f"{float(amt):.4f} {sym}")
         lp_detail = " + ".join(lp_detail_parts) if lp_detail_parts else ""
