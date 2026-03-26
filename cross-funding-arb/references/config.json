@@ -13,7 +13,7 @@
     "leverage": 3,
     "stability_snapshots": 3,
     "stability_max_std_ratio": 0.3,
-    "close_spread_threshold": 0.00005,
+    "close_spread_threshold": 0.0001,
     "switch_threshold_apr": 5.0,
     "max_price_basis_pct": 0.5,
     "round_trip_cost_pct": 0.12

@@ -4,12 +4,34 @@ description: "跨交易所资金费率套利策略。在费率低的交易所做
 license: Apache-2.0
 metadata:
   author: SynthThoughts
-  version: "1.0.0"
-  pattern: "pipeline, tool-wrapper"
+  version: "2.0.0"
+  pattern: "pipeline"
   steps: "5"
+  openclaw:
+    requires:
+      env:
+        - HL_PRIVATE_KEY
+        - BINANCE_API_KEY
+        - BINANCE_SECRET_KEY
+      optional_env:
+        - HL_VAULT_ADDRESS
+        - HL_TESTNET
+        - BINANCE_TESTNET
+        - DISCORD_CHANNEL_ID
+        - DISCORD_BOT_TOKEN
+        - TELEGRAM_BOT_TOKEN
+        - TELEGRAM_CHAT_ID
+        - STATE_DIR
+      bins:
+        - python3
+    primaryEnv: HL_PRIVATE_KEY
+    entrypoint: references/cross_funding.py
+    os:
+      - darwin
+      - linux
 ---
 
-# Cross-Exchange Funding Rate Arbitrage v1
+# Cross-Exchange Funding Rate Arbitrage v2
 
 Cron 驱动的跨交易所资金费率套利机器人。核心思路：**在费率低的交易所做多永续合约，在费率高的交易所做空永续合约**，两腿等量 delta-neutral，赚取 funding spread。
 
@@ -196,7 +218,7 @@ bn.close_position("ETH")
 | `leverage` | `3` | 杠杆倍数 |
 | `stability_snapshots` | `3` | 稳定性验证所需快照数 |
 | `stability_max_std_ratio` | `0.3` | Spread 标准差/均值上限 |
-| `close_spread_threshold` | `0.00005` | 平仓 spread 下限（8h 费率差） |
+| `close_spread_threshold` | `0.0001` | 平仓 spread 下限（8h 费率差，≈10.95% APR） |
 | `switch_threshold_apr` | `5.0` | 切仓 APR 差距门槛 (%) |
 | `max_price_basis_pct` | `0.5` | 两所价格差异上限 (%) |
 | `round_trip_cost_pct` | `0.12` | 往返成本 (%, 含手续费+滑点) |
@@ -234,13 +256,13 @@ bn.close_position("ETH")
 
 ```bash
 # 单次 tick
-cd ~/scripts/hyperliquid && set -a && . ./.env && set +a && python3 -m funding.hl_cross_funding tick
+cd ~/scripts/cross-funding && set -a && . ./.env && set +a && python3 cross_funding.py tick
 
 # 日报
-python3 -m funding.hl_cross_funding report
+python3 cross_funding.py report
 
 # 状态查询
-python3 -m funding.hl_cross_funding status
+python3 cross_funding.py status
 ```
 
 ## Notification Tiers
@@ -374,11 +396,11 @@ Response: {
 ```bash
 # tick: 每 5 分钟
 zeroclaw cron add --expr "*/5 * * * *" --shell \
-  "cd ~/scripts/hyperliquid && set -a && . ./.env && set +a && python3 -m funding.hl_cross_funding tick"
+  "cd ~/scripts/cross-funding && set -a && . ./.env && set +a && python3 cross_funding.py tick"
 
 # 日报: 每天 00:00 UTC
 zeroclaw cron add --expr "0 0 * * *" --agent \
-  "执行跨交易所资金费率套利日报: cd ~/scripts/hyperliquid && set -a && . ./.env && set +a && python3 -m funding.hl_cross_funding report。将完整输出结果总结后回复我。"
+  "执行跨交易所资金费率套利日报: cd ~/scripts/cross-funding && set -a && . ./.env && set +a && python3 cross_funding.py report。将完整输出结果总结后回复我。"
 ```
 
 ### Systemd Timer
@@ -388,22 +410,22 @@ zeroclaw cron add --expr "0 0 * * *" --agent \
 Description=Cross Funding Arb Tick
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 -m funding.hl_cross_funding tick
-WorkingDirectory=/path/to/hyperliquid
-EnvironmentFile=/path/to/hyperliquid/.env
+ExecStart=/usr/bin/python3 cross_funding.py tick
+WorkingDirectory=/path/to/cross-funding
+EnvironmentFile=/path/to/cross-funding/.env
 ```
 
 ### Manual
 
 ```bash
 # 单次 tick
-python3 -m funding.hl_cross_funding tick
+python3 cross_funding.py tick
 
 # 状态查询
-python3 -m funding.hl_cross_funding status
+python3 cross_funding.py status
 
 # 日报
-python3 -m funding.hl_cross_funding report
+python3 cross_funding.py report
 ```
 
 **Post-deploy**: 部署成功后，将部署信息写入 memory（key 建议: `core_strategy_deployment_paths`），包含：策略名称、状态、脚本路径、配置路径、状态文件路径、cron 表达式、tick/report 完整命令、钱包地址。如已有同 key 条目则更新。
