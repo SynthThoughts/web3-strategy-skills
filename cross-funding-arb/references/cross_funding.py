@@ -1431,10 +1431,13 @@ class BinanceClient:
     # ---- Account ----
 
     def get_usdt_balance(self) -> float:
+        """获取 USDT 账户权益（含未实现盈亏），与 HL accountValue 口径一致。"""
         data = self._request("GET", "/fapi/v2/balance", signed=True)
         for asset in data:
             if asset["asset"] == "USDT":
-                return float(asset["balance"])
+                balance = float(asset["balance"])
+                unrealized_pnl = float(asset.get("crossUnPnl", 0))
+                return balance + unrealized_pnl
         return 0.0
 
     def get_position(self, coin: str) -> dict | None:
