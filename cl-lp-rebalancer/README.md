@@ -56,20 +56,7 @@ Uniswap V3 集中流动性自动调仓策略，运行在 EVM L2 链上，通过 
 
 详细算法说明见 [references/range-algorithm.md](references/range-algorithm.md)。
 
-## 与网格交易的区别
-
-| 维度 | 网格交易 | V3 LP 调仓 |
-|------|---------|-----------|
-| 收益来源 | 网格价差（低买高卖） | LP 手续费（做市） |
-| 持仓形式 | ETH + USDC 代币余额 | LP NFT 头寸 |
-| 链上操作 | 单步 swap | 四步：claim → remove → swap → deposit |
-| 核心参数 | 网格间距、层数 | 范围宽度、tick 间距 |
-| 主要风险 | 单边行情踏空 | 无常损失 (IL) |
-| Gas 敏感度 | 低 | 高（多步操作） |
-
 ## 快速开始
-
-详细步骤见 [SETUP.md](SETUP.md)。
 
 ```bash
 # 1. 安装
