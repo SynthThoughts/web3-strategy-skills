@@ -391,7 +391,19 @@ Response: {
 
 ## Deployment
 
-### ZeroClaw Cron (recommended)
+### OpenClaw Cron
+
+```bash
+# tick: 每 5 分钟
+openclaw cron add --expr "*/5 * * * *" --shell \
+  "cd ~/scripts/cross-funding && set -a && . ./.env && set +a && python3 cross_funding.py tick"
+
+# 日报: 每天 00:00 UTC
+openclaw cron add --expr "0 0 * * *" --agent \
+  "执行跨交易所资金费率套利日报: cd ~/scripts/cross-funding && set -a && . ./.env && set +a && python3 cross_funding.py report。将完整输出结果总结后回复我。"
+```
+
+### ZeroClaw Cron
 
 ```bash
 # tick: 每 5 分钟
