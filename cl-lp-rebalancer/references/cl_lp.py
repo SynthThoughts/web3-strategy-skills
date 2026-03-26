@@ -1647,14 +1647,18 @@ def _build_notification(tier: str, data: dict) -> dict:
             f"_tx: {tx[:10]}...{tx[-6:]}_" if tx else None,
         ]
 
+        discord_embed = {
+            "title": f"{icon} {verb} · {PAIR_NAME} · {CHAIN_LABEL}",
+            "color": color,
+            "fields": fields_discord,
+            "footer": {"text": footer},
+        }
+        if visual:
+            discord_embed["description"] = f"`{visual}`"
+
         return {
             "tier": "trade_alert",
-            "discord": {
-                "title": f"{icon} {verb} · {PAIR_NAME} · {CHAIN_LABEL}",
-                "color": color,
-                "fields": fields_discord,
-                "footer": {"text": footer},
-            },
+            "discord": discord_embed,
             "text": "\n".join(ln for ln in text_lines if ln),
         }
 
@@ -1738,14 +1742,18 @@ def _build_notification(tier: str, data: dict) -> dict:
             f"_{footer}_",
         ]
 
+        discord_embed = {
+            "title": f"📊 {PAIR_NAME} · {CHAIN_LABEL} · 运行中",
+            "color": 0x808080,
+            "fields": fields_discord,
+            "footer": {"text": footer},
+        }
+        if visual:
+            discord_embed["description"] = f"`{visual}`"
+
         return {
             "tier": "hourly_pulse",
-            "discord": {
-                "title": f"📊 {PAIR_NAME} · {CHAIN_LABEL} · 运行中",
-                "color": 0x808080,
-                "fields": fields_discord,
-                "footer": {"text": footer},
-            },
+            "discord": discord_embed,
             "text": "\n".join(ln for ln in text_lines if ln),
         }
 
@@ -1812,14 +1820,24 @@ def _build_notification(tier: str, data: dict) -> dict:
             f"_{footer}_",
         ]
 
+        # Range visualization for daily report
+        pos = data.get("position", {})
+        d_lower = pos.get("lower_price", 0)
+        d_upper = pos.get("upper_price", 0)
+        daily_visual = _range_visual(price, d_lower, d_upper) if d_lower and d_upper else ""
+
+        discord_embed = {
+            "title": f"📈 日报 · {PAIR_NAME} · {today}",
+            "color": 0x3399FF,
+            "fields": fields_discord,
+            "footer": {"text": footer},
+        }
+        if daily_visual:
+            discord_embed["description"] = f"`{daily_visual}`"
+
         return {
             "tier": "daily_report",
-            "discord": {
-                "title": f"📈 日报 · {PAIR_NAME} · {today}",
-                "color": 0x3399FF,
-                "fields": fields_discord,
-                "footer": {"text": footer},
-            },
+            "discord": discord_embed,
             "text": "\n".join(ln for ln in text_lines if ln),
         }
 
