@@ -11,52 +11,49 @@
 - **自动切仓**：Spread 不利时平仓，下一 tick 自动寻找新机会
 - **多渠道通知**：Discord embed + Telegram markdown，按 tier 分级推送
 
-## Architecture
-
-```
-VarFunding API → Scanner → Stability Check → Deep Verify → Atomic Open
-                                                              ↓
-                                                    HL (EIP-712) + Binance (HMAC)
-                                                              ↓
-                                                    Health Monitor → Auto Close/Switch
-```
-
 ## Quick Start
 
 ### 1. Install
 
 ```bash
-pip install -r requirements.txt
+npx clawhub install cross-funding-arb --force
+pip install -r references/requirements.txt
 ```
 
 ### 2. Configure
 
 ```bash
-cp .env.example .env
-# 编辑 .env，填入 HL 私钥和 Binance API Key
-```
+# OpenClaw
+cp .env.example ~/.openclaw/skills/cross-funding-arb/references/.env
+# 编辑 .env，填入 HL_PRIVATE_KEY, BINANCE_API_KEY, BINANCE_SECRET_KEY
 
-编辑 `config.json` 调整预算和风控参数。
+# 可选：调整 references/config.json 中的风控参数
+```
 
 ### 3. Test
 
 ```bash
-# 查看当前状态
-python3 -m funding.hl_cross_funding status
+cd ~/.openclaw/skills/cross-funding-arb/references
+set -a && . ./.env && set +a
 
-# 单次 tick（扫描 + 开仓/维护）
-python3 -m funding.hl_cross_funding tick
+python3 cross_funding.py status    # 查看当前状态
+python3 cross_funding.py tick      # 单次 tick
 ```
 
 ### 4. Deploy
 
 ```bash
-# ZeroClaw cron（推荐）
-zeroclaw cron add --expr "*/5 * * * *" --shell \
-  "cd ~/scripts/hyperliquid && set -a && . ./.env && set +a && python3 -m funding.hl_cross_funding tick"
+SKILL_DIR=~/.openclaw/skills/cross-funding-arb/references
+
+# OpenClaw cron
+openclaw cron add \
+  --name "cross-funding-tick" \
+  --cron "*/5 * * * *" \
+  --session main \
+  --system-event "cd $SKILL_DIR && set -a && . ./.env && set +a && python3 cross_funding.py tick"
 
 # 或系统 crontab
-*/5 * * * * cd ~/scripts/hyperliquid && set -a && . ./.env && set +a && python3 -m funding.hl_cross_funding tick >> /tmp/cross_funding.log 2>&1
+*/5 * * * * cd $SKILL_DIR && set -a && . ./.env && set +a && python3 cross_funding.py tick >> /tmp/cross_funding.log 2>&1
 ```
 
 ## Commands
@@ -73,7 +70,7 @@ zeroclaw cron add --expr "*/5 * * * *" --shell \
 |---|---|
 | 稳定性验证 | 3+ 快照 + std_ratio < 0.3 |
 | 深度验证 | 实时费率 + 价格差 < 0.5% + 净 APR ≥ 10% |
-| 保守预算 | min(两所) × 50% |
+| 保守预算 | min(两所) × 50%，budget=0 自动读取账户余额 |
 | 滑点 0.1% | 远低于常规 5%，保护套利利润 |
 | HL Margin 重试 | size 减半最多 3 次 |
 | 原子回滚 | BN 失败 → 自动平 HL |
@@ -84,7 +81,7 @@ zeroclaw cron add --expr "*/5 * * * *" --shell \
 - Python 3.10+
 - Hyperliquid 账户 + 私钥
 - Binance Futures 账户 + API Key（USDT-M 交易权限）
-- 两所均需有足够保证金（建议 HL ≥ $300, Binance ≥ $450）
+- 两所均需存入保证金（策略自动检测账户余额）
 
 ## License
 

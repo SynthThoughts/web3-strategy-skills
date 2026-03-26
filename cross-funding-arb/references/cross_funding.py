@@ -189,32 +189,52 @@ def _parse_toml_section(text: str, section: str) -> dict[str, str]:
     return result
 
 
-def _read_zeroclaw_config() -> dict[str, str]:
-    """Read ZeroClaw config.toml, search by instance priority.
+def _read_daemon_config() -> dict:
+    """Read bot token from OpenClaw (JSON) or ZeroClaw (TOML) config.
 
-    Order: zeroclaw-strategy > zeroclaw > zeroclaw-data > zeroclaw-ops
+    Search order:
+      1. ~/.openclaw/openclaw.json  (OpenClaw)
+      2. ~/.zeroclaw/config.toml  (ZeroClaw instances)
+      3. ~/.zeroclaw/config.toml
+      4. ~/.zeroclaw-data/config.toml
+      5. ~/.zeroclaw-ops/config.toml
     """
-    for instance in ["zeroclaw-strategy", "zeroclaw", "zeroclaw-data", "zeroclaw-ops"]:
+    # OpenClaw: JSON format
+    oc_path = Path.home() / ".openclaw" / "openclaw.json"
+    if oc_path.exists():
+        try:
+            data = json.loads(oc_path.read_text())
+            channels = data.get("channels", {})
+            return {"_type": "openclaw", "_data": channels}
+        except Exception:
+            pass
+
+    # ZeroClaw: TOML format
+    for instance in ["zeroclaw", "zeroclaw-strategy", "zeroclaw-data", "zeroclaw-ops"]:
         cfg_path = Path.home() / f".{instance}" / "config.toml"
         if cfg_path.exists():
             try:
-                return {"_text": cfg_path.read_text(), "_instance": instance}
+                return {"_type": "zeroclaw", "_text": cfg_path.read_text()}
             except Exception:
                 pass
     return {}
 
 
-_ZC_CONFIG = _read_zeroclaw_config()
+_DAEMON_CONFIG = _read_daemon_config()
 
 
 def _get_discord_token() -> str:
-    """Discord bot token: env > ZeroClaw channels_config.discord.bot_token"""
+    """Discord bot token: env > OpenClaw/ZeroClaw config."""
     env_token = os.environ.get("DISCORD_BOT_TOKEN", "")
     if env_token:
         return env_token
-    text = _ZC_CONFIG.get("_text", "")
-    if text:
-        section = _parse_toml_section(text, "channels_config.discord")
+    cfg_type = _DAEMON_CONFIG.get("_type")
+    if cfg_type == "openclaw":
+        return _DAEMON_CONFIG.get("_data", {}).get("discord", {}).get("token", "")
+    if cfg_type == "zeroclaw":
+        section = _parse_toml_section(
+            _DAEMON_CONFIG.get("_text", ""), "channels_config.discord"
+        )
         return section.get("bot_token", "")
     return ""
 
@@ -225,16 +245,20 @@ def _get_discord_channel_id() -> str:
 
 
 def _get_telegram_config() -> tuple[str, str]:
-    """Telegram creds: env > ZeroClaw channels_config.telegram.
+    """Telegram creds: env > OpenClaw/ZeroClaw config.
 
-    bot_token falls back to ZeroClaw config, chat_id from env only.
+    bot_token falls back to daemon config, chat_id from env only.
     """
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     if not token:
-        text = _ZC_CONFIG.get("_text", "")
-        if text:
-            section = _parse_toml_section(text, "channels_config.telegram")
+        cfg_type = _DAEMON_CONFIG.get("_type")
+        if cfg_type == "openclaw":
+            token = _DAEMON_CONFIG.get("_data", {}).get("telegram", {}).get("token", "")
+        elif cfg_type == "zeroclaw":
+            section = _parse_toml_section(
+                _DAEMON_CONFIG.get("_text", ""), "channels_config.telegram"
+            )
             token = section.get("bot_token", "")
     return token, chat_id
 

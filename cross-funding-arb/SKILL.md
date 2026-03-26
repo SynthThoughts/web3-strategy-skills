@@ -274,7 +274,7 @@ python3 cross_funding.py status
 | `hourly_pulse` | 每小时（持仓中） | ⚪ Grey | 两所余额, 费率, Spread, PnL |
 | `daily_report` | 每日报告 | 🔵 Blue | 持仓详情, 总资产, ROI, 年化 |
 
-通知同时推送 Discord embed + Telegram markdown。凭证解析优先级：环境变量 > ZeroClaw config.toml。未配置时静默跳过。
+通知同时推送 Discord embed + Telegram markdown。凭证解析优先级：环境变量 > OpenClaw `openclaw.json` > ZeroClaw `config.toml`。未配置时静默跳过。
 
 ## State Schema
 
@@ -398,7 +398,7 @@ Response: {
 ~/.openclaw/skills/cross-funding-arb/references/cross_funding.py
 
 # ZeroClaw 安装路径
-~/.zeroclaw-strategy/skills/cross-funding-arb/references/cross_funding.py
+~/.zeroclaw/skills/cross-funding-arb/references/cross_funding.py
 ```
 
 **安装后配置**：将 `.env` 放到 `references/` 目录（与 `cross_funding.py` 同级）：
@@ -409,7 +409,7 @@ cp .env.example ~/.openclaw/skills/cross-funding-arb/references/.env
 # 编辑填入 HL_PRIVATE_KEY, BINANCE_API_KEY, BINANCE_SECRET_KEY
 
 # ZeroClaw
-cp .env.example ~/.zeroclaw-strategy/skills/cross-funding-arb/references/.env
+cp .env.example ~/.zeroclaw/skills/cross-funding-arb/references/.env
 ```
 
 ### OpenClaw Cron
@@ -438,7 +438,7 @@ openclaw cron add \
 ### ZeroClaw Cron
 
 ```bash
-SKILL_DIR=~/.zeroclaw-strategy/skills/cross-funding-arb/references
+SKILL_DIR=~/.zeroclaw/skills/cross-funding-arb/references
 
 # tick: 每 5 分钟
 zeroclaw cron add --expr "*/5 * * * *" --shell \
