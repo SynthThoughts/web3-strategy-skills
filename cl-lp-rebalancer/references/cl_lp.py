@@ -2549,45 +2549,45 @@ def _tick_inner():
     notify = tier != ""
     emit("tick", tick_data, notify=notify, tier=tier)
 
+    # Cache snapshot for fast status queries
+    tick_data["_cached_at"] = datetime.now().isoformat()
+    state["_cached_snapshot"] = tick_data
+    save_state(state)
+
 
 # ── Sub-commands ────────────────────────────────────────────────────────────
 
 
-def status():
-    """Print current status with full portfolio breakdown."""
-    state = load_state()
-    price = get_eth_price()
-    eth_bal, usdc_bal, bal_failed = get_balances()
-    if bal_failed:
-        print("> 余额查询失败，显示的余额可能不准确")
-    wallet_usd = eth_bal * (price or 0) + usdc_bal
+def _print_status_from_snapshot(snap: dict, state: dict, cached_age_s: float = 0):
+    """Render status text from a tick_data snapshot (cached or live)."""
     position = state.get("position")
-    lp_value = 0.0
-    unclaimed_fee = 0.0
-    lp_assets = []
-    if position and position.get("token_id"):
-        pos_detail = get_position_detail(position["token_id"])
-        lp_value = pos_detail["value"]
-        unclaimed_fee = pos_detail["unclaimed_fee_usd"]
-        lp_assets = pos_detail.get("assets", [])
-    total_usd = wallet_usd + lp_value
     stats = state.get("stats", {})
-    history = state.get("price_history", [])
+    price = snap.get("price", 0)
+    bals = snap.get("balances", {})
+    eth_bal = bals.get("eth", 0)
+    usdc_bal = bals.get("usdc", 0)
+    lp_value = bals.get("lp_usd", 0)
+    lp_assets = bals.get("lp_assets", [])
+    total_usd = snap.get("portfolio_usd", 0)
+    unclaimed_fee = snap.get("unclaimed_fee_usd", 0)
 
-    print("**CL LP Auto-Rebalancer v1 -- 状态**")
+    header = "**CL LP Auto-Rebalancer v1 -- 状态**"
+    if cached_age_s > 0:
+        header += f" (缓存 {cached_age_s:.0f}s 前)"
+    print(header)
     print(f"> 价格: `${price:.2f}`" if price else "> 价格: 不可用")
 
-    # Wallet breakdown
+    # Wallet + LP breakdown
+    wallet_usd = eth_bal * price + usdc_bal
     print(f"> 钱包: `{eth_bal:.6f}` ETH + `${usdc_bal:.2f}` USDC (`${wallet_usd:.0f}`)")
 
-    # LP breakdown with asset detail
     if lp_value > 0:
         lp_detail_parts = []
-        for asset in lp_assets:
-            sym = asset.get("tokenSymbol", "")
-            amt = asset.get("coinAmount", "0")
-            if sym and float(amt) > 0:
-                lp_detail_parts.append(f"{float(amt):.4f} {sym}")
+        for a in lp_assets:
+            sym = a.get("symbol", "")
+            amt = a.get("amount", 0)
+            if sym and amt > 0:
+                lp_detail_parts.append(f"{amt:.4f} {sym}")
         lp_detail = " + ".join(lp_detail_parts) if lp_detail_parts else ""
         lp_line = f"> LP 头寸: `${lp_value:.0f}`"
         if lp_detail:
@@ -2598,99 +2598,195 @@ def status():
 
     print(f"> **总价值: `${total_usd:.0f}`**")
 
-    if position and position.get("tick_lower"):
+    # Position range
+    pos_snap = snap.get("position")
+    if pos_snap:
+        lower_p = pos_snap.get("lower_price", 0)
+        upper_p = pos_snap.get("upper_price", 0)
+        if lower_p and upper_p:
+            in_range = lower_p <= (price or 0) <= upper_p
+            status_emoji = "✅" if in_range else "⚠️"
+            status_str = "范围内" if in_range else "范围外"
+            edge_str = ""
+            if in_range and price:
+                edge_dist = min(
+                    (price - lower_p) / (upper_p - lower_p),
+                    (upper_p - price) / (upper_p - lower_p),
+                )
+                edge_str = f" | 边缘距离: `{edge_dist:.0%}`"
+            print(
+                f"> {status_emoji} 范围: `${lower_p:.2f}` - `${upper_p:.2f}` ({status_str}{edge_str})"
+            )
+            if price:
+                bar_w = 30
+                pos_ratio = max(0.0, min(1.0, (price - lower_p) / (upper_p - lower_p)))
+                cursor = round(pos_ratio * (bar_w - 1))
+                bar = list("░" * bar_w)
+                if 0 <= cursor < bar_w:
+                    bar[cursor] = "█"
+                print(f"> `${lower_p:.0f} [{''.join(bar)}] ${upper_p:.0f}`")
+                print(f"> `{' ' * (len(f'${lower_p:.0f} [') + cursor)}▲${price:.0f}`")
+    elif position and position.get("tick_lower"):
         lower_p = position.get("lower_price", tick_to_price(position["tick_lower"]))
         upper_p = position.get("upper_price", tick_to_price(position["tick_upper"]))
-        in_range = lower_p <= (price or 0) <= upper_p
-        status_emoji = "✅" if in_range else "⚠️"
-        status_str = "范围内" if in_range else "范围外"
-        # Edge proximity
-        if in_range and price:
-            dist_lower = (price - lower_p) / (upper_p - lower_p)
-            dist_upper = (upper_p - price) / (upper_p - lower_p)
-            edge_dist = min(dist_lower, dist_upper)
-            edge_str = f" | 边缘距离: `{edge_dist:.0%}`"
-        else:
-            edge_str = ""
-        print(
-            f"> {status_emoji} 范围: `${lower_p:.2f}` - `${upper_p:.2f}` ({status_str}{edge_str})"
-        )
-        # ASCII tick range visualization
-        if price:
-            bar_w = 30
-            pos_ratio = max(0.0, min(1.0, (price - lower_p) / (upper_p - lower_p)))
-            cursor = round(pos_ratio * (bar_w - 1))
-            bar = list("░" * bar_w)
-            if 0 <= cursor < bar_w:
-                bar[cursor] = "█"
-            print(f"> `${lower_p:.0f} [{''.join(bar)}] ${upper_p:.0f}`")
-            print(f"> `{' ' * (len(f'${lower_p:.0f} [') + cursor)}▲${price:.0f}`")
-        if position.get("created_at"):
-            created_dt = _safe_isoparse(position["created_at"])
-            if created_dt:
-                age_h = (datetime.now() - created_dt).total_seconds() / 3600
-                rebal_count = stats.get("total_rebalances", 0)
-                print(
-                    f"> 头寸年龄: `{age_h:.1f}h` | 调仓: `{rebal_count}` 次 | token_id: `{position.get('token_id', 'N/A')}`"
-                )
+        print(f"> 范围: `${lower_p:.2f}` - `${upper_p:.2f}`")
     else:
         print("> 头寸: 未建立")
 
-    # K-line ATR
-    kline_cache = state.get("kline_cache")
-    if kline_cache:
-        atr = kline_cache.get("atr_pct", 0)
-        regime = classify_volatility(atr)
-        print(f"\n> ATR(1H): `{atr:.2f}%` ({regime})")
+    if position and position.get("created_at"):
+        created_dt = _safe_isoparse(position["created_at"])
+        if created_dt:
+            age_h = (datetime.now() - created_dt).total_seconds() / 3600
+            rebal_count = stats.get("total_rebalances", 0)
+            print(
+                f"> 头寸年龄: `{age_h:.1f}h` | 调仓: `{rebal_count}` 次 | token_id: `{position.get('token_id', 'N/A')}`"
+            )
 
-    # MTF
-    if price and len(history) >= MTF_SHORT_PERIOD:
-        mtf = analyze_multi_timeframe(history, price)
-        print(
-            f"> 趋势: `{mtf['trend']}` ({mtf['strength']:.0%}) | 结构: `{mtf['structure']}`"
-        )
-        print(
-            f"> 动量: 1h `{mtf['momentum_1h']:+.2f}%` | 4h `{mtf['momentum_4h']:+.2f}%`"
-        )
+    # ATR + Trend
+    atr_pct = snap.get("atr_pct", 0)
+    regime = snap.get("regime", "")
+    if atr_pct:
+        print(f"\n> ATR(1H): `{atr_pct:.2f}%` ({regime})")
+    trend = snap.get("trend", "")
+    trend_str = snap.get("trend_strength", 0)
+    if trend:
+        print(f"> 趋势: `{trend}` ({trend_str:.0%})")
 
     # PnL & Yield
-    # Update unclaimed in stats so calc_pnl includes it for APY
-    stats["unclaimed_fee_usd"] = round(unclaimed_fee, 2)
-    pnl = calc_pnl(stats, total_usd)
     print("\n**收益**")
-    if pnl["valid"] and price:
-        print(f"> PnL: **`${pnl['pnl_usd']:+.2f}`** (`{pnl['pnl_pct']:+.1f}%`)")
+    if snap.get("pnl_valid") and price:
+        print(f"> PnL: **`${snap['pnl_usd']:+.2f}`** (`{snap['pnl_pct']:+.1f}%`)")
         print(
-            f"> 年化 APY: Fee `{pnl['fee_apy']:+.1f}%` | Net `{pnl['net_apy']:+.1f}%` (运行 `{pnl['days_running']:.1f}` 天)"
+            f"> 年化 APY: Fee `{snap.get('fee_apy', 0):+.1f}%` | Net `{snap.get('net_apy', 0):+.1f}%` (运行 `{snap.get('days_running', 0):.1f}` 天)"
         )
     else:
         print("> PnL: 数据不足")
-    # Fee income
-    claimed_fee = stats.get("total_fees_claimed_usd", 0)
+
+    claimed_fee = snap.get("total_fees_claimed_usd", 0)
     total_fees = claimed_fee + unclaimed_fee
     if total_fees > 0.01:
         print(
             f"> LP 手续费: `${total_fees:.2f}` (已领 `${claimed_fee:.2f}` + 待领 `${unclaimed_fee:.2f}`)"
         )
-    # IL: exact V3 formula, position entry price > initial price
-    pos_lower = position.get("lower_price", 0) if position else 0
-    pos_upper = position.get("upper_price", 0) if position else 0
-    pos_entry = position.get("entry_price", 0) if position else 0
-    entry_price = pos_entry or stats.get("initial_eth_price")
-    if entry_price and price:
-        il_pct = estimate_il(entry_price, price, pos_lower, pos_upper)
-        il_usd = round(il_pct / 100 * total_usd, 2)
+
+    il_pct = snap.get("il_pct", 0)
+    il_usd = snap.get("il_usd", 0)
+    if il_pct:
         print(f"> 无常损失: `${il_usd:.2f}` (`{il_pct:.2f}%`)")
 
     print("\n**运行**")
-    tir = stats.get("time_in_range_pct", 0)
-    rebalances = stats.get("total_rebalances", 0)
+    tir = snap.get("time_in_range_pct", 0)
+    rebalances = snap.get("total_rebalances", 0)
     print(f"> 范围内时间: `{tir:.0f}%` | 调仓次数: `{rebalances}`")
 
     stop = state.get("stop_triggered")
     if stop:
         print(f"\n> 🔴 **交易已停止**: `{stop}`")
         print("> 使用 `resume-trading` 恢复")
+
+
+# Maximum cache age: 360s (slightly over 5-min tick interval)
+_SNAPSHOT_MAX_AGE_S = 360
+
+
+def status():
+    """Print current status — uses cached tick snapshot if fresh, else queries live."""
+    state = load_state()
+
+    # Try cached snapshot first
+    cached = state.get("_cached_snapshot")
+    if cached:
+        cached_at = _safe_isoparse(cached.get("_cached_at", ""))
+        if cached_at:
+            age_s = (datetime.now() - cached_at).total_seconds()
+            if age_s < _SNAPSHOT_MAX_AGE_S:
+                _print_status_from_snapshot(cached, state, cached_age_s=age_s)
+                return
+
+    # Cache stale or missing — live query
+    price = get_eth_price()
+    eth_bal, usdc_bal, bal_failed = get_balances()
+    if bal_failed:
+        print("> 余额查询失败，显示的余额可能不准确")
+    wallet_usd = eth_bal * (price or 0) + usdc_bal
+    position = state.get("position")
+    lp_value = 0.0
+    unclaimed_fee = 0.0
+    lp_assets_raw = []
+    if position and position.get("token_id"):
+        pos_detail = get_position_detail(position["token_id"])
+        lp_value = pos_detail["value"]
+        unclaimed_fee = pos_detail["unclaimed_fee_usd"]
+        lp_assets_raw = pos_detail.get("assets", [])
+    total_usd = wallet_usd + lp_value
+    stats = state.get("stats", {})
+    history = state.get("price_history", [])
+
+    # Build a live snapshot in tick_data format for the shared renderer
+    stats["unclaimed_fee_usd"] = round(unclaimed_fee, 2)
+    pnl = calc_pnl(stats, total_usd)
+
+    pos_entry = position.get("entry_price", 0) if position else 0
+    entry_price = pos_entry or stats.get("initial_eth_price", 0)
+    pos_lower = position.get("lower_price", 0) if position else 0
+    pos_upper = position.get("upper_price", 0) if position else 0
+    il_pct = (
+        estimate_il(entry_price, price, pos_lower, pos_upper) if entry_price else 0.0
+    )
+    il_usd = round(il_pct / 100 * total_usd, 2) if il_pct else 0.0
+
+    # MTF
+    mtf = {}
+    if price and len(history) >= MTF_SHORT_PERIOD:
+        mtf = analyze_multi_timeframe(history, price)
+
+    # ATR
+    kline_cache = state.get("kline_cache")
+    atr_pct = kline_cache.get("atr_pct", 0) if kline_cache else 0
+
+    live_snap = {
+        "price": round(price, 2) if price else 0,
+        "atr_pct": round(atr_pct, 2),
+        "regime": classify_volatility(atr_pct),
+        "trend": mtf.get("trend", ""),
+        "trend_strength": round(mtf.get("strength", 0), 2),
+        "portfolio_usd": round(total_usd, 2),
+        "pnl_usd": pnl["pnl_usd"],
+        "pnl_pct": round(pnl["pnl_pct"], 2),
+        "pnl_valid": pnl["valid"],
+        "unclaimed_fee_usd": round(unclaimed_fee, 2),
+        "total_fees_claimed_usd": round(stats.get("total_fees_claimed_usd", 0), 2),
+        "il_pct": round(il_pct, 2),
+        "il_usd": il_usd,
+        "fee_apy": pnl["fee_apy"],
+        "net_apy": pnl["net_apy"],
+        "days_running": pnl["days_running"],
+        "cost_basis": pnl["cost_basis"],
+        "balances": {
+            "eth": round(eth_bal, 6),
+            "usdc": round(usdc_bal, 2),
+            "lp_usd": round(lp_value, 2),
+            "lp_assets": [
+                {
+                    "symbol": a.get("tokenSymbol", ""),
+                    "amount": float(a.get("coinAmount", 0)),
+                }
+                for a in lp_assets_raw
+                if float(a.get("coinAmount", 0)) > 0
+            ],
+        },
+        "time_in_range_pct": stats.get("time_in_range_pct", 0),
+        "total_rebalances": stats.get("total_rebalances", 0),
+    }
+    if position and position.get("tick_lower"):
+        live_snap["position"] = {
+            "tick_lower": position["tick_lower"],
+            "tick_upper": position["tick_upper"],
+            "lower_price": position.get("lower_price"),
+            "upper_price": position.get("upper_price"),
+        }
+
+    _print_status_from_snapshot(live_snap, state)
 
 
 def report():
