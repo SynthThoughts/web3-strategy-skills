@@ -189,53 +189,54 @@ def _parse_toml_section(text: str, section: str) -> dict[str, str]:
     return result
 
 
-def _read_daemon_config() -> dict:
-    """Read bot token from OpenClaw (JSON) or ZeroClaw (TOML) config.
+def _read_daemon_configs() -> list[dict]:
+    """Read all available daemon configs for bot token resolution.
 
-    Search order:
-      1. ~/.openclaw/openclaw.json  (OpenClaw)
-      2. ~/.zeroclaw/config.toml  (ZeroClaw instances)
-      3. ~/.zeroclaw/config.toml
-      4. ~/.zeroclaw-data/config.toml
-      5. ~/.zeroclaw-ops/config.toml
+    Returns a list of config sources (OpenClaw JSON + ZeroClaw TOML instances).
+    Callers try each source in order until a token is found.
     """
+    sources: list[dict] = []
+
     # OpenClaw: JSON format
     oc_path = Path.home() / ".openclaw" / "openclaw.json"
     if oc_path.exists():
         try:
             data = json.loads(oc_path.read_text())
             channels = data.get("channels", {})
-            return {"_type": "openclaw", "_data": channels}
+            sources.append({"_type": "openclaw", "_data": channels})
         except Exception:
             pass
 
-    # ZeroClaw: TOML format
-    for instance in ["zeroclaw", "zeroclaw-strategy", "zeroclaw-data", "zeroclaw-ops"]:
+    # ZeroClaw: TOML format (try all instances)
+    for instance in ["zeroclaw-strategy", "zeroclaw", "zeroclaw-data", "zeroclaw-ops"]:
         cfg_path = Path.home() / f".{instance}" / "config.toml"
         if cfg_path.exists():
             try:
-                return {"_type": "zeroclaw", "_text": cfg_path.read_text()}
+                sources.append({"_type": "zeroclaw", "_text": cfg_path.read_text()})
             except Exception:
                 pass
-    return {}
+    return sources
 
 
-_DAEMON_CONFIG = _read_daemon_config()
+_DAEMON_CONFIGS = _read_daemon_configs()
 
 
 def _get_discord_token() -> str:
-    """Discord bot token: env > OpenClaw/ZeroClaw config."""
+    """Discord bot token: env > first available daemon config."""
     env_token = os.environ.get("DISCORD_BOT_TOKEN", "")
     if env_token:
         return env_token
-    cfg_type = _DAEMON_CONFIG.get("_type")
-    if cfg_type == "openclaw":
-        return _DAEMON_CONFIG.get("_data", {}).get("discord", {}).get("token", "")
-    if cfg_type == "zeroclaw":
-        section = _parse_toml_section(
-            _DAEMON_CONFIG.get("_text", ""), "channels_config.discord"
-        )
-        return section.get("bot_token", "")
+    for cfg in _DAEMON_CONFIGS:
+        token = ""
+        if cfg["_type"] == "openclaw":
+            token = cfg.get("_data", {}).get("discord", {}).get("token", "")
+        elif cfg["_type"] == "zeroclaw":
+            section = _parse_toml_section(
+                cfg.get("_text", ""), "channels_config.discord"
+            )
+            token = section.get("bot_token", "")
+        if token:
+            return token
     return ""
 
 
@@ -245,21 +246,24 @@ def _get_discord_channel_id() -> str:
 
 
 def _get_telegram_config() -> tuple[str, str]:
-    """Telegram creds: env > OpenClaw/ZeroClaw config.
+    """Telegram creds: env > first available daemon config.
 
     bot_token falls back to daemon config, chat_id from env only.
     """
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     if not token:
-        cfg_type = _DAEMON_CONFIG.get("_type")
-        if cfg_type == "openclaw":
-            token = _DAEMON_CONFIG.get("_data", {}).get("telegram", {}).get("token", "")
-        elif cfg_type == "zeroclaw":
-            section = _parse_toml_section(
-                _DAEMON_CONFIG.get("_text", ""), "channels_config.telegram"
-            )
-            token = section.get("bot_token", "")
+        for cfg in _DAEMON_CONFIGS:
+            if cfg["_type"] == "openclaw":
+                # OpenClaw uses camelCase "botToken"
+                token = cfg.get("_data", {}).get("telegram", {}).get("botToken", "")
+            elif cfg["_type"] == "zeroclaw":
+                section = _parse_toml_section(
+                    cfg.get("_text", ""), "channels_config.telegram"
+                )
+                token = section.get("bot_token", "")
+            if token:
+                break
     return token, chat_id
 
 
