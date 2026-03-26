@@ -2687,7 +2687,8 @@ def _print_status_from_snapshot(snap: dict, state: dict, cached_age_s: float = 0
             sym = a.get("symbol", "")
             amt = a.get("amount", 0)
             if sym and amt > 0:
-                lp_detail_parts.append(f"{amt:.4f} {sym}")
+                usd_val = amt * price if sym.upper() in ("WETH", "ETH") else amt
+                lp_detail_parts.append(f"{amt:.4f} {sym} (${usd_val:,.0f})")
         lp_detail = " + ".join(lp_detail_parts) if lp_detail_parts else ""
         lp_line = f"> LP 头寸: `${lp_value:.0f}`"
         if lp_detail:
