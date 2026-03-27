@@ -4,7 +4,7 @@ description: "Uniswap V3 集中流动性 LP 自动调仓策略。基于波动率
 license: Apache-2.0
 metadata:
   author: SynthThoughts
-  version: "3.3.2"
+  version: "3.4.0"
   pattern: "pipeline, tool-wrapper"
   steps: "5"
 ---
@@ -251,10 +251,8 @@ onchainos defi search --chain <chain> --token "<token0>,<token1>" --product-grou
 
 **Actions**:
 1. If no existing position → always deploy (first run)
-2. Check rebalance triggers (in priority order):
+2. Check rebalance triggers:
    - **Out of range**: price < lower or price > upper → MUST rebalance
-   - **Volatility shift**: ATR changed >30% from position creation → adaptive rebalance
-   - **Time decay**: position age > 24h → maintenance rebalance
 3. Anti-churn checks:
    - Position age >= `MIN_POSITION_AGE` (2h)
    - Rebalance count < `MAX_REBALANCES_24H` (6/day)
@@ -356,8 +354,6 @@ Rebalance failure fallback: if deposit fails after remove, emergency deploy at 3
 
 | Parameter | Default | Description |
 |---|---|---|
-| `VOL_SHIFT_THRESHOLD` | `0.30` | Trigger if ATR changed >30% from position creation |
-| `MAX_POSITION_AGE_H` | `24` | Force rebalance after 24 hours |
 | `MIN_RANGE_CHANGE_PCT` | `0.05` | Skip rebalance if new range <5% different |
 
 ### Anti-Churn Controls
@@ -540,8 +536,6 @@ Key fields:
    c. Convert to ticks, align to tick_spacing
 8. Check rebalance triggers:
    a. Out of range → must rebalance
-   b. ATR shift > 30% → adaptive
-   c. Position age > 24h → maintenance
 9. Anti-churn gates (position age, frequency, gas cost, range change)
 10. If rebalancing:
     a. Claim fees → remove liquidity → swap to ratio → deposit at new range
@@ -606,5 +600,5 @@ IF rebalance sub-step fails:
 | Ignore gas costs | L1 gas can exceed daily fee income |
 | Symmetric range in trends | Miss upside in bull, excess downside in bear |
 | No IL tracking | Cannot detect when IL exceeds fee income |
-| Rebalance on every vol change | Minor ATR fluctuations cause unnecessary churn |
+| Rebalance on vol change alone | Minor ATR fluctuations cause unnecessary churn — only rebalance when out of range |
 | No time-in-range tracking | Cannot measure strategy effectiveness |

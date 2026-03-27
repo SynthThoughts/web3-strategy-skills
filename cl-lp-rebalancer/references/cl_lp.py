@@ -858,38 +858,9 @@ def check_rebalance_triggers(
         side = "below" if price < lower_price else "above"
         return {"trigger": "out_of_range", "priority": "mandatory", "detail": side}
 
-    # [2] Volatility regime change — adaptive
-    created_atr = position.get("created_atr_pct", 0)
-    if created_atr > 0:
-        vol_change = abs(atr_pct - created_atr) / created_atr
-        if vol_change > 0.3:
-            old_regime = classify_volatility(created_atr)
-            new_regime = classify_volatility(atr_pct)
-            return {
-                "trigger": "volatility_shift",
-                "priority": "adaptive",
-                "detail": f"{old_regime}->{new_regime} (delta {vol_change:.0%})",
-            }
-
-    # [4] Time decay — only when price drifts to outer edge of range (>24h)
-    created_at = position.get("created_at")
-    if created_at:
-        created_dt = _safe_isoparse(created_at)
-        age_seconds = (datetime.now() - created_dt).total_seconds() if created_dt else 0
-        if age_seconds > 86400:  # 24h
-            # Only trigger if price is in the outer 20% of range (near edge)
-            range_width = upper_price - lower_price
-            if range_width > 0:
-                position_in_range = (price - lower_price) / range_width
-                edge_threshold = 0.20
-                near_edge = position_in_range < edge_threshold or position_in_range > (1 - edge_threshold)
-                if near_edge:
-                    edge_side = "near_lower" if position_in_range < 0.5 else "near_upper"
-                    return {
-                        "trigger": "time_decay",
-                        "priority": "maintenance",
-                        "detail": f"{age_seconds / 3600:.1f}h old, {edge_side} ({position_in_range:.0%})",
-                    }
+    # [2] Higher yield pool detected — TODO: requires hourly yield API
+    # Trigger when another pool consistently outperforms for 1+ hour.
+    # Data source not yet available; placeholder for future implementation.
 
     return None
 
