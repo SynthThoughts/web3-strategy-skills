@@ -2004,7 +2004,7 @@ class CrossFundingEngine:
 
         hl_budget, bn_budget = self._get_budgets()
         budget = min(hl_budget, bn_budget)
-        conservative = budget * 0.5
+        conservative = budget * 0.8
         raw_size = self._calculate_size(conservative, price)
 
         hl_rounded = self.hl.round_size(coin, raw_size)
@@ -2264,6 +2264,7 @@ class CrossFundingEngine:
             entry_price=state.get("entry_price", 0),
             exit_price=current_price,
             pnl=pnl,
+            funding_pnl=round(funding_earned, 2),
             reason=f"funding earned: {funding_earned:.2f}",
         )
 
@@ -2721,11 +2722,12 @@ def _save_trade_history(trades: list[dict]) -> None:
 
 def log_trade(
     trade_type: str, coin: str, direction: dict, size: float, entry_price: float,
-    exit_price: float | None = None, pnl: float | None = None, reason: str = "",
+    exit_price: float | None = None, pnl: float | None = None,
+    funding_pnl: float | None = None, reason: str = "",
 ) -> None:
     """Append a trade record to trade_history.json."""
     trades = _load_trade_history()
-    trades.append({
+    record: dict = {
         "time": datetime.now(timezone.utc).isoformat(),
         "type": trade_type,
         "coin": coin,
@@ -2735,7 +2737,10 @@ def log_trade(
         "exit_price": exit_price,
         "pnl": pnl,
         "reason": reason,
-    })
+    }
+    if funding_pnl is not None:
+        record["funding_pnl"] = funding_pnl
+    trades.append(record)
     _save_trade_history(trades)
 
 
