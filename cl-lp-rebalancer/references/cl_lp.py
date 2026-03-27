@@ -1512,30 +1512,62 @@ def execute_rebalance(
         return _emergency_deposit(state, price, trigger)
 
     # Deposit returns bool; recover token_id and verify on-chain value
-    time.sleep(5)  # wait for chain confirmation
-    new_token_id = find_latest_token_id()
-    if new_token_id:
-        detail = get_position_detail(new_token_id)
-        lp_value = detail.get("value", 0)
-        if lp_value < MIN_TRADE_USD:
-            log(
-                f"  Deposit verification FAILED: token_id={new_token_id} "
-                f"on-chain value=${lp_value:.2f} (expected >=${MIN_TRADE_USD})"
-            )
-            log("  Deposit tx may have reverted — attempting emergency wide deposit")
-            return _emergency_deposit(state, price, trigger)
-        log(f"  Found token_id from position-detail: {new_token_id} (value=${lp_value:.2f})")
-        # Clean up any residual positions from previous failed rebalances
-        cleanup_residual_positions(new_token_id)
-    else:
-        # Deposit broadcast succeeded but can't find position — retry once
-        time.sleep(10)
+    # Retry verification with increasing delays (chain indexing can lag)
+    new_token_id = ""
+    lp_value = 0.0
+    for verify_attempt, delay in enumerate([8, 15, 25], 1):
+        time.sleep(delay)
         new_token_id = find_latest_token_id()
         if new_token_id:
-            log(f"  Found token_id on retry: {new_token_id}")
-            cleanup_residual_positions(new_token_id)
+            detail = get_position_detail(new_token_id)
+            lp_value = detail.get("value", 0)
+            if lp_value >= MIN_TRADE_USD:
+                log(
+                    f"  Deposit verified (attempt {verify_attempt}): "
+                    f"token_id={new_token_id} value=${lp_value:.2f}"
+                )
+                break
+            log(
+                f"  Verify attempt {verify_attempt}: token_id={new_token_id} "
+                f"value=${lp_value:.2f} (too low)"
+            )
         else:
-            log("  ERROR: deposit broadcast OK but token_id not found after retry")
+            log(f"  Verify attempt {verify_attempt}: no token_id found yet")
+    else:
+        # All verification attempts failed
+        dep_fails = state.get("_consecutive_deposit_failures", 0) + 1
+        state["_consecutive_deposit_failures"] = dep_fails
+        log(
+            f"  Deposit verification FAILED after 3 attempts "
+            f"(consecutive failures: {dep_fails}/{MAX_DEPOSIT_FAILURES})"
+        )
+        if dep_fails >= MAX_DEPOSIT_FAILURES:
+            state["stop_triggered"] = (
+                f"deposit_failures ({dep_fails} consecutive deposit verifications failed)"
+            )
+            save_state(state)
+            emit(
+                "stop_triggered",
+                {
+                    "status": "stop_triggered",
+                    "trigger": state["stop_triggered"],
+                    "price": round(price, 2),
+                },
+                notify=True,
+                tier="risk_alert",
+            )
+            log(
+                f"  AUTO-PAUSED: {dep_fails} consecutive deposit failures — "
+                f"manual intervention required (resume-trading to restart)"
+            )
+        else:
+            save_state(state)
+        return _emergency_deposit(state, price, trigger)
+
+    # Verification passed — reset failure counter
+    state["_consecutive_deposit_failures"] = 0
+    if new_token_id:
+        cleanup_residual_positions(new_token_id)
 
     # Update state
     now_iso = datetime.now().isoformat()
@@ -1613,21 +1645,52 @@ def _emergency_deposit(state: dict, price: float, trigger: dict) -> bool:
 
     deposit_result = defi_deposit(user_input, tick_lower, tick_upper)
     if deposit_result:
-        time.sleep(5)
-        new_token_id = find_latest_token_id()
-        if new_token_id:
-            detail = get_position_detail(new_token_id)
-            lp_value = detail.get("value", 0)
-            if lp_value < MIN_TRADE_USD:
+        # Retry verification with increasing delays
+        new_token_id = ""
+        lp_value = 0.0
+        for verify_attempt, delay in enumerate([8, 15, 25], 1):
+            time.sleep(delay)
+            new_token_id = find_latest_token_id()
+            if new_token_id:
+                detail = get_position_detail(new_token_id)
+                lp_value = detail.get("value", 0)
+                if lp_value >= MIN_TRADE_USD:
+                    log(
+                        f"  Emergency verified (attempt {verify_attempt}): "
+                        f"token_id={new_token_id} value=${lp_value:.2f}"
+                    )
+                    break
                 log(
-                    f"  Emergency deposit verification FAILED: token_id={new_token_id} "
-                    f"on-chain value=${lp_value:.2f}"
+                    f"  Emergency verify attempt {verify_attempt}: "
+                    f"token_id={new_token_id} value=${lp_value:.2f}"
                 )
-                return False
-            log(f"  Found token_id from position-detail: {new_token_id} (value=${lp_value:.2f})")
+            else:
+                log(f"  Emergency verify attempt {verify_attempt}: no token_id")
         else:
-            new_token_id = ""
-            log("  Warning: emergency deposit OK but token_id not found")
+            dep_fails = state.get("_consecutive_deposit_failures", 0) + 1
+            state["_consecutive_deposit_failures"] = dep_fails
+            log(
+                f"  Emergency deposit verification FAILED "
+                f"(consecutive: {dep_fails}/{MAX_DEPOSIT_FAILURES})"
+            )
+            if dep_fails >= MAX_DEPOSIT_FAILURES:
+                state["stop_triggered"] = (
+                    f"deposit_failures ({dep_fails} consecutive)"
+                )
+                save_state(state)
+                emit(
+                    "stop_triggered",
+                    {
+                        "status": "stop_triggered",
+                        "trigger": state["stop_triggered"],
+                    },
+                    notify=True,
+                    tier="risk_alert",
+                )
+                log("  AUTO-PAUSED: too many deposit failures")
+            return False
+        # Verification passed
+        state["_consecutive_deposit_failures"] = 0
 
         state["position"] = {
             "token_id": new_token_id,
@@ -2204,6 +2267,8 @@ def estimate_il(
 STOP_AUTO_RESUME = CFG.get("stop_auto_resume", True)
 STOP_RESUME_COOLDOWN = CFG.get("stop_resume_cooldown_seconds", 3600)  # 1h default
 STOP_RESUME_REBOUND_PCT = CFG.get("stop_resume_rebound_pct", 0.02)  # 2% default
+MAX_AUTO_RESUMES_24H = CFG.get("max_auto_resumes_24h", 2)  # max 2 auto-resumes per 24h
+MAX_DEPOSIT_FAILURES = CFG.get("max_deposit_failures", 3)  # pause after N consecutive deposit fails
 MAX_BALANCE_FAILURES = CFG.get("max_balance_failures", 5)
 
 
@@ -2412,42 +2477,67 @@ def _tick_inner():
         # Auto-resume logic
         resumed = False
         if STOP_AUTO_RESUME and "trailing_stop" in trigger_msg:
-            stop_time = _safe_isoparse(state.get("stop_triggered_at", ""))
-            cooldown_met = (
-                not stop_time
-                or (datetime.now() - stop_time).total_seconds() > STOP_RESUME_COOLDOWN
-            )
-            # Check drawdown recovery (use smoothed value)
-            stats = state.get("stats", {})
-            peak = stats.get("portfolio_peak_usd", 0)
-            value_history = state.get("_value_history", [])
-            smooth_usd = (
-                sorted(value_history[-5:])[len(value_history[-5:]) // 2]
-                if len(value_history) >= 3
-                else total_usd
-            )
-            current_drawdown = (peak - smooth_usd) / peak if peak > 0 else 1.0
-            # Resume if drawdown recovered below threshold with margin
-            resume_threshold = (
-                TRAILING_STOP_PCT * 0.7
-            )  # must recover to 70% of stop level
-            if cooldown_met and current_drawdown < resume_threshold:
+            # Check 24h resume count limit
+            resume_log = state.get("_auto_resume_log", [])
+            cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
+            resume_log = [t for t in resume_log if t > cutoff]
+            if len(resume_log) >= MAX_AUTO_RESUMES_24H:
                 log(
-                    f"AUTO-RESUME: drawdown {current_drawdown:.1%} < {resume_threshold:.1%} "
-                    f"threshold, cooldown met"
+                    f"AUTO-RESUME BLOCKED: {len(resume_log)} resumes in 24h "
+                    f"(limit={MAX_AUTO_RESUMES_24H})"
                 )
-                state.pop("stop_triggered", None)
-                state.pop("stop_notified", None)
-                state.pop("stop_triggered_at", None)
-                save_state(state)
-                resumed_data = {
-                    "status": "stop_resumed",
-                    "previous_trigger": trigger_msg,
-                    "drawdown_pct": round(current_drawdown * 100, 2),
-                    "price": round(price, 2),
-                }
-                emit("stop_resumed", resumed_data, notify=True, tier="trade_alert")
-                resumed = True
+            else:
+                stop_time = _safe_isoparse(state.get("stop_triggered_at", ""))
+                cooldown_met = (
+                    not stop_time
+                    or (datetime.now() - stop_time).total_seconds()
+                    > STOP_RESUME_COOLDOWN
+                )
+                # Check drawdown recovery (use smoothed value)
+                stats = state.get("stats", {})
+                peak = stats.get("portfolio_peak_usd", 0)
+                value_history = state.get("_value_history", [])
+                smooth_usd = (
+                    sorted(value_history[-5:])[len(value_history[-5:]) // 2]
+                    if len(value_history) >= 3
+                    else total_usd
+                )
+                current_drawdown = (
+                    (peak - smooth_usd) / peak if peak > 0 else 1.0
+                )
+                # Resume if drawdown recovered below threshold with margin
+                resume_threshold = (
+                    TRAILING_STOP_PCT * 0.7
+                )  # must recover to 70% of stop level
+                if cooldown_met and current_drawdown < resume_threshold:
+                    log(
+                        f"AUTO-RESUME: drawdown {current_drawdown:.1%} < "
+                        f"{resume_threshold:.1%} threshold, cooldown met "
+                        f"(resume {len(resume_log)+1}/{MAX_AUTO_RESUMES_24H})"
+                    )
+                    state.pop("stop_triggered", None)
+                    state.pop("stop_notified", None)
+                    state.pop("stop_triggered_at", None)
+                    # Reset peak to current value to prevent immediate re-trigger
+                    stats["portfolio_peak_usd"] = round(smooth_usd, 2)
+                    # Record this resume
+                    resume_log.append(datetime.now().isoformat())
+                    state["_auto_resume_log"] = resume_log
+                    save_state(state)
+                    resumed_data = {
+                        "status": "stop_resumed",
+                        "previous_trigger": trigger_msg,
+                        "drawdown_pct": round(current_drawdown * 100, 2),
+                        "price": round(price, 2),
+                        "resume_count_24h": len(resume_log),
+                    }
+                    emit(
+                        "stop_resumed",
+                        resumed_data,
+                        notify=True,
+                        tier="trade_alert",
+                    )
+                    resumed = True
 
         if not resumed:
             # Log dedup: only log stop message once per hour
@@ -3304,6 +3394,16 @@ def resume_trading():
     old_trigger = state["stop_triggered"]
     state.pop("stop_triggered", None)
     state.pop("stop_notified", None)
+    state.pop("stop_triggered_at", None)
+    # Reset failure counters and resume log on manual resume
+    state["_consecutive_deposit_failures"] = 0
+    state["_auto_resume_log"] = []
+    # Reset peak to current portfolio to prevent immediate re-trigger
+    eth_bal, usdc_bal, _ = get_balances(force=True)
+    price = get_eth_price()
+    if price:
+        current_usd = eth_bal * price + usdc_bal
+        state.setdefault("stats", {})["portfolio_peak_usd"] = round(current_usd, 2)
     save_state(state)
     log(f"Trading resumed (was: {old_trigger})")
     emit(
