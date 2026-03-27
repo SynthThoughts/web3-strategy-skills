@@ -1406,6 +1406,13 @@ def execute_rebalance(
             )
     elif token_id:
         log(f"  Skip claim: unclaimed ${unclaimed:.2f} < ${MIN_TRADE_USD:.0f}")
+        # Redeem will auto-collect fees, so count them as claimed
+        if unclaimed > 0:
+            state["stats"]["total_fees_claimed_usd"] = round(
+                state["stats"].get("total_fees_claimed_usd", 0) + unclaimed, 2
+            )
+            state["stats"]["unclaimed_fee_usd"] = 0.0
+            log(f"  (will be collected via redeem, recorded: ${unclaimed:.2f})")
 
     # Step 2: Remove liquidity
     if token_id:
@@ -2990,10 +2997,20 @@ def reset():
     state = load_state()
     position = state.get("position")
 
-    # Try to close existing position
+    # Try to close existing position — record fees before wiping state
+    carried_fees = 0.0
     if position and position.get("token_id"):
         log("Resetting: closing existing position...")
-        defi_claim_fees(position["token_id"])
+        pre_claim = get_position_detail(position["token_id"])
+        unclaimed = pre_claim.get("unclaimed_fee_usd", 0)
+        claimed = defi_claim_fees(position["token_id"])
+        if claimed and unclaimed > 0:
+            carried_fees = round(
+                state["stats"].get("total_fees_claimed_usd", 0) + unclaimed, 2
+            )
+            log(f"  Fees claimed on reset: ${unclaimed:.2f} (carried: ${carried_fees:.2f})")
+        else:
+            carried_fees = round(state["stats"].get("total_fees_claimed_usd", 0), 2)
         defi_redeem(position["token_id"])
 
     new_state = (
@@ -3015,7 +3032,7 @@ def reset():
             "rebalance_history": [],
             "stats": {
                 "total_rebalances": 0,
-                "total_fees_claimed_usd": 0.0,
+                "total_fees_claimed_usd": carried_fees,
                 "total_gas_spent_usd": 0.0,
                 "time_in_range_pct": 100.0,
                 "net_yield_usd": 0.0,
@@ -3053,7 +3070,18 @@ def close():
     token_id = position["token_id"]
     log(f"Closing position token_id={token_id}")
 
-    defi_claim_fees(token_id)
+    # Record unclaimed fees before claiming
+    pre_claim = get_position_detail(token_id)
+    unclaimed = pre_claim.get("unclaimed_fee_usd", 0)
+
+    claimed = defi_claim_fees(token_id)
+    if claimed and unclaimed > 0:
+        state["stats"]["total_fees_claimed_usd"] = round(
+            state["stats"].get("total_fees_claimed_usd", 0) + unclaimed, 2
+        )
+        state["stats"]["unclaimed_fee_usd"] = 0.0
+        log(f"  Fees claimed on close: ${unclaimed:.2f} (total: ${state['stats']['total_fees_claimed_usd']:.2f})")
+
     redeemed = defi_redeem(token_id)
 
     if redeemed:
