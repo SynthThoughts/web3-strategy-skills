@@ -3093,6 +3093,7 @@ def _build_position_dashboard(
     projected_daily = round(abs(current_spread) * 3 * avg_notional, 2)
 
     return {
+        "has_position": True,
         "coin": coin,
         "direction": direction,
         "entry_time": entry_time,
@@ -3126,6 +3127,7 @@ def _build_position_dashboard(
         "total_funding_pnl": total_funding,
         "total_price_pnl": total_price_pnl,
         "total_pnl": round(total_funding + total_price_pnl, 2),
+        "roi_pct": roi_pct,
         "current_apr": current_apr,
         "projected_daily_usd": projected_daily,
     }, total_funding
