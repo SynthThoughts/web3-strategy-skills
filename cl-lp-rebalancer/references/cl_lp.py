@@ -1475,11 +1475,20 @@ def execute_rebalance(
         log("  Deposit failed — attempting emergency wide deposit")
         return _emergency_deposit(state, price, trigger)
 
-    # Deposit returns bool; recover token_id from on-chain position-detail
+    # Deposit returns bool; recover token_id and verify on-chain value
     time.sleep(5)  # wait for chain confirmation
     new_token_id = find_latest_token_id()
     if new_token_id:
-        log(f"  Found token_id from position-detail: {new_token_id}")
+        detail = get_position_detail(new_token_id)
+        lp_value = detail.get("value", 0)
+        if lp_value < MIN_TRADE_USD:
+            log(
+                f"  Deposit verification FAILED: token_id={new_token_id} "
+                f"on-chain value=${lp_value:.2f} (expected >=${MIN_TRADE_USD})"
+            )
+            log("  Deposit tx may have reverted — attempting emergency wide deposit")
+            return _emergency_deposit(state, price, trigger)
+        log(f"  Found token_id from position-detail: {new_token_id} (value=${lp_value:.2f})")
     else:
         log("  Warning: deposit broadcast OK but token_id not found")
 
@@ -1562,7 +1571,15 @@ def _emergency_deposit(state: dict, price: float, trigger: dict) -> bool:
         time.sleep(5)
         new_token_id = find_latest_token_id()
         if new_token_id:
-            log(f"  Found token_id from position-detail: {new_token_id}")
+            detail = get_position_detail(new_token_id)
+            lp_value = detail.get("value", 0)
+            if lp_value < MIN_TRADE_USD:
+                log(
+                    f"  Emergency deposit verification FAILED: token_id={new_token_id} "
+                    f"on-chain value=${lp_value:.2f}"
+                )
+                return False
+            log(f"  Found token_id from position-detail: {new_token_id} (value=${lp_value:.2f})")
         else:
             new_token_id = ""
             log("  Warning: emergency deposit OK but token_id not found")
