@@ -1829,7 +1829,8 @@ class CrossFundingEngine:
         self.close_spread_threshold: float = cfg.get("close_spread_threshold", 0.0001)
         self.switch_threshold_apr: float = cfg.get("switch_threshold_apr", 5.0)
         self.max_breakeven_days: float = cfg.get("max_breakeven_days", 3.0)
-        self.max_price_basis_pct: float = cfg.get("max_price_basis_pct", 0.5)
+        self.max_price_basis_pct: float = cfg.get("max_price_basis_pct", 0.3)
+        self.max_entry_breakeven_days: float = cfg.get("max_entry_breakeven_days", 5.0)
         self.round_trip_cost_pct: float = cfg.get("round_trip_cost_pct", 0.12)
         self.max_positions: int = cfg.get("max_positions", 3)
         self.min_position_usd: float = cfg.get("min_position_usd", 50)
@@ -1995,13 +1996,28 @@ class CrossFundingEngine:
         price_basis_pct = abs(hl_price - bn_price) / avg_price * 100 if avg_price else 0
 
         gross_annual = actual_spread * 3 * 365 * 100
-        net_apr = gross_annual - self.round_trip_cost_pct
 
+        # Entry cost = trading fees + price basis (cross-exchange slippage)
+        total_entry_cost_pct = self.round_trip_cost_pct + price_basis_pct
+        # Daily funding income as % of notional
+        daily_funding_pct = actual_spread * 3 * 100
+        # Days needed for funding to recover all entry costs
+        breakeven_days = total_entry_cost_pct / daily_funding_pct if daily_funding_pct > 0 else float("inf")
+        # Net APR after amortizing entry cost over expected 30-day hold
+        net_apr = gross_annual - total_entry_cost_pct / 30 * 365
+
+        max_breakeven = getattr(self, "max_entry_breakeven_days", 5.0)
         reject_reason = None
         if actual_spread <= 0:
             reject_reason = f"spread non-positive: {actual_spread:.6f}"
         elif price_basis_pct > self.max_price_basis_pct:
             reject_reason = f"price basis too large: {price_basis_pct:.2f}%"
+        elif breakeven_days > max_breakeven:
+            reject_reason = (
+                f"breakeven {breakeven_days:.1f}d > {max_breakeven}d "
+                f"(basis={price_basis_pct:.2f}% + fees={self.round_trip_cost_pct:.2f}% "
+                f"= {total_entry_cost_pct:.2f}%, daily={daily_funding_pct:.3f}%)"
+            )
         elif net_apr < self.min_apr:
             reject_reason = f"net APR too low: {net_apr:.1f}%"
 
@@ -2013,6 +2029,8 @@ class CrossFundingEngine:
             "hl_price": hl_price,
             "bn_price": bn_price,
             "price_basis_pct": round(price_basis_pct, 4),
+            "total_entry_cost_pct": round(total_entry_cost_pct, 4),
+            "breakeven_days": round(breakeven_days, 1) if breakeven_days < 999 else None,
             "round_trip_cost_pct": self.round_trip_cost_pct,
             "net_apr_after_costs": round(net_apr, 2),
             "reject_reason": reject_reason,
