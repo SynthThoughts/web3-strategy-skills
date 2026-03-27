@@ -2757,7 +2757,7 @@ def export_dashboard(
         roi_pct = round(total_pnl / entry_total * 100, 4) if entry_total else 0.0
 
         annualized_roi_pct = 0.0
-        strategy_start = state.get("strategy_start_time", "")
+        strategy_start = state.get("strategy_start_time") or state.get("entry_time", "")
         if strategy_start and entry_total:
             try:
                 hours_running = (
