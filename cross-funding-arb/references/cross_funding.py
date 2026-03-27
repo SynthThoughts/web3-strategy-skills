@@ -3103,6 +3103,24 @@ def _build_position_dashboard(
     long_notional = round(long_size * current_price, 2)
     short_notional = round(short_size * current_price, 2)
 
+    # Pending (unrealized) funding: rate * notional * elapsed fraction
+    # Sign: positive rate means longs pay shorts
+    def _pending_funding(rate: float, notional: float, side: str, cycle_h: int, next_min: int) -> float:
+        elapsed_min = cycle_h * 60 - next_min
+        fraction = elapsed_min / (cycle_h * 60) if cycle_h > 0 else 0
+        # Funding payment = rate * notional; longs pay when rate > 0
+        raw = rate * notional * fraction
+        return round(-raw if side == "long" else raw, 4)
+
+    long_pending = _pending_funding(
+        long_leg_extra["funding_rate"], long_notional, "long",
+        long_leg_extra["settlement_cycle_h"], long_leg_extra["next_settlement_min"],
+    )
+    short_pending = _pending_funding(
+        short_leg_extra["funding_rate"], short_notional, "short",
+        short_leg_extra["settlement_cycle_h"], short_leg_extra["next_settlement_min"],
+    )
+
     avg_size = (long_size + short_size) / 2 if (long_size + short_size) > 0 else 1
     delta_exposure = abs(long_size - short_size)
     delta_pct = round(delta_exposure / avg_size * 100, 2)
@@ -3126,6 +3144,7 @@ def _build_position_dashboard(
             "notional": long_notional,
             "unrealized_pnl": round(long_pnl, 2),
             "accumulated_funding": long_funding,
+            "pending_funding": long_pending,
             "funding_payments": long_payments,
         },
         "short_leg": {
@@ -3137,12 +3156,14 @@ def _build_position_dashboard(
             "notional": short_notional,
             "unrealized_pnl": round(short_pnl, 2),
             "accumulated_funding": short_funding,
+            "pending_funding": short_pending,
             "funding_payments": short_payments,
         },
         "delta_neutral": delta_pct < 5,
         "delta_exposure": round(delta_exposure, 6),
         "delta_exposure_pct": delta_pct,
         "total_funding_pnl": total_funding,
+        "total_pending_funding": round(long_pending + short_pending, 4),
         "total_price_pnl": total_price_pnl,
         "total_pnl": round(total_funding + total_price_pnl, 2),
         "roi_pct": roi_pct,

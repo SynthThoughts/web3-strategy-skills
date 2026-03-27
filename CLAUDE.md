@@ -57,24 +57,7 @@ dashboard (可视化)
 | 本地 Mac | 开发 + 回测 | `Agentic Wallet/onchainos` (arm64) |
 | VPS (见 1Password "OpenClaw") | 实盘 + 看板 | `/usr/local/bin/onchainos` (amd64) |
 
-VPS 通过 SSH 部署，pm2 管理进程，OpenClaw 推送 Discord 通知。
-
-### VPS SSH 连接
-
-SSH 走本地 Stash 代理（HTTP `127.0.0.1:7890`）以保证稳定性，已配置在 `~/.ssh/config`：
-
-```
-Host 43.133.182.170
-  ProxyCommand /usr/bin/nc -X connect -x 127.0.0.1:7890 %h %p
-  ServerAliveInterval 10
-  ServerAliveCountMax 3
-  ControlMaster auto
-  ControlPath ~/.ssh/sockets/%r@%h-%p
-  ControlPersist 600
-```
-
-- 需要 Stash 保持运行，否则 SSH 连接会失败
-- ControlMaster 复用连接，避免频繁新建连接触发 VPS 的 MaxStartups 限制
+VPS 通过 SSH 部署，部署方式见各策略 Skill 内置说明。SSH 配置见 `~/.ssh/config`。
 
 ## 已有策略
 
@@ -83,6 +66,34 @@ Host 43.133.182.170
 | grid-trading | LIVE | Base | 动态网格 + MTF 趋势 + 非对称步距 |
 | cl-lp-rebalancer | 待部署 | Base | V3 LP 波动率自适应范围 + 趋势不对称 |
 
-## 凭证管理
+## 策略变更验证
 
-通过 `op` (1Password CLI) 获取，禁止明文。onchainos 通过 `OKX_API_KEY` / `OKX_SECRET_KEY` / `OKX_PASSPHRASE` 环境变量认证。
+策略代码修改后，必须按顺序通过以下验证才算 done：
+
+1. **代码验证** — lint + format + type check（按语言：Python 用 ruff/pyright，Rust 用 cargo check）
+2. **逻辑验证** — 核心交易逻辑的单元测试通过，边界条件覆盖（如价格为 0、余额不足、API 超时）
+3. **交易验证** — 用测试账户（Account 3）dry-run 或小额实盘验证下单/撤单/仓位计算正确
+4. **数据统计验证** — 回测指标（胜率、最大回撤、夏普比率）与改动前对比，无意外恶化
+
+## 同步发布
+
+策略变更验证通过后，必须同时同步以下四处，不能只更新部分：
+
+1. **本地仓库** — git commit
+2. **VPS 部署** — SSH 更新脚本 + 重启服务
+3. **GitHub** — git push（账号: SynthThoughts）
+4. **ClawHub** — `npx clawhub publish <dir> --version <semver> --changelog "<msg>"`
+
+通过 subagent 执行（模板见全局 CLAUDE.md Context 保护）。
+
+## 敏感信息保护
+
+以下内容**禁止**提交到 Git / GitHub / ClawHub：
+
+- `.env` 文件、私钥、API Key、Secret、Passphrase
+- 1Password 条目引用（`op://`）
+- 钱包地址与 Account ID 的映射关系
+- VPS IP、SSH 密钥路径
+
+使用 `.gitignore` 排除，发布前检查 `git diff --cached` 确认无泄漏。
+
