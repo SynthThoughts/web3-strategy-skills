@@ -523,24 +523,10 @@ def _build_notification(tier: str, data: dict) -> dict | None:
 
     # ── Hourly Pulse ─────────────────────────────────────────────────────
     if tier == "hourly_pulse":
-        coin = data.get("coin", "?")
-        direction = data.get("direction", {})
-        long_ex = direction.get("long_exchange", "?")
-        short_ex = direction.get("short_exchange", "?")
-        size = data.get("size", 0)
-        price = data.get("entry_price", 0)
-        notional = round(size * price, 2) if size and price else 0
-
-        rate_map = {
-            "hyperliquid": data.get("hl_rate", 0),
-            "binance": data.get("bn_rate", 0),
-        }
-        long_rate = rate_map.get(long_ex, 0)
-        short_rate = rate_map.get(short_ex, 0)
-        current_apr = data.get("current_apr", 0)
-        current_spread = data.get("current_spread", 0)
-        delta_pct = data.get("delta_pct", 0)
         healthy = data.get("healthy", True)
+        position_count = data.get("position_count", 0)
+        report_positions = data.get("positions", [])
+        position_health = data.get("position_health", [])
 
         hl_bal = data.get("hl_balance", 0)
         bn_bal = data.get("bn_balance", 0)
@@ -550,8 +536,6 @@ def _build_notification(tier: str, data: dict) -> dict | None:
         roi_pct = data.get("roi_pct", 0)
 
         health_icon = "✅" if healthy else "⚠️"
-        long_label = _EX_SHORT.get(long_ex, long_ex)
-        short_label = _EX_SHORT.get(short_ex, short_ex)
         countdown = _next_settlement_countdown()
 
         fields = [
@@ -559,58 +543,70 @@ def _build_notification(tier: str, data: dict) -> dict | None:
             {"name": "HL", "value": f"${hl_bal:,.2f}", "inline": True},
             {"name": "BN", "value": f"${bn_bal:,.2f}", "inline": True},
             {"name": "Total", "value": f"${total:,.2f}", "inline": True},
-            # Row 2: Direction + size
-            {"name": "Long", "value": long_label, "inline": True},
-            {"name": "Short", "value": short_label, "inline": True},
-            {
-                "name": "Size",
-                "value": f"{size:g} {coin} (${notional:,.0f})",
-                "inline": True,
-            },
-            # Row 3: Rate alignment (Long exchange rate | Short exchange rate | Spread)
-            {
-                "name": f"{long_label} Rate",
-                "value": f"{long_rate:.4%}/8h",
-                "inline": True,
-            },
-            {
-                "name": f"{short_label} Rate",
-                "value": f"{short_rate:.4%}/8h",
-                "inline": True,
-            },
-            {
-                "name": "Spread → APR",
-                "value": f"{current_spread:.4%}/8h → {current_apr:.1f}% APR",
-                "inline": True,
-            },
-            # Row 4: Settlement countdown (aligned with Long/Short columns)
-            {
-                "name": f"{long_label} 结算",
-                "value": f"⏱ {countdown[long_ex.replace('hyperliquid', 'hl').replace('binance', 'bn')]}",
-                "inline": True,
-            },
-            {
-                "name": f"{short_label} 结算",
-                "value": f"⏱ {countdown[short_ex.replace('hyperliquid', 'hl').replace('binance', 'bn')]}",
-                "inline": True,
-            },
         ]
 
-        footer = f"PnL ${pnl:+,.2f} ({roi_pct:+.2f}%) · {health_icon} {'健康' if healthy else '异常'}"
+        # Add each position as a field
+        for rp in report_positions:
+            rp_coin = rp.get("coin", "?")
+            rp_dir = rp.get("direction", {})
+            rp_long_ex = rp_dir.get("long_exchange", "?")
+            rp_short_ex = rp_dir.get("short_exchange", "?")
+            rp_long_label = _EX_SHORT.get(rp_long_ex, rp_long_ex)
+            rp_short_label = _EX_SHORT.get(rp_short_ex, rp_short_ex)
+            rp_size = rp.get("size", 0)
+            rp_price = rp.get("entry_price", 0)
+            rp_notional = round(rp_size * rp_price, 2) if rp_size and rp_price else 0
+            rp_apr = rp.get("current_apr", 0)
+            rp_spread = rp.get("current_spread", 0)
+            rp_healthy = rp.get("healthy", True)
+            rp_health_icon = "✅" if rp_healthy else "⚠️"
+            fields.append({
+                "name": f"{rp_health_icon} {rp_coin}",
+                "value": (
+                    f"L:{rp_long_label}/S:{rp_short_label} · "
+                    f"`{rp_size:g}` (${rp_notional:,.0f}) · "
+                    f"{rp_spread:.4%}/8h → {rp_apr:.1f}% APR"
+                ),
+                "inline": False,
+            })
 
+        fields.append({
+            "name": "结算倒计时",
+            "value": f"HL `{countdown['hl']}` / BN `{countdown['bn']}`",
+            "inline": False,
+        })
+
+        footer = f"PnL ${pnl:+,.2f} ({roi_pct:+.2f}%) · {health_icon} {position_count}仓"
+
+        coins_str = "/".join(rp.get("coin", "?") for rp in report_positions) or "空仓"
         text_lines = [
-            f"📊 **{coin} · {STRATEGY_LABEL} · 运行中**",
+            f"📊 **{coins_str} · {STRATEGY_LABEL} · 运行中**",
             f"💰 HL `${hl_bal:,.2f}` + BN `${bn_bal:,.2f}` = **`${total:,.2f}`**",
-            f"📍 Long `{long_label}` / Short `{short_label}` | `{size:g} {coin}` (`${notional:,.0f}`)",
-            f"📈 {long_label} `{long_rate:.4%}/8h` / {short_label} `{short_rate:.4%}/8h` → Spread `{current_spread:.4%}/8h` ({current_apr:.1f}% APR)",
-            f"⏱ 结算倒计时: HL `{countdown['hl']}` / BN `{countdown['bn']}`",
+        ]
+        for rp in report_positions:
+            rp_coin = rp.get("coin", "?")
+            rp_dir = rp.get("direction", {})
+            rp_long_label = _EX_SHORT.get(rp_dir.get("long_exchange", "?"), "?")
+            rp_short_label = _EX_SHORT.get(rp_dir.get("short_exchange", "?"), "?")
+            rp_size = rp.get("size", 0)
+            rp_price = rp.get("entry_price", 0)
+            rp_notional = round(rp_size * rp_price, 2) if rp_size and rp_price else 0
+            rp_apr = rp.get("current_apr", 0)
+            rp_spread = rp.get("current_spread", 0)
+            text_lines.append(
+                f"📍 `{rp_coin}` L:`{rp_long_label}` S:`{rp_short_label}` | "
+                f"`{rp_size:g}` (${rp_notional:,.0f}) | "
+                f"{rp_spread:.4%}/8h ({rp_apr:.1f}% APR)"
+            )
+        text_lines += [
+            f"⏱ 结算: HL `{countdown['hl']}` / BN `{countdown['bn']}`",
             f"_{footer}_",
         ]
 
         return {
             "tier": "hourly_pulse",
             "discord": {
-                "title": f"📊 {coin} · {STRATEGY_LABEL} · 运行中",
+                "title": f"📊 {coins_str} · {STRATEGY_LABEL} · 运行中",
                 "color": 0x808080,
                 "fields": fields,
                 "footer": {"text": footer},
@@ -641,69 +637,55 @@ def _build_notification(tier: str, data: dict) -> dict | None:
         short_rate = rate_map.get(short_ex, 0)
         current_apr = data.get("current_apr", 0)
         current_spread = data.get("current_spread", 0)
-        has_position = data.get("has_position", False)
-
-        entry_time = data.get("entry_time", "")
-        hours_held = 0.0
-        if entry_time:
-            try:
-                entry_dt = datetime.fromisoformat(entry_time)
-                hours_held = (
-                    datetime.now(timezone.utc) - entry_dt
-                ).total_seconds() / 3600
-            except (ValueError, TypeError):
-                pass
+        has_positions = data.get("has_positions", False)
+        position_count = data.get("position_count", 0)
+        report_positions = data.get("positions", [])
 
         today = datetime.now(timezone.utc).date().isoformat()
-        long_label = _EX_SHORT.get(long_ex, long_ex)
-        short_label = _EX_SHORT.get(short_ex, short_ex)
 
-        if has_position:
-            fields = [
-                # Row 1: Direction + duration
-                {"name": "Long", "value": long_label, "inline": True},
-                {"name": "Short", "value": short_label, "inline": True},
-                {
-                    "name": "持仓",
-                    "value": f"{coin} · {hours_held:.1f}h",
-                    "inline": True,
-                },
-                # Row 2: Rate alignment
-                {
-                    "name": f"{long_label} Rate",
-                    "value": f"{long_rate:.4%}/8h",
-                    "inline": True,
-                },
-                {
-                    "name": f"{short_label} Rate",
-                    "value": f"{short_rate:.4%}/8h",
-                    "inline": True,
-                },
-                {
-                    "name": "Spread → APR",
-                    "value": f"{current_spread:.4%}/8h → {current_apr:.1f}% APR",
-                    "inline": True,
-                },
-                # Row 3: Assets
+        if has_positions and report_positions:
+            # Build fields for each position
+            fields = []
+            for rp in report_positions:
+                rp_coin = rp.get("coin", "?")
+                rp_dir = rp.get("direction", {})
+                rp_long_ex = rp_dir.get("long_exchange", "?")
+                rp_short_ex = rp_dir.get("short_exchange", "?")
+                rp_long_label = _EX_SHORT.get(rp_long_ex, rp_long_ex)
+                rp_short_label = _EX_SHORT.get(rp_short_ex, rp_short_ex)
+                rp_apr = rp.get("current_apr", 0)
+                rp_funding = rp.get("total_funding_earned", 0)
+                rp_entry_time = rp.get("entry_time", "")
+                rp_hours = 0.0
+                if rp_entry_time:
+                    try:
+                        rp_hours = (
+                            datetime.now(timezone.utc) - datetime.fromisoformat(rp_entry_time)
+                        ).total_seconds() / 3600
+                    except (ValueError, TypeError):
+                        pass
+                fields.append({
+                    "name": f"{rp_coin}",
+                    "value": (
+                        f"L:{rp_long_label}/S:{rp_short_label} · "
+                        f"{rp_apr:.1f}% APR · {rp_hours:.1f}h · "
+                        f"funding ${rp_funding:+.2f}"
+                    ),
+                    "inline": False,
+                })
+
+            # Assets row
+            fields += [
                 {"name": "HL", "value": f"${hl_bal:,.2f}", "inline": True},
-                {
-                    "name": "BN",
-                    "value": f"${bn_bal:,.2f}",
-                    "inline": True,
-                },
-                {
-                    "name": "Total",
-                    "value": f"${total:,.2f}",
-                    "inline": True,
-                },
-                # Row 4: PnL
+                {"name": "BN", "value": f"${bn_bal:,.2f}", "inline": True},
+                {"name": "Total", "value": f"${total:,.2f}", "inline": True},
                 {
                     "name": "💵 PnL",
                     "value": f"${pnl:+,.2f} ({roi_pct:+.2f}%)",
                     "inline": True,
                 },
             ]
-            footer = f"本金 ${entry_total:,.0f} · 持仓 {hours_held:.1f}h"
+            footer = f"本金 ${entry_total:,.0f} · {position_count} 个持仓"
         else:
             fields = [
                 {"name": "状态", "value": "空仓观望中", "inline": True},
@@ -725,11 +707,20 @@ def _build_notification(tier: str, data: dict) -> dict | None:
             f"📈 **日报 · {STRATEGY_LABEL} · {today}**",
             "",
         ]
-        if has_position:
+        if has_positions and report_positions:
+            text_lines.append(f"**持仓 ({position_count})**")
+            for rp in report_positions:
+                rp_coin = rp.get("coin", "?")
+                rp_dir = rp.get("direction", {})
+                rp_long_label = _EX_SHORT.get(rp_dir.get("long_exchange", "?"), "?")
+                rp_short_label = _EX_SHORT.get(rp_dir.get("short_exchange", "?"), "?")
+                rp_apr = rp.get("current_apr", 0)
+                rp_spread = rp.get("current_spread", 0)
+                text_lines.append(
+                    f"  `{rp_coin}` | L:`{rp_long_label}` S:`{rp_short_label}` | "
+                    f"Spread `{rp_spread:.4%}/8h` ({rp_apr:.1f}% APR)"
+                )
             text_lines += [
-                "**持仓**",
-                f"  `{coin}` | Long `{long_label}` / Short `{short_label}` | `{hours_held:.1f}h`",
-                f"  {long_label} `{long_rate:.4%}/8h` / {short_label} `{short_rate:.4%}/8h` → Spread `{current_spread:.4%}/8h` ({current_apr:.1f}% APR)",
                 "",
                 "**资产**",
                 f"  HL: `${hl_bal:,.2f}` | BN: `${bn_bal:,.2f}` | Total: `${total:,.2f}`",
@@ -1840,11 +1831,36 @@ class CrossFundingEngine:
         self.max_breakeven_days: float = cfg.get("max_breakeven_days", 3.0)
         self.max_price_basis_pct: float = cfg.get("max_price_basis_pct", 0.5)
         self.round_trip_cost_pct: float = cfg.get("round_trip_cost_pct", 0.12)
+        self.max_positions: int = cfg.get("max_positions", 3)
+        self.min_position_usd: float = cfg.get("min_position_usd", 50)
 
     # ---- State management ----
 
     def _load(self) -> dict:
-        return load_state(STATE_NAME)
+        state = load_state(STATE_NAME)
+        # Migrate v1 → v2
+        if "current_coin" in state and "positions" not in state:
+            coin = state.pop("current_coin", None)
+            positions: list[dict] = []
+            if coin:
+                pos = {
+                    "coin": coin,
+                    "direction": state.pop("direction", {}),
+                    "size": state.pop("size", 0),
+                    "entry_price": state.pop("entry_price", 0),
+                    "entry_time": state.pop("entry_time", ""),
+                    "entry_spread": state.pop("entry_spread", 0),
+                    "total_funding_earned": state.pop("total_funding_earned", 0),
+                }
+                positions.append(pos)
+            # Clean up other v1 fields that are now per-position
+            for k in ["entry_hl_rate", "entry_bn_rate", "budget_hl", "budget_bn",
+                       "entry_hl_balance", "entry_bn_balance"]:
+                state.pop(k, None)
+            state["positions"] = positions
+            state["version"] = 2
+            self._save(state)
+        return state
 
     def _save(self, state: dict) -> None:
         state["last_tick"] = datetime.now(timezone.utc).isoformat()
@@ -1859,6 +1875,42 @@ class CrossFundingEngine:
             self.bn_budget_cfg if self.bn_budget_cfg > 0 else self.bn.get_usdt_balance()
         )
         return hl, bn
+
+    def _get_positions(self) -> list[dict]:
+        return self._load().get("positions", [])
+
+    def _get_position_by_coin(self, coin: str) -> dict | None:
+        for p in self._get_positions():
+            if p["coin"] == coin:
+                return p
+        return None
+
+    def _occupied_coins(self) -> set[str]:
+        return {p["coin"] for p in self._get_positions()}
+
+    def _get_available_budgets(self) -> tuple[float, float]:
+        """Return available (not margin-locked) balance per exchange."""
+        hl_total = self.hl.get_usdc_balance()
+        bn_total = self.bn.get_usdt_balance()
+        positions = self._get_positions()
+
+        # Calculate used margin per exchange
+        hl_used = 0.0
+        bn_used = 0.0
+        for pos in positions:
+            direction = pos.get("direction", {})
+            notional = pos.get("size", 0) * pos.get("entry_price", 0)
+            margin = notional / self.leverage if self.leverage > 0 else notional
+            if direction.get("long_exchange") == "hyperliquid":
+                hl_used += margin
+                bn_used += margin
+            else:
+                bn_used += margin
+                hl_used += margin
+
+        hl_available = max(hl_total - hl_used * 1.1, 0)  # 10% safety buffer
+        bn_available = max(bn_total - bn_used * 1.1, 0)
+        return hl_available, bn_available
 
     # ---- Client routing ----
 
@@ -1981,12 +2033,25 @@ class CrossFundingEngine:
         """Atomic open: HL leg first (stricter limits), then Binance. Rollback on failure.
 
         HL tiered margin is strict for small coins; auto-halves size on retry (max 3x).
+        Multi-position: appends to positions array. Checks duplicates and max slots.
         """
         state = self._load()
-        if state.get("current_coin"):
+        positions = state.get("positions", [])
+
+        # Guard: duplicate coin
+        occupied = {p["coin"] for p in positions}
+        if coin in occupied:
             emit(
                 "warn",
-                {"msg": f"already has position in {state['current_coin']}, skip open"},
+                {"msg": f"already has position in {coin}, skip open"},
+            )
+            return False
+
+        # Guard: max positions
+        if len(positions) >= self.max_positions:
+            emit(
+                "warn",
+                {"msg": f"max positions ({self.max_positions}) reached, skip open"},
             )
             return False
 
@@ -2002,8 +2067,18 @@ class CrossFundingEngine:
             emit_error("price", RuntimeError(f"invalid price for {coin}: {price}"))
             return False
 
-        hl_budget, bn_budget = self._get_budgets()
-        budget = min(hl_budget, bn_budget)
+        # Use available budgets (account for existing positions' margin)
+        hl_available, bn_available = self._get_available_budgets()
+        budget = min(hl_available, bn_available)
+
+        # Guard: minimum budget
+        if budget < self.min_position_usd:
+            emit(
+                "warn",
+                {"msg": f"available budget ${budget:.0f} < min ${self.min_position_usd:.0f}, skip open"},
+            )
+            return False
+
         conservative = budget * 0.8
         raw_size = self._calculate_size(conservative, price)
 
@@ -2024,6 +2099,8 @@ class CrossFundingEngine:
                 "raw_size": raw_size,
                 "final_size": size,
                 "notional": round(size * price, 2),
+                "position_slot": len(positions) + 1,
+                "max_positions": self.max_positions,
             },
         )
 
@@ -2171,33 +2248,40 @@ class CrossFundingEngine:
         # Use verified size (smaller of the two, in case of rounding diffs)
         size = min(hl_filled, bn_filled)
 
-        # Save state
+        # Save state — append to positions array
         hl_rate = self.hl.get_funding_rate(coin)
         bn_rate = self.bn.get_funding_rate(coin)
 
-        entry_hl_balance = self.hl.get_usdc_balance()
-        entry_bn_balance = self.bn.get_usdt_balance()
-
-        old_state = self._load()
         now_iso = datetime.now(timezone.utc).isoformat()
-        state = {
-            "current_coin": coin,
+
+        new_pos = {
+            "coin": coin,
             "direction": direction,
             "entry_time": now_iso,
-            "strategy_start_time": old_state.get("strategy_start_time", now_iso),
             "entry_spread": abs(hl_rate - bn_rate),
             "entry_hl_rate": hl_rate,
             "entry_bn_rate": bn_rate,
             "size": size,
             "entry_price": price,
-            "budget_hl": hl_budget,
-            "budget_bn": bn_budget,
-            "entry_hl_balance": entry_hl_balance,
-            "entry_bn_balance": entry_bn_balance,
-            "entry_total_balance": round(entry_hl_balance + entry_bn_balance, 2),
             "total_funding_earned": 0.0,
-            "rate_snapshots": [],
         }
+
+        # Re-load state to avoid race; append position
+        state = self._load()
+        positions = state.get("positions", [])
+        positions.append(new_pos)
+        state["positions"] = positions
+        state["version"] = 2
+
+        # Strategy-level fields (set once on first open)
+        if not state.get("strategy_start_time"):
+            state["strategy_start_time"] = now_iso
+        if not state.get("entry_total_balance"):
+            entry_hl_balance = self.hl.get_usdc_balance()
+            entry_bn_balance = self.bn.get_usdt_balance()
+            state["entry_total_balance"] = round(entry_hl_balance + entry_bn_balance, 2)
+
+        state["rate_snapshots"] = state.get("rate_snapshots", [])
         self._save(state)
 
         emit(
@@ -2211,6 +2295,7 @@ class CrossFundingEngine:
                 "entry_price": price,
                 "hl_rate": hl_rate,
                 "bn_rate": bn_rate,
+                "position_count": len(positions),
             },
             notify=True,
             tier="trade_alert",
@@ -2221,11 +2306,30 @@ class CrossFundingEngine:
 
     def close_position(self, coin: str) -> bool:
         state = self._load()
-        direction = state.get("direction", {})
+        positions = state.get("positions", [])
+
+        # Find the position for this coin
+        pos_data = None
+        pos_idx = -1
+        for i, p in enumerate(positions):
+            if p["coin"] == coin:
+                pos_data = p
+                pos_idx = i
+                break
+
+        if pos_data is None:
+            emit("warn", {"msg": f"no position found for {coin}, skip close"})
+            return False
+
+        direction = pos_data.get("direction", {})
         long_ex = direction.get("long_exchange", "hyperliquid")
         short_ex = direction.get("short_exchange", "binance")
         long_client = self._get_client(long_ex)
         short_client = self._get_client(short_ex)
+
+        # Capture pre-close balances for per-position PnL estimate
+        pre_hl = self.hl.get_usdc_balance()
+        pre_bn = self.bn.get_usdt_balance()
 
         try:
             short_client.close_position(coin)
@@ -2239,12 +2343,13 @@ class CrossFundingEngine:
             emit_error("close_long", e)
         time.sleep(1)
 
-        funding_earned = state.get("total_funding_earned", 0.0)
+        funding_earned = pos_data.get("total_funding_earned", 0.0)
         current_price = self.hl.get_mid_price(coin)
-        entry_total = state.get("entry_total_balance", 0.0)
-        current_hl = self.hl.get_usdc_balance()
-        current_bn = self.bn.get_usdt_balance()
-        pnl = round(current_hl + current_bn - entry_total, 2) if entry_total else 0.0
+
+        # Per-position PnL: balance change from closing this specific position
+        post_hl = self.hl.get_usdc_balance()
+        post_bn = self.bn.get_usdt_balance()
+        pnl = round((post_hl + post_bn) - (pre_hl + pre_bn), 2)
 
         emit(
             "position_closed",
@@ -2253,6 +2358,8 @@ class CrossFundingEngine:
                 "long_exchange": long_ex,
                 "short_exchange": short_ex,
                 "funding_earned": funding_earned,
+                "pnl": pnl,
+                "remaining_positions": len(positions) - 1,
             },
             notify=True,
             tier="trade_alert",
@@ -2260,26 +2367,26 @@ class CrossFundingEngine:
 
         log_trade(
             "close", coin, direction,
-            size=state.get("size", 0),
-            entry_price=state.get("entry_price", 0),
+            size=pos_data.get("size", 0),
+            entry_price=pos_data.get("entry_price", 0),
             exit_price=current_price,
             pnl=pnl,
             funding_pnl=round(funding_earned, 2),
             reason=f"funding earned: {funding_earned:.2f}",
         )
 
-        self._save({})
+        # Remove position from array (do NOT clear entire state)
+        positions.pop(pos_idx)
+        state["positions"] = positions
+        self._save(state)
         return True
 
     # ---- Health check ----
 
-    def check_health(self) -> dict:
-        state = self._load()
-        coin = state.get("current_coin")
-        if not coin:
-            return {"healthy": True, "has_position": False}
-
-        direction = state.get("direction", {})
+    def _check_position_health(self, pos_data: dict) -> dict:
+        """Check health of a single position. Returns per-position health dict."""
+        coin = pos_data["coin"]
+        direction = pos_data.get("direction", {})
         long_ex = direction.get("long_exchange", "hyperliquid")
         short_ex = direction.get("short_exchange", "binance")
         long_client = self._get_client(long_ex)
@@ -2301,14 +2408,12 @@ class CrossFundingEngine:
         current_apr = current_spread * 3 * 365 * 100
 
         spread_favorable = current_spread > self.close_spread_threshold
-
         has_both_legs = long_size > 0 and short_size > 0
         healthy = has_both_legs and spread_favorable and delta_pct < 20
 
         result = {
-            "healthy": healthy,
-            "has_position": True,
             "coin": coin,
+            "healthy": healthy,
             "long_exchange": long_ex,
             "short_exchange": short_ex,
             "long_size": long_size,
@@ -2327,62 +2432,43 @@ class CrossFundingEngine:
 
         return result
 
-    # ---- Switch position ----
+    def check_health(self) -> dict:
+        """Check health for ALL positions. Returns aggregate + per-position health."""
+        positions = self._get_positions()
+        if not positions:
+            return {
+                "healthy": True,
+                "has_positions": False,
+                "position_count": 0,
+                "position_health": [],
+            }
 
-    def check_and_switch(self, opportunities: list[dict] | None = None) -> bool:
-        """Check if we should switch position using time-cost breakeven model.
+        position_health = []
+        all_healthy = True
+        for pos in positions:
+            ph = self._check_position_health(pos)
+            position_health.append(ph)
+            if not ph["healthy"]:
+                all_healthy = False
 
-        Triggers:
-          1. Unhealthy: spread unfavorable or missing leg → close immediately
-          2. Better opportunity: breakeven time < max_breakeven_days → switch
-             (but defer if waiting for settlement is more profitable)
+        return {
+            "healthy": all_healthy,
+            "has_positions": True,
+            "position_count": len(positions),
+            "position_health": position_health,
+        }
 
-        Breakeven time = total_switch_cost / daily_apr_gain
-        Total cost = trading fees + sunk funding + realized price loss
+    # ---- Position management ----
+
+    def _evaluate_switch_candidate(
+        self, coin: str, current_apr: float, health: dict,
+        opportunities: list[dict],
+    ) -> dict | None:
+        """Evaluate if a better opportunity justifies switching out of `coin`.
+
+        Returns the best verified candidate dict or None if no switch warranted.
+        Uses time-cost breakeven model with settlement deferral.
         """
-        state = self._load()
-        coin = state.get("current_coin")
-        if not coin:
-            return False
-
-        health = self.check_health()
-
-        # 1) Unhealthy → close immediately
-        if not health["spread_favorable"]:
-            emit(
-                "switch_close",
-                {
-                    "coin": coin,
-                    "reason": "spread unfavorable",
-                    "current_spread": health["current_spread"],
-                    "current_apr": health["current_apr"],
-                },
-                notify=True,
-                tier="risk_alert",
-            )
-            self.close_position(coin)
-            return True
-
-        if not health["has_both_legs"]:
-            emit(
-                "switch_close",
-                {
-                    "coin": coin,
-                    "reason": "missing leg",
-                    "long_size": health["long_size"],
-                    "short_size": health["short_size"],
-                },
-                notify=True,
-                tier="risk_alert",
-            )
-            self.close_position(coin)
-            return True
-
-        # 2) Better opportunity → evaluate with time-cost model
-        if not opportunities:
-            return False
-
-        current_apr = health.get("current_apr", 0.0)
         hl_rate = health.get("hl_rate", 0.0)
         bn_rate = health.get("bn_rate", 0.0)
         long_ex = health.get("long_exchange", "binance")
@@ -2393,32 +2479,26 @@ class CrossFundingEngine:
         trading_cost_pct = self.round_trip_cost_pct * 2  # close + open
 
         # --- Cost component 2: Sunk funding (unrealized since last settlement) ---
-        # BN settles every 8h at 00:00/08:00/16:00 UTC
         bn_elapsed_h = (now.hour % 8) + now.minute / 60
         bn_fraction = bn_elapsed_h / 8.0
         bn_remaining_h = 8.0 - bn_elapsed_h
-        # HL settles every 1h at xx:00 UTC
         hl_elapsed_m = now.minute + now.second / 60
         hl_fraction = hl_elapsed_m / 60.0
         hl_remaining_m = 60.0 - hl_elapsed_m
 
-        # Per-leg unrealized funding (as % of notional)
-        # Positive = we've accumulated earnings (forfeited on close = cost)
-        # Negative = we've accumulated losses (avoided on close = benefit)
         if long_ex == "binance":
-            bn_unrealized = -bn_rate * bn_fraction * 100  # long earning
-            hl_unrealized = hl_rate * hl_fraction * 100   # short earning
+            bn_unrealized = -bn_rate * bn_fraction * 100
+            hl_unrealized = hl_rate * hl_fraction * 100
         else:
-            hl_unrealized = -hl_rate * hl_fraction * 100  # long earning
-            bn_unrealized = bn_rate * bn_fraction * 100   # short earning
+            hl_unrealized = -hl_rate * hl_fraction * 100
+            bn_unrealized = bn_rate * bn_fraction * 100
 
         sunk_cost_pct = bn_unrealized + hl_unrealized
 
         # --- Cost component 3: Realized price PnL ---
-        # If the current position has unrealized price losses, closing realizes them
         long_client = self._get_client(long_ex)
-        short_ex = "binance" if long_ex == "hyperliquid" else "hyperliquid"
-        short_client = self._get_client(short_ex)
+        short_ex_name = "binance" if long_ex == "hyperliquid" else "hyperliquid"
+        short_client = self._get_client(short_ex_name)
         long_pos = long_client.get_position(coin)
         short_pos = short_client.get_position(coin)
 
@@ -2426,30 +2506,24 @@ class CrossFundingEngine:
         short_pnl = short_pos.get("unrealized_pnl", 0.0) if short_pos else 0.0
         price_pnl = long_pnl + short_pnl
 
-        # Only count price loss as a cost (profit is a benefit, reduce cost)
         long_notional = abs(long_pos["size"]) * long_pos.get("mark_px", 0) if long_pos else 0
         short_notional = abs(short_pos["size"]) * short_pos.get("mark_px", 0) if short_pos else 0
         avg_notional = (long_notional + short_notional) / 2 if (long_notional + short_notional) > 0 else 1
-        price_pnl_pct = price_pnl / avg_notional * 100  # negative = loss = cost
+        price_pnl_pct = price_pnl / avg_notional * 100
 
-        # --- Total switch cost (as % of notional) ---
         total_cost_pct = trading_cost_pct + sunk_cost_pct - price_pnl_pct
-        # Note: price_pnl_pct is subtracted because negative PnL increases cost
 
-        # --- Find best candidate ---
-        max_breakeven_days = getattr(self, "max_breakeven_days", 3.0)
+        max_breakeven_days = self.max_breakeven_days
+        occupied = self._occupied_coins()
 
         best = None
         best_breakeven = float("inf")
-        best_verified_apr = 0.0
         for opp in opportunities:
-            if opp["coin"] == coin:
+            if opp["coin"] == coin or opp["coin"] in occupied:
                 continue
             apr_gain = opp["estimated_apr"] - current_apr
             if apr_gain <= 0:
                 continue
-
-            # Quick breakeven check before expensive verification
             daily_gain_pct = apr_gain / 365.0
             if daily_gain_pct > 0:
                 quick_breakeven = total_cost_pct / daily_gain_pct
@@ -2458,7 +2532,7 @@ class CrossFundingEngine:
                     best_breakeven = quick_breakeven
 
         if not best:
-            return False
+            return None
 
         # Deep-verify the candidate
         direction = {
@@ -2469,26 +2543,18 @@ class CrossFundingEngine:
         if not verification["valid"]:
             emit(
                 "switch_rejected",
-                {
-                    "from": coin,
-                    "to": best["coin"],
-                    "reason": verification["reject_reason"],
-                },
+                {"from": coin, "to": best["coin"], "reason": verification["reject_reason"]},
             )
-            return False
+            return None
 
         verified_apr = verification["net_apr_after_costs"]
         apr_gain = verified_apr - current_apr
         if apr_gain <= 0:
             emit(
                 "switch_rejected",
-                {
-                    "from": coin,
-                    "to": best["coin"],
-                    "reason": f"verified APR gain <= 0: {apr_gain:.1f}%",
-                },
+                {"from": coin, "to": best["coin"], "reason": f"verified APR gain <= 0: {apr_gain:.1f}%"},
             )
-            return False
+            return None
 
         daily_gain_pct = apr_gain / 365.0
         breakeven_days = total_cost_pct / daily_gain_pct if daily_gain_pct > 0 else float("inf")
@@ -2497,128 +2563,278 @@ class CrossFundingEngine:
             emit(
                 "switch_rejected",
                 {
-                    "from": coin,
-                    "to": best["coin"],
+                    "from": coin, "to": best["coin"],
                     "reason": f"breakeven {breakeven_days:.1f}d > max {max_breakeven_days}d "
                     f"(cost={total_cost_pct:.3f}%, gain={apr_gain:.1f}%/yr, "
                     f"trading={trading_cost_pct:.2f}%, sunk={sunk_cost_pct:.3f}%, "
                     f"price_pnl={price_pnl_pct:.3f}%)",
                 },
             )
-            return False
+            return None
 
         # --- Settlement deferral check ---
-        # Compare: value of waiting for next settlement vs. cost of delaying switch
-        # Pending funding = what we'd earn at next settlement if we wait
-        # Opportunity cost = APR gain we miss during wait period
         if long_ex == "binance":
-            bn_pending = -bn_rate * (1 - bn_fraction) * 100  # remaining long earning
-            hl_pending = hl_rate * (1 - hl_fraction) * 100   # remaining short earning
+            bn_pending = -bn_rate * (1 - bn_fraction) * 100
+            hl_pending = hl_rate * (1 - hl_fraction) * 100
         else:
             hl_pending = -hl_rate * (1 - hl_fraction) * 100
             bn_pending = bn_rate * (1 - bn_fraction) * 100
 
-        # Check BN settlement deferral (bigger impact due to 8h cycle)
         bn_wait_hours = bn_remaining_h
-        bn_funding_gain = bn_pending  # % of notional we'd earn by waiting
-        bn_opportunity_cost = apr_gain / 365.0 / 24.0 * bn_wait_hours  # % we miss
+        bn_funding_gain = bn_pending
+        bn_opportunity_cost = apr_gain / 365.0 / 24.0 * bn_wait_hours
         defer_for_bn = bn_funding_gain > 0 and bn_funding_gain > bn_opportunity_cost
-
-        # Check HL settlement deferral (smaller impact, 1h cycle)
-        hl_wait_hours = hl_remaining_m / 60.0
-        hl_funding_gain = hl_pending
-        hl_opportunity_cost = apr_gain / 365.0 / 24.0 * hl_wait_hours
-        defer_for_hl = hl_funding_gain > 0 and hl_funding_gain > hl_opportunity_cost
 
         if defer_for_bn:
             emit(
                 "switch_deferred",
                 {
-                    "from": coin,
-                    "to": best["coin"],
+                    "from": coin, "to": best["coin"],
                     "reason": f"BN settlement in {bn_remaining_h:.1f}h, "
                     f"pending funding {bn_funding_gain:.4f}% > "
                     f"opportunity cost {bn_opportunity_cost:.4f}%",
                     "breakeven_days": round(breakeven_days, 1),
                 },
             )
+            return None
+
+        return {
+            "candidate": best,
+            "direction": direction,
+            "verified_apr": verified_apr,
+            "apr_gain": apr_gain,
+            "breakeven_days": breakeven_days,
+            "trading_cost_pct": trading_cost_pct,
+            "sunk_cost_pct": sunk_cost_pct,
+            "price_pnl_pct": price_pnl_pct,
+            "total_cost_pct": total_cost_pct,
+            "bn_elapsed_h": bn_elapsed_h,
+            "hl_elapsed_m": hl_elapsed_m,
+        }
+
+    def check_and_manage(self, opportunities: list[dict] | None = None) -> bool:
+        """Manage all positions: close unhealthy, open new with idle funds, switch worst.
+
+        Returns True if any action was taken.
+        """
+        acted = False
+        positions = self._get_positions()
+
+        if not positions and not opportunities:
             return False
 
-        # Execute switch
-        emit(
-            "switch_start",
-            {
-                "from": coin,
-                "from_apr": current_apr,
-                "to": best["coin"],
-                "to_apr": verified_apr,
-                "apr_gain": round(apr_gain, 1),
-                "breakeven_days": round(breakeven_days, 1),
-                "trading_cost_pct": round(trading_cost_pct, 2),
-                "sunk_cost_pct": round(sunk_cost_pct, 4),
-                "price_pnl_pct": round(price_pnl_pct, 4),
-                "total_cost_pct": round(total_cost_pct, 3),
-                "bn_elapsed_h": round(bn_elapsed_h, 1),
-                "hl_elapsed_m": round(hl_elapsed_m, 1),
-            },
-            notify=True,
-            tier="trade_alert",
-        )
+        # 1) Close unhealthy positions
+        for pos in list(positions):
+            coin = pos["coin"]
+            ph = self._check_position_health(pos)
+            if not ph["spread_favorable"]:
+                emit(
+                    "manage_close",
+                    {
+                        "coin": coin,
+                        "reason": "spread unfavorable",
+                        "current_spread": ph["current_spread"],
+                        "current_apr": ph["current_apr"],
+                    },
+                    notify=True,
+                    tier="risk_alert",
+                )
+                self.close_position(coin)
+                acted = True
+            elif not ph["has_both_legs"]:
+                emit(
+                    "manage_close",
+                    {
+                        "coin": coin,
+                        "reason": "missing leg",
+                        "long_size": ph["long_size"],
+                        "short_size": ph["short_size"],
+                    },
+                    notify=True,
+                    tier="risk_alert",
+                )
+                self.close_position(coin)
+                acted = True
 
-        self.close_position(coin)
-        time.sleep(2)
-        success = self.open_position(best["coin"], direction)
-        if not success:
-            emit(
-                "switch_failed",
-                {"from": coin, "to": best["coin"], "reason": "open_position failed"},
-                notify=True,
-                tier="risk_alert",
+        if not opportunities:
+            return acted
+
+        # Refresh positions after potential closes
+        positions = self._get_positions()
+        occupied = {p["coin"] for p in positions}
+
+        # 2) Open new positions with idle funds if below max
+        if len(positions) < self.max_positions:
+            hl_avail, bn_avail = self._get_available_budgets()
+            available_budget = min(hl_avail, bn_avail)
+
+            if available_budget >= self.min_position_usd:
+                # Find best opportunity not already held
+                for opp in opportunities:
+                    if opp["coin"] in occupied:
+                        continue
+                    if len(self._get_positions()) >= self.max_positions:
+                        break
+
+                    direction = {
+                        "long_exchange": opp["long_exchange"],
+                        "short_exchange": opp["short_exchange"],
+                    }
+                    verification = self.verify_opportunity(opp["coin"], direction)
+                    if not verification["valid"]:
+                        continue
+
+                    emit(
+                        "manage_open",
+                        {
+                            "coin": opp["coin"],
+                            "apr": verification["net_apr_after_costs"],
+                            "direction": direction,
+                            "slot": len(self._get_positions()) + 1,
+                        },
+                    )
+                    success = self.open_position(opp["coin"], direction)
+                    if success:
+                        acted = True
+                        occupied.add(opp["coin"])
+                        log_trade(
+                            "open", opp["coin"], direction,
+                            size=self._get_position_by_coin(opp["coin"]).get("size", 0),
+                            entry_price=self._get_position_by_coin(opp["coin"]).get("entry_price", 0),
+                            reason=f"APR {verification['net_apr_after_costs']:.1f}%",
+                        )
+                        # Re-check budget for next slot
+                        hl_avail, bn_avail = self._get_available_budgets()
+                        available_budget = min(hl_avail, bn_avail)
+                        if available_budget < self.min_position_usd:
+                            break
+                    else:
+                        break  # Don't keep trying if open failed
+
+            return acted
+
+        # 3) At max positions — try to switch the worst one
+        positions = self._get_positions()
+        if not positions:
+            return acted
+
+        # Find worst position by current APR
+        worst_coin = None
+        worst_apr = float("inf")
+        worst_health = None
+        for pos in positions:
+            ph = self._check_position_health(pos)
+            if ph["current_apr"] < worst_apr:
+                worst_apr = ph["current_apr"]
+                worst_coin = pos["coin"]
+                worst_health = ph
+
+        if worst_coin and worst_health:
+            switch = self._evaluate_switch_candidate(
+                worst_coin, worst_apr, worst_health, opportunities,
             )
-        return True
+            if switch:
+                candidate = switch["candidate"]
+                direction = switch["direction"]
+                emit(
+                    "switch_start",
+                    {
+                        "from": worst_coin,
+                        "from_apr": worst_apr,
+                        "to": candidate["coin"],
+                        "to_apr": switch["verified_apr"],
+                        "apr_gain": round(switch["apr_gain"], 1),
+                        "breakeven_days": round(switch["breakeven_days"], 1),
+                        "trading_cost_pct": round(switch["trading_cost_pct"], 2),
+                        "sunk_cost_pct": round(switch["sunk_cost_pct"], 4),
+                        "price_pnl_pct": round(switch["price_pnl_pct"], 4),
+                        "total_cost_pct": round(switch["total_cost_pct"], 3),
+                        "bn_elapsed_h": round(switch["bn_elapsed_h"], 1),
+                        "hl_elapsed_m": round(switch["hl_elapsed_m"], 1),
+                    },
+                    notify=True,
+                    tier="trade_alert",
+                )
+                self.close_position(worst_coin)
+                time.sleep(2)
+                success = self.open_position(candidate["coin"], direction)
+                if success:
+                    log_trade(
+                        "open", candidate["coin"], direction,
+                        size=self._get_position_by_coin(candidate["coin"]).get("size", 0),
+                        entry_price=self._get_position_by_coin(candidate["coin"]).get("entry_price", 0),
+                        reason=f"switch from {worst_coin}, APR {switch['verified_apr']:.1f}%",
+                    )
+                else:
+                    emit(
+                        "switch_failed",
+                        {"from": worst_coin, "to": candidate["coin"], "reason": "open_position failed"},
+                        notify=True,
+                        tier="risk_alert",
+                    )
+                acted = True
+
+        return acted
 
     # ---- Report ----
 
     def get_status(self) -> dict:
         state = self._load()
-        coin = state.get("current_coin")
-        if not coin:
+        positions = state.get("positions", [])
+        health = self.check_health()
+
+        hl_balance = self.hl.get_usdc_balance()
+        bn_balance = self.bn.get_usdt_balance()
+
+        if not positions:
             return {
-                "has_position": False,
-                "hl_balance": self.hl.get_usdc_balance(),
-                "bn_balance": self.bn.get_usdt_balance(),
+                "has_positions": False,
+                "position_count": 0,
+                "positions": [],
+                "hl_balance": hl_balance,
+                "bn_balance": bn_balance,
             }
 
-        health = self.check_health()
+        position_statuses = []
+        health_by_coin = {
+            ph["coin"]: ph for ph in health.get("position_health", [])
+        }
+        for pos in positions:
+            coin = pos["coin"]
+            ph = health_by_coin.get(coin, {})
+            position_statuses.append({
+                "coin": coin,
+                "direction": pos.get("direction"),
+                "entry_time": pos.get("entry_time"),
+                "size": pos.get("size"),
+                "entry_price": pos.get("entry_price"),
+                "entry_spread": pos.get("entry_spread"),
+                "current_spread": ph.get("current_spread"),
+                "current_apr": ph.get("current_apr"),
+                "hl_rate": ph.get("hl_rate"),
+                "bn_rate": ph.get("bn_rate"),
+                "long_size": ph.get("long_size"),
+                "short_size": ph.get("short_size"),
+                "delta_pct": ph.get("delta_pct"),
+                "healthy": ph.get("healthy"),
+                "total_funding_earned": pos.get("total_funding_earned", 0.0),
+            })
+
         return {
-            "has_position": True,
-            "coin": coin,
-            "direction": state.get("direction"),
-            "entry_time": state.get("entry_time"),
-            "size": state.get("size"),
-            "entry_price": state.get("entry_price"),
-            "entry_spread": state.get("entry_spread"),
-            "current_spread": health.get("current_spread"),
-            "current_apr": health.get("current_apr"),
-            "hl_rate": health.get("hl_rate"),
-            "bn_rate": health.get("bn_rate"),
-            "long_size": health.get("long_size"),
-            "short_size": health.get("short_size"),
-            "delta_pct": health.get("delta_pct"),
+            "has_positions": True,
+            "position_count": len(positions),
+            "positions": position_statuses,
             "healthy": health.get("healthy"),
-            "total_funding_earned": state.get("total_funding_earned", 0.0),
-            "hl_balance": self.hl.get_usdc_balance(),
-            "bn_balance": self.bn.get_usdt_balance(),
+            "hl_balance": hl_balance,
+            "bn_balance": bn_balance,
         }
 
     def get_report(self) -> dict:
-        """Generate full report with real balance-based PnL."""
+        """Generate full report with real balance-based PnL (aggregate across all positions)."""
         status = self.get_status()
         state = self._load()
 
         entry_total = state.get("entry_total_balance", 0.0)
-        entry_hl = state.get("entry_hl_balance", 0.0)
-        entry_bn = state.get("entry_bn_balance", 0.0)
 
         current_hl = status.get("hl_balance", 0.0)
         current_bn = status.get("bn_balance", 0.0)
@@ -2626,6 +2842,12 @@ class CrossFundingEngine:
 
         pnl = round(current_total - entry_total, 2) if entry_total else 0.0
         roi_pct = round(pnl / entry_total * 100, 4) if entry_total else 0.0
+
+        # Aggregate funding earned across all positions
+        total_funding = sum(
+            p.get("total_funding_earned", 0.0)
+            for p in state.get("positions", [])
+        )
 
         annualized_roi_pct = 0.0
         strategy_start = state.get("strategy_start_time")
@@ -2642,10 +2864,9 @@ class CrossFundingEngine:
 
         return {
             **status,
-            "entry_hl_balance": entry_hl,
-            "entry_bn_balance": entry_bn,
             "entry_total_balance": entry_total,
             "current_total_balance": current_total,
+            "total_funding_earned": round(total_funding, 2),
             "pnl": pnl,
             "roi_pct": roi_pct,
             "annualized_roi_pct": annualized_roi_pct,
@@ -2744,6 +2965,172 @@ def log_trade(
     _save_trade_history(trades)
 
 
+def _build_position_dashboard(
+    engine: CrossFundingEngine, pos_data: dict, roi_pct: float,
+) -> dict:
+    """Build dashboard data for a single position."""
+    coin = pos_data["coin"]
+    direction = pos_data.get("direction", {})
+    long_ex = direction.get("long_exchange", "hyperliquid")
+    short_ex = direction.get("short_exchange", "binance")
+    long_client = engine._get_client(long_ex)
+    short_client = engine._get_client(short_ex)
+
+    long_pos = long_client.get_position(coin)
+    short_pos = short_client.get_position(coin)
+
+    long_size = abs(long_pos["size"]) if long_pos else 0.0
+    short_size = abs(short_pos["size"]) if short_pos else 0.0
+
+    hl_rate = engine.hl.get_funding_rate(coin)
+    bn_rate = engine.bn.get_funding_rate(coin)
+
+    current_price = engine.hl.get_mid_price(coin)
+    entry_price = pos_data.get("entry_price", 0.0)
+
+    rate_map = {"hyperliquid": hl_rate, "binance": bn_rate}
+    current_spread = rate_map[short_ex] - rate_map[long_ex]
+    current_apr = round(current_spread * 3 * 365 * 100, 2)
+
+    # Settlement countdown
+    now = datetime.now(timezone.utc)
+    hl_next_min = 60 - now.minute
+    bn_next_secs = 0
+    for h in [0, 8, 16, 24]:
+        bn_next = now.replace(hour=h % 24, minute=0, second=0, microsecond=0)
+        if h == 24:
+            bn_next += timedelta(days=1)
+            bn_next = bn_next.replace(hour=0)
+        if bn_next > now:
+            bn_next_secs = (bn_next - now).total_seconds()
+            break
+    bn_next_min = int(bn_next_secs / 60)
+
+    # Funding payments count
+    entry_time = pos_data.get("entry_time", "")
+    hours_held = 0.0
+    if entry_time:
+        try:
+            hours_held = (
+                now - datetime.fromisoformat(entry_time)
+            ).total_seconds() / 3600
+        except (ValueError, TypeError):
+            pass
+    hl_payments = int(hours_held)
+    bn_payments = int(hours_held / 8)
+
+    long_entry_px = long_pos.get("entry_px", entry_price) if long_pos else entry_price
+    short_entry_px = short_pos.get("entry_px", entry_price) if short_pos else entry_price
+
+    long_pnl = long_pos.get("unrealized_pnl", 0.0) if long_pos else 0.0
+    short_pnl = short_pos.get("unrealized_pnl", 0.0) if short_pos else 0.0
+    total_price_pnl = round(long_pnl + short_pnl, 2)
+
+    # Real funding PnL from exchange APIs
+    hl_cum_funding = 0.0
+    bn_cum_funding = 0.0
+    if long_ex == "hyperliquid":
+        hl_cum_funding = -(long_pos.get("cum_funding", 0.0)) if long_pos else 0.0
+    else:
+        hl_cum_funding = -(short_pos.get("cum_funding", 0.0)) if short_pos else 0.0
+
+    entry_time_val = pos_data.get("entry_time", "")
+    if entry_time_val:
+        try:
+            entry_ms = int(datetime.fromisoformat(entry_time_val).timestamp() * 1000)
+            bn_cum_funding = engine.bn.get_funding_income(coin, entry_ms)
+        except (ValueError, TypeError):
+            pass
+
+    if long_ex == "hyperliquid":
+        hl_funding_share = round(hl_cum_funding, 4)
+        bn_funding_share = round(bn_cum_funding, 4)
+    else:
+        hl_funding_share = round(hl_cum_funding, 4)
+        bn_funding_share = round(bn_cum_funding, 4)
+
+    total_funding = round(hl_funding_share + bn_funding_share, 2)
+
+    # Build leg data
+    hl_leg_data = {
+        "exchange": "hyperliquid",
+        "leverage": engine.leverage,
+        "funding_rate": hl_rate,
+        "settlement_cycle_h": 1,
+        "next_settlement_min": hl_next_min,
+    }
+    bn_leg_data = {
+        "exchange": "binance",
+        "leverage": engine.leverage,
+        "funding_rate": bn_rate,
+        "settlement_cycle_h": 8,
+        "next_settlement_min": bn_next_min,
+    }
+
+    if long_ex == "hyperliquid":
+        long_leg_extra = hl_leg_data
+        short_leg_extra = bn_leg_data
+        long_funding = hl_funding_share
+        short_funding = bn_funding_share
+        long_payments = hl_payments
+        short_payments = bn_payments
+    else:
+        long_leg_extra = bn_leg_data
+        short_leg_extra = hl_leg_data
+        long_funding = bn_funding_share
+        short_funding = hl_funding_share
+        long_payments = bn_payments
+        short_payments = hl_payments
+
+    long_notional = round(long_size * current_price, 2)
+    short_notional = round(short_size * current_price, 2)
+
+    avg_size = (long_size + short_size) / 2 if (long_size + short_size) > 0 else 1
+    delta_exposure = abs(long_size - short_size)
+    delta_pct = round(delta_exposure / avg_size * 100, 2)
+
+    avg_notional = (long_notional + short_notional) / 2
+    projected_daily = round(abs(current_spread) * 3 * avg_notional, 2)
+
+    return {
+        "coin": coin,
+        "direction": direction,
+        "entry_time": entry_time,
+        "entry_spread": pos_data.get("entry_spread", 0.0),
+        "current_spread": current_spread,
+        "long_leg": {
+            **long_leg_extra,
+            "side": "long",
+            "size": long_size,
+            "entry_price": long_entry_px,
+            "current_price": current_price,
+            "notional": long_notional,
+            "unrealized_pnl": round(long_pnl, 2),
+            "accumulated_funding": long_funding,
+            "funding_payments": long_payments,
+        },
+        "short_leg": {
+            **short_leg_extra,
+            "side": "short",
+            "size": short_size,
+            "entry_price": short_entry_px,
+            "current_price": current_price,
+            "notional": short_notional,
+            "unrealized_pnl": round(short_pnl, 2),
+            "accumulated_funding": short_funding,
+            "funding_payments": short_payments,
+        },
+        "delta_neutral": delta_pct < 5,
+        "delta_exposure": round(delta_exposure, 6),
+        "delta_exposure_pct": delta_pct,
+        "total_funding_pnl": total_funding,
+        "total_price_pnl": total_price_pnl,
+        "total_pnl": round(total_funding + total_price_pnl, 2),
+        "current_apr": current_apr,
+        "projected_daily_usd": projected_daily,
+    }, total_funding
+
+
 def export_dashboard(
     engine: CrossFundingEngine,
     opportunities: list[dict] | None = None,
@@ -2751,7 +3138,7 @@ def export_dashboard(
     """Write dashboard_data.json for the frontend."""
     try:
         state = engine._load()
-        coin = state.get("current_coin")
+        positions = state.get("positions", [])
 
         # Balances
         hl_bal = engine.hl.get_usdc_balance()
@@ -2762,7 +3149,7 @@ def export_dashboard(
         roi_pct = round(total_pnl / entry_total * 100, 4) if entry_total else 0.0
 
         annualized_roi_pct = 0.0
-        strategy_start = state.get("strategy_start_time") or state.get("entry_time", "")
+        strategy_start = state.get("strategy_start_time", "")
         if strategy_start and entry_total:
             try:
                 hours_running = (
@@ -2782,181 +3169,26 @@ def export_dashboard(
             "annualized_roi_pct": annualized_roi_pct,
             "hl_balance": round(hl_bal, 2),
             "bn_balance": round(bn_bal, 2),
+            "position_count": len(positions),
+            "max_positions": engine.max_positions,
         }
 
-        # Position
-        position = None
-        if coin:
-            direction = state.get("direction", {})
-            long_ex = direction.get("long_exchange", "hyperliquid")
-            short_ex = direction.get("short_exchange", "binance")
-            long_client = engine._get_client(long_ex)
-            short_client = engine._get_client(short_ex)
+        # Build positions array
+        dashboard_positions: list[dict] = []
+        for pos_data in positions:
+            pos_dashboard, pos_funding = _build_position_dashboard(
+                engine, pos_data, roi_pct,
+            )
+            dashboard_positions.append(pos_dashboard)
 
-            long_pos = long_client.get_position(coin)
-            short_pos = short_client.get_position(coin)
-
-            long_size = abs(long_pos["size"]) if long_pos else 0.0
-            short_size = abs(short_pos["size"]) if short_pos else 0.0
-
-            hl_rate = engine.hl.get_funding_rate(coin)
-            bn_rate = engine.bn.get_funding_rate(coin)
-
-            current_price = engine.hl.get_mid_price(coin)
-            entry_price = state.get("entry_price", 0.0)
-
-            rate_map = {"hyperliquid": hl_rate, "binance": bn_rate}
-            current_spread = rate_map[short_ex] - rate_map[long_ex]
-            current_apr = round(current_spread * 3 * 365 * 100, 2)
-
-            # Settlement countdown
-            now = datetime.now(timezone.utc)
-            hl_next_min = 60 - now.minute
-            bn_next_secs = 0
-            for h in [0, 8, 16, 24]:
-                bn_next = now.replace(hour=h % 24, minute=0, second=0, microsecond=0)
-                if h == 24:
-                    bn_next += timedelta(days=1)
-                    bn_next = bn_next.replace(hour=0)
-                if bn_next > now:
-                    bn_next_secs = (bn_next - now).total_seconds()
+            # Update per-position funding in state
+            for sp in state.get("positions", []):
+                if sp["coin"] == pos_data["coin"]:
+                    sp["total_funding_earned"] = pos_funding
                     break
-            bn_next_min = int(bn_next_secs / 60)
 
-            # Funding payments count
-            entry_time = state.get("entry_time", "")
-            hours_held = 0.0
-            if entry_time:
-                try:
-                    hours_held = (
-                        now - datetime.fromisoformat(entry_time)
-                    ).total_seconds() / 3600
-                except (ValueError, TypeError):
-                    pass
-            hl_payments = int(hours_held)  # 1 per hour
-            bn_payments = int(hours_held / 8)  # 1 per 8h
-
-            long_entry_px = long_pos.get("entry_px", entry_price) if long_pos else entry_price
-            short_entry_px = short_pos.get("entry_px", entry_price) if short_pos else entry_price
-
-            long_pnl = long_pos.get("unrealized_pnl", 0.0) if long_pos else 0.0
-            short_pnl = short_pos.get("unrealized_pnl", 0.0) if short_pos else 0.0
-            total_price_pnl = round(long_pnl + short_pnl, 2)
-
-            # Real funding PnL from exchange APIs
-            # HL: cumFunding.sinceOpen (negative = earned for shorts, positive = paid)
-            # Note: HL cumFunding sign: positive = paid by user, negative = received
-            hl_cum_funding = 0.0
-            bn_cum_funding = 0.0
-            if long_ex == "hyperliquid":
-                hl_cum_funding = -(long_pos.get("cum_funding", 0.0)) if long_pos else 0.0
-            else:
-                hl_cum_funding = -(short_pos.get("cum_funding", 0.0)) if short_pos else 0.0
-
-            # BN: query funding income history since entry
-            entry_time_val = state.get("entry_time", "")
-            if entry_time_val:
-                try:
-                    entry_ms = int(datetime.fromisoformat(entry_time_val).timestamp() * 1000)
-                    bn_cum_funding = engine.bn.get_funding_income(coin, entry_ms)
-                except (ValueError, TypeError):
-                    pass
-
-            # Assign per-leg funding
-            if long_ex == "hyperliquid":
-                hl_funding_share = round(hl_cum_funding, 4)
-                bn_funding_share = round(bn_cum_funding, 4)
-            else:
-                hl_funding_share = round(hl_cum_funding, 4)
-                bn_funding_share = round(bn_cum_funding, 4)
-
-            total_funding = round(hl_funding_share + bn_funding_share, 2)
-
-            # Build leg data
-            hl_leg_data = {
-                "exchange": "hyperliquid",
-                "leverage": engine.leverage,
-                "funding_rate": hl_rate,
-                "settlement_cycle_h": 1,
-                "next_settlement_min": hl_next_min,
-            }
-            bn_leg_data = {
-                "exchange": "binance",
-                "leverage": engine.leverage,
-                "funding_rate": bn_rate,
-                "settlement_cycle_h": 8,
-                "next_settlement_min": bn_next_min,
-            }
-
-            if long_ex == "hyperliquid":
-                long_leg_extra = hl_leg_data
-                short_leg_extra = bn_leg_data
-                long_funding = hl_funding_share
-                short_funding = bn_funding_share
-                long_payments = hl_payments
-                short_payments = bn_payments
-            else:
-                long_leg_extra = bn_leg_data
-                short_leg_extra = hl_leg_data
-                long_funding = bn_funding_share
-                short_funding = hl_funding_share
-                long_payments = bn_payments
-                short_payments = hl_payments
-
-            # Also update state with real funding total
-            state["total_funding_earned"] = total_funding
+        if positions:
             engine._save(state)
-
-            long_notional = round(long_size * current_price, 2)
-            short_notional = round(short_size * current_price, 2)
-
-            avg_size = (long_size + short_size) / 2 if (long_size + short_size) > 0 else 1
-            delta_exposure = abs(long_size - short_size)
-            delta_pct = round(delta_exposure / avg_size * 100, 2)
-
-            # Projected daily income from funding spread
-            avg_notional = (long_notional + short_notional) / 2
-            projected_daily = round(abs(current_spread) * 3 * avg_notional, 2)
-
-            position = {
-                "has_position": True,
-                "coin": coin,
-                "direction": direction,
-                "entry_time": entry_time,
-                "entry_spread": state.get("entry_spread", 0.0),
-                "current_spread": current_spread,
-                "long_leg": {
-                    **long_leg_extra,
-                    "side": "long",
-                    "size": long_size,
-                    "entry_price": long_entry_px,
-                    "current_price": current_price,
-                    "notional": long_notional,
-                    "unrealized_pnl": round(long_pnl, 2),
-                    "accumulated_funding": long_funding,
-                    "funding_payments": long_payments,
-                },
-                "short_leg": {
-                    **short_leg_extra,
-                    "side": "short",
-                    "size": short_size,
-                    "entry_price": short_entry_px,
-                    "current_price": current_price,
-                    "notional": short_notional,
-                    "unrealized_pnl": round(short_pnl, 2),
-                    "accumulated_funding": short_funding,
-                    "funding_payments": short_payments,
-                },
-                "delta_neutral": delta_pct < 5,
-                "delta_exposure": round(delta_exposure, 6),
-                "delta_exposure_pct": delta_pct,
-                "total_funding_pnl": round(total_funding, 2),
-                "total_price_pnl": total_price_pnl,
-                "total_pnl": round(total_funding + total_price_pnl, 2),
-                "roi_pct": round(roi_pct, 2),
-                "current_apr": current_apr,
-                "projected_daily_usd": projected_daily,
-            }
 
         # Opportunities
         opps = opportunities or []
@@ -2967,7 +3199,7 @@ def export_dashboard(
         dashboard = {
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "summary": summary,
-            "position": position,
+            "positions": dashboard_positions,
             "opportunities": opps[:20],
             "trades": trades[-50:],
         }
@@ -2978,7 +3210,7 @@ def export_dashboard(
 
 
 def tick() -> None:
-    """Main loop tick: scan → stability check → open/maintain + scheduled pulse."""
+    """Main loop tick: scan → manage positions (close/open/switch) + pulse."""
     if not acquire_lock(LOCK_NAME):
         emit("skip", {"reason": "another instance running"})
         return
@@ -2991,14 +3223,18 @@ def tick() -> None:
 
         engine = _build_engine()
         state = engine._load()
-        coin = state.get("current_coin")
+        positions = state.get("positions", [])
         opportunities: list[dict] = []
 
-        if not coin:
-            # No position: scan → record snapshot → check stability → verify → open
-            opportunities = engine.scan_opportunities()
+        # Always scan opportunities
+        opportunities = engine.scan_opportunities()
+
+        if not positions:
+            # No positions: stability check flow for first position
             if not opportunities:
                 emit("tick", {"action": "idle", "reason": "no opportunities"})
+                export_dashboard(engine, opportunities)
+                cb.record_success()
                 return
 
             engine.record_snapshot(opportunities)
@@ -3014,6 +3250,8 @@ def tick() -> None:
                         "top_apr": opportunities[0]["estimated_apr"],
                     },
                 )
+                export_dashboard(engine, opportunities)
+                cb.record_success()
                 return
 
             # Deep verification
@@ -3031,6 +3269,8 @@ def tick() -> None:
                         "reason": verification["reject_reason"],
                     },
                 )
+                export_dashboard(engine, opportunities)
+                cb.record_success()
                 return
 
             emit(
@@ -3045,18 +3285,19 @@ def tick() -> None:
             success = engine.open_position(stable_opp["coin"], direction)
             if not success:
                 cb.record_error("open_position")
+                export_dashboard(engine, opportunities)
                 return
+            opened_pos = engine._get_position_by_coin(stable_opp["coin"])
             log_trade(
                 "open", stable_opp["coin"], direction,
-                size=engine._load().get("size", 0),
-                entry_price=engine._load().get("entry_price", 0),
+                size=opened_pos.get("size", 0) if opened_pos else 0,
+                entry_price=opened_pos.get("entry_price", 0) if opened_pos else 0,
                 reason=f"APR {verification['net_apr_after_costs']:.1f}%",
             )
         else:
-            # Has position: health check + switch evaluation + scan opportunities
-            opportunities = engine.scan_opportunities()
-            switched = engine.check_and_switch(opportunities)
-            if not switched:
+            # Has positions: manage all (close unhealthy, open new, switch worst)
+            acted = engine.check_and_manage(opportunities)
+            if not acted:
                 health = engine.check_health()
                 report_data = engine.get_report()
                 snapshot = {**report_data, **health}
@@ -3071,13 +3312,13 @@ def tick() -> None:
                     emit("tick", snapshot, tier="hourly_pulse")
                     state["last_pulse_ts"] = datetime.now(timezone.utc).isoformat()
                 else:
+                    pos_coins = [p["coin"] for p in engine._get_positions()]
                     emit(
                         "tick",
                         {
                             "action": "hold",
-                            "coin": coin,
-                            "current_apr": health.get("current_apr"),
-                            "delta_pct": health.get("delta_pct"),
+                            "positions": pos_coins,
+                            "position_count": len(pos_coins),
                             "healthy": health.get("healthy"),
                         },
                     )
