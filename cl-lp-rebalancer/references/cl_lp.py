@@ -486,15 +486,16 @@ def get_eth_price() -> float | None:
     return None
 
 
-def get_balances() -> tuple[float, float, bool]:
+def get_balances(force: bool = False) -> tuple[float, float, bool]:
     """Get ETH and USDC balances via --all to avoid wallet-switch race condition."""
     account_id = _cfg_account_id
+    base_args = ["wallet", "balance", "--chain", CHAIN_ID]
+    if force:
+        base_args.append("--force")
     if account_id:
-        data = onchainos_cmd(
-            ["wallet", "balance", "--all", "--chain", CHAIN_ID], timeout=15
-        )
+        data = onchainos_cmd(base_args + ["--all"], timeout=15)
     else:
-        data = onchainos_cmd(["wallet", "balance", "--chain", CHAIN_ID], timeout=15)
+        data = onchainos_cmd(base_args, timeout=15)
     if not data or not data.get("ok") or not data.get("data"):
         log(f"Balance query failed, raw: {json.dumps(data)[:200] if data else 'None'}")
         return 0.0, 0.0, True
@@ -1435,13 +1436,13 @@ def execute_rebalance(
         save_state(state)
         time.sleep(3)
 
-    # Step 3: Get current balances after redeem
-    eth_bal, usdc_bal, bal_failed = get_balances()
+    # Step 3: Get current balances after redeem (force refresh to bypass cache)
+    eth_bal, usdc_bal, bal_failed = get_balances(force=True)
     if bal_failed:
         log("  Balance query failed after redeem — funds may be idle")
         # Don't crash, but try to continue with what we have
         time.sleep(5)
-        eth_bal, usdc_bal, bal_failed = get_balances()
+        eth_bal, usdc_bal, bal_failed = get_balances(force=True)
         if bal_failed:
             log("  Balance still unavailable — aborting, funds sitting idle in wallet")
             return False
@@ -1455,8 +1456,8 @@ def execute_rebalance(
         return False
 
     # Step 4: Deposit with USDC only — OKX adapter handles internal swap
-    usdc_deposit = int(usdc_bal * 0.95)  # 95% to leave buffer
-    log(f"  Balances: ETH={eth_bal:.6f} USDC={usdc_bal:.2f} deposit={usdc_deposit}")
+    usdc_deposit = int(usdc_bal * 0.95 * (10 ** TOKEN1["decimals"]))  # minimal units
+    log(f"  Balances: ETH={eth_bal:.6f} USDC={usdc_bal:.2f} deposit={usdc_deposit} (minimal units)")
     user_input_json = json.dumps(
         [
             {
@@ -1547,12 +1548,12 @@ def _emergency_deposit(state: dict, price: float, trigger: dict) -> bool:
     tick_lower = price_to_tick(lower_price)
     tick_upper = price_to_tick(upper_price)
 
-    eth_bal, usdc_bal, bal_failed = get_balances()
+    eth_bal, usdc_bal, bal_failed = get_balances(force=True)
     if bal_failed:
         log("  Emergency: balance query failed — cannot proceed")
         return False
-    usdc_deposit = int(usdc_bal * 0.9)
-    if usdc_deposit < MIN_TRADE_USD:
+    usdc_deposit = int(usdc_bal * 0.9 * (10 ** TOKEN1["decimals"]))  # minimal units
+    if usdc_bal * 0.9 < MIN_TRADE_USD:
         log(f"  Emergency: USDC balance too low ({usdc_bal:.2f})")
         return False
     user_input = json.dumps(
@@ -2815,9 +2816,9 @@ def status():
                 _print_status_from_snapshot(cached, state, cached_age_s=age_s)
                 return
 
-    # Cache stale or missing — live query
+    # Cache stale or missing — live query (force refresh for accurate display)
     price = get_eth_price()
-    eth_bal, usdc_bal, bal_failed = get_balances()
+    eth_bal, usdc_bal, bal_failed = get_balances(force=True)
     if bal_failed:
         print("> 余额查询失败，显示的余额可能不准确")
     wallet_usd = eth_bal * (price or 0) + usdc_bal
