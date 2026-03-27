@@ -4,7 +4,7 @@ description: "Uniswap V3 集中流动性 LP 自动调仓策略。基于波动率
 license: Apache-2.0
 metadata:
   author: SynthThoughts
-  version: "3.3.1"
+  version: "3.3.2"
   pattern: "pipeline, tool-wrapper"
   steps: "5"
 ---

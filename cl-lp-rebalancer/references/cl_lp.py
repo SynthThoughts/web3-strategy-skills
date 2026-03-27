@@ -1485,6 +1485,7 @@ def execute_rebalance(
                 "chainIndex": CHAIN_ID,
                 "coinAmount": str(usdc_deposit),
                 "tokenAddress": USDC_ADDR,
+                "tokenPrecision": str(TOKEN1["decimals"]),
             }
         ]
     )
@@ -1573,6 +1574,7 @@ def _emergency_deposit(state: dict, price: float, trigger: dict) -> bool:
                 "chainIndex": CHAIN_ID,
                 "coinAmount": str(usdc_deposit),
                 "tokenAddress": USDC_ADDR,
+                "tokenPrecision": str(TOKEN1["decimals"]),
             }
         ]
     )
