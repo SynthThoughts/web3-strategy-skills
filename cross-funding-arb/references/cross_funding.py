@@ -2819,6 +2819,7 @@ def export_dashboard(
             bn_next_min = int(bn_next_secs / 60)
 
             # Funding payments count
+            entry_time = state.get("entry_time", "")
             hours_held = 0.0
             if entry_time:
                 try:
