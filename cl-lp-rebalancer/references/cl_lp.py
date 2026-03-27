@@ -571,10 +571,10 @@ def get_position_value(token_id: str) -> float:
     return get_position_detail(token_id)["value"]
 
 
-def find_latest_token_id() -> str:
-    """Query position-detail to find the latest LP token ID for this pool."""
+def _query_all_positions() -> list[dict]:
+    """Query all LP positions for this pool. Returns list of {tokenId, assets, value}."""
     if not WALLET_ADDR:
-        return ""
+        return []
     data = onchainos_cmd(
         [
             "defi",
@@ -589,19 +589,54 @@ def find_latest_token_id() -> str:
         timeout=20,
     )
     if not data or not data.get("ok") or not data.get("data"):
-        return ""
+        return []
+    result = []
     try:
         for platform in data["data"]:
             for wallet in platform.get("walletIdPlatformDetailList", []):
                 for network in wallet.get("networkHoldVoList", []):
                     for invest in network.get("investTokenBalanceVoList", []):
-                        positions = invest.get("positionList", [])
-                        if positions:
-                            # Return the last (newest) position's tokenId
-                            return str(positions[-1].get("tokenId", ""))
+                        for pos in invest.get("positionList", []):
+                            tid = str(pos.get("tokenId", ""))
+                            assets = pos.get("assetsTokenList", [])
+                            value = sum(
+                                float(a.get("currencyAmount", 0)) for a in assets
+                            )
+                            result.append(
+                                {"tokenId": tid, "assets": assets, "value": value}
+                            )
     except (KeyError, ValueError, TypeError):
         pass
+    return result
+
+
+def find_latest_token_id() -> str:
+    """Query position-detail to find the latest LP token ID for this pool."""
+    positions = _query_all_positions()
+    if positions:
+        return positions[-1]["tokenId"]
     return ""
+
+
+def cleanup_residual_positions(keep_token_id: str) -> int:
+    """Redeem all positions except keep_token_id. Returns count of cleaned positions."""
+    positions = _query_all_positions()
+    cleaned = 0
+    for pos in positions:
+        tid = pos["tokenId"]
+        if tid == keep_token_id or not tid:
+            continue
+        val = pos["value"]
+        log(f"  Cleaning residual position #{tid} (${val:.2f})")
+        ok = defi_redeem(tid)
+        if ok:
+            cleaned += 1
+            log(f"  Redeemed #{tid}")
+        else:
+            log(f"  WARN: failed to redeem #{tid}")
+    if cleaned:
+        log(f"  Cleaned {cleaned} residual position(s)")
+    return cleaned
 
 
 # ── K-line / OHLC Data ──────────────────────────────────────────────────────
@@ -1490,8 +1525,17 @@ def execute_rebalance(
             log("  Deposit tx may have reverted — attempting emergency wide deposit")
             return _emergency_deposit(state, price, trigger)
         log(f"  Found token_id from position-detail: {new_token_id} (value=${lp_value:.2f})")
+        # Clean up any residual positions from previous failed rebalances
+        cleanup_residual_positions(new_token_id)
     else:
-        log("  Warning: deposit broadcast OK but token_id not found")
+        # Deposit broadcast succeeded but can't find position — retry once
+        time.sleep(10)
+        new_token_id = find_latest_token_id()
+        if new_token_id:
+            log(f"  Found token_id on retry: {new_token_id}")
+            cleanup_residual_positions(new_token_id)
+        else:
+            log("  ERROR: deposit broadcast OK but token_id not found after retry")
 
     # Update state
     now_iso = datetime.now().isoformat()
@@ -1625,6 +1669,7 @@ def load_state() -> dict:
                     log("Backup also corrupted — starting fresh")
     return {
         "version": 1,
+        "wallet_address": WALLET_ADDR,
         "pool": {
             "investment_id": INVESTMENT_ID,
             "chain": POOL_CHAIN,
@@ -2179,6 +2224,10 @@ def _tick_inner():
     """Actual tick logic (called under process lock)."""
     state = load_state()
 
+    # Ensure wallet_address is stored in state
+    if WALLET_ADDR and state.get("wallet_address") != WALLET_ADDR:
+        state["wallet_address"] = WALLET_ADDR
+
     # Check for in-progress rebalance from crashed previous tick
     if state.get("_rebalance_in_progress"):
         log(
@@ -2283,6 +2332,9 @@ def _tick_inner():
         if recovered_id:
             position["token_id"] = recovered_id
             log(f"Recovered token_id: {recovered_id}")
+    # Clean up residual positions (from failed rebalances)
+    if position and position.get("token_id"):
+        cleanup_residual_positions(position["token_id"])
     if position and position.get("token_id"):
         pos_detail = get_position_detail(position["token_id"])
         lp_value = pos_detail["value"]
@@ -3036,6 +3088,7 @@ def reset():
         if hasattr(load_state, "__wrapped__")
         else {
             "version": 1,
+            "wallet_address": WALLET_ADDR,
             "pool": {
                 "investment_id": INVESTMENT_ID,
                 "chain": POOL_CHAIN,
