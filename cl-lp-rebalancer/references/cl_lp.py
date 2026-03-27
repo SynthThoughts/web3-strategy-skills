@@ -871,17 +871,25 @@ def check_rebalance_triggers(
                 "detail": f"{old_regime}->{new_regime} (delta {vol_change:.0%})",
             }
 
-    # [4] Time decay — maintenance (>24h)
+    # [4] Time decay — only when price drifts to outer edge of range (>24h)
     created_at = position.get("created_at")
     if created_at:
         created_dt = _safe_isoparse(created_at)
         age_seconds = (datetime.now() - created_dt).total_seconds() if created_dt else 0
         if age_seconds > 86400:  # 24h
-            return {
-                "trigger": "time_decay",
-                "priority": "maintenance",
-                "detail": f"{age_seconds / 3600:.1f}h old",
-            }
+            # Only trigger if price is in the outer 20% of range (near edge)
+            range_width = upper_price - lower_price
+            if range_width > 0:
+                position_in_range = (price - lower_price) / range_width
+                edge_threshold = 0.20
+                near_edge = position_in_range < edge_threshold or position_in_range > (1 - edge_threshold)
+                if near_edge:
+                    edge_side = "near_lower" if position_in_range < 0.5 else "near_upper"
+                    return {
+                        "trigger": "time_decay",
+                        "priority": "maintenance",
+                        "detail": f"{age_seconds / 3600:.1f}h old, {edge_side} ({position_in_range:.0%})",
+                    }
 
     return None
 
@@ -2506,13 +2514,17 @@ def _tick_inner():
             rebalanced = execute_rebalance(state, price, new_range, trigger)
             if rebalanced:
                 tick_status = "rebalanced"
+                errors["consecutive"] = 0
             else:
                 tick_status = "rebalance_failed"
                 errors["consecutive"] = errors.get("consecutive", 0) + 1
-                if errors["consecutive"] >= MAX_CONSECUTIVE_ERRORS:
-                    errors["cooldown_until"] = (
-                        datetime.now() + timedelta(seconds=COOLDOWN_AFTER_ERRORS)
-                    ).isoformat()
+                n = errors["consecutive"]
+                # Exponential backoff: 10min, 20min, 40min, ... capped at COOLDOWN_AFTER_ERRORS
+                backoff = min(600 * (2 ** (n - 1)), COOLDOWN_AFTER_ERRORS)
+                errors["cooldown_until"] = (
+                    datetime.now() + timedelta(seconds=backoff)
+                ).isoformat()
+                log(f"Rebalance failed ({n} consecutive) — cooldown {backoff // 60}min")
                 state["errors"] = errors
 
     else:
