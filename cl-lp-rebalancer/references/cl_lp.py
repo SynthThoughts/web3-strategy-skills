@@ -2534,8 +2534,6 @@ def _tick_inner():
         "rebalanced",
         "first_deploy",
         "initial_deposit",
-        "rebalance_failed",
-        "initial_deposit_failed",
     )
     is_quiet = tick_status in (
         "in_range",
