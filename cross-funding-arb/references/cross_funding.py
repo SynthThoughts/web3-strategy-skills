@@ -3194,9 +3194,33 @@ def export_dashboard(
         entry_total = state.get("entry_total_balance", 0.0)
         current_total = round(hl_bal + bn_bal, 2)
 
-        # PnL & ROI based on trade history funding totals
+        # Build positions array first to get live funding PnL
+        dashboard_positions: list[dict] = []
+        live_funding_total = 0.0
+        for pos_data in positions:
+            pos_dashboard, pos_funding = _build_position_dashboard(
+                engine, pos_data, 0.0,
+            )
+            dashboard_positions.append(pos_dashboard)
+            live_funding_total += pos_funding
+            live_funding_total += pos_dashboard.get("total_pending_funding", 0.0)
+
+            # Update per-position funding in state
+            for sp in state.get("positions", []):
+                if sp["coin"] == pos_data["coin"]:
+                    sp["total_funding_earned"] = pos_funding
+                    break
+
+        if positions:
+            engine._save(state)
+
+        # PnL & ROI: closed trades + live positions funding
         trades = _load_trade_history()
-        total_pnl = round(sum(t.get("funding_pnl", 0) for t in trades if t.get("funding_pnl") is not None), 2)
+        closed_pnl = sum(
+            t.get("funding_pnl", 0) for t in trades
+            if t.get("funding_pnl") is not None
+        )
+        total_pnl = round(closed_pnl + live_funding_total, 2)
         roi_pct = round(total_pnl / entry_total * 100, 4) if entry_total else 0.0
 
         annualized_roi_pct = 0.0
@@ -3212,6 +3236,10 @@ def export_dashboard(
             except (ValueError, TypeError):
                 pass
 
+        # Update roi_pct in position dashboards
+        for pd in dashboard_positions:
+            pd["roi_pct"] = roi_pct
+
         summary = {
             "total_invested": entry_total or current_total,
             "current_value": current_total,
@@ -3223,23 +3251,6 @@ def export_dashboard(
             "position_count": len(positions),
             "max_positions": engine.max_positions,
         }
-
-        # Build positions array
-        dashboard_positions: list[dict] = []
-        for pos_data in positions:
-            pos_dashboard, pos_funding = _build_position_dashboard(
-                engine, pos_data, roi_pct,
-            )
-            dashboard_positions.append(pos_dashboard)
-
-            # Update per-position funding in state
-            for sp in state.get("positions", []):
-                if sp["coin"] == pos_data["coin"]:
-                    sp["total_funding_earned"] = pos_funding
-                    break
-
-        if positions:
-            engine._save(state)
 
         # Opportunities
         opps = opportunities or []
