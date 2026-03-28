@@ -1545,19 +1545,33 @@ def execute_rebalance(
         log(f"  Balance too low after redeem: ${total_usd:.2f}")
         return False
 
-    # Step 4: Deposit with USDC only — OKX adapter handles internal swap
-    usdc_deposit = int(usdc_bal * 0.95 * (10 ** TOKEN1["decimals"]))  # minimal units
-    log(f"  Balances: ETH={eth_bal:.6f} USDC={usdc_bal:.2f} deposit={usdc_deposit} (minimal units)")
-    user_input_json = json.dumps(
-        [
-            {
-                "chainIndex": CHAIN_ID,
-                "coinAmount": str(usdc_deposit),
-                "tokenAddress": USDC_ADDR,
-                "tokenPrecision": str(TOKEN1["decimals"]),
-            }
-        ]
+    # Step 4: Calculate optimal dual-token deposit using available ETH + USDC
+    deposit_eth = int(available_eth * 0.95 * (10 ** TOKEN0["decimals"]))  # wei
+    log(f"  Balances: ETH={eth_bal:.6f} USDC={usdc_bal:.2f}")
+    # Use calculate-entry to get proper dual-token ratio for the tick range
+    calculated = defi_calculate_entry(
+        input_token=NATIVE_TOKEN,
+        input_amount=str(deposit_eth),
+        token_decimal=TOKEN0["decimals"],
+        tick_lower=new_tick_lower,
+        tick_upper=new_tick_upper,
     )
+    if calculated and isinstance(calculated, list):
+        user_input_json = json.dumps(calculated)
+    else:
+        # Fallback: deposit USDC only
+        usdc_deposit = int(usdc_bal * 0.95 * (10 ** TOKEN1["decimals"]))
+        log(f"  calculate-entry failed, falling back to USDC-only: {usdc_deposit}")
+        user_input_json = json.dumps(
+            [
+                {
+                    "chainIndex": CHAIN_ID,
+                    "coinAmount": str(usdc_deposit),
+                    "tokenAddress": USDC_ADDR,
+                    "tokenPrecision": str(TOKEN1["decimals"]),
+                }
+            ]
+        )
 
     # Step 5: Deposit at new range
     # Record current max token_id so we only find positions created AFTER deposit
@@ -1698,20 +1712,40 @@ def _emergency_deposit(state: dict, price: float, trigger: dict) -> bool:
     if bal_failed:
         log("  Emergency: balance query failed — cannot proceed")
         return False
-    usdc_deposit = int(usdc_bal * 0.9 * (10 ** TOKEN1["decimals"]))  # minimal units
-    if usdc_bal * 0.9 < MIN_TRADE_USD:
-        log(f"  Emergency: USDC balance too low ({usdc_bal:.2f})")
+    available_eth = eth_bal - ETH_RESERVE
+    if available_eth < 0:
+        available_eth = 0
+    total_usd = available_eth * price + usdc_bal
+    if total_usd < MIN_TRADE_USD:
+        log(f"  Emergency: total balance too low (${total_usd:.2f})")
         return False
-    user_input = json.dumps(
-        [
-            {
-                "chainIndex": CHAIN_ID,
-                "coinAmount": str(usdc_deposit),
-                "tokenAddress": USDC_ADDR,
-                "tokenPrecision": str(TOKEN1["decimals"]),
-            }
-        ]
+    log(f"  Emergency balances: ETH={eth_bal:.6f} USDC={usdc_bal:.2f}")
+
+    # Use calculate-entry for dual-token deposit (same as execute_rebalance)
+    deposit_eth = int(available_eth * 0.9 * (10 ** TOKEN0["decimals"]))  # wei
+    calculated = defi_calculate_entry(
+        input_token=NATIVE_TOKEN,
+        input_amount=str(deposit_eth),
+        token_decimal=TOKEN0["decimals"],
+        tick_lower=tick_lower,
+        tick_upper=tick_upper,
     )
+    if calculated and isinstance(calculated, list):
+        user_input = json.dumps(calculated)
+    else:
+        # Fallback: deposit USDC only
+        usdc_deposit = int(usdc_bal * 0.9 * (10 ** TOKEN1["decimals"]))
+        log(f"  Emergency calculate-entry failed, falling back to USDC-only: {usdc_deposit}")
+        user_input = json.dumps(
+            [
+                {
+                    "chainIndex": CHAIN_ID,
+                    "coinAmount": str(usdc_deposit),
+                    "tokenAddress": USDC_ADDR,
+                    "tokenPrecision": str(TOKEN1["decimals"]),
+                }
+            ]
+        )
 
     # Record current max token_id before deposit
     pre_deposit_max_tid = ""
