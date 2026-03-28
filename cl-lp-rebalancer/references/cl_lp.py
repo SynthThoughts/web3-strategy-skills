@@ -1869,6 +1869,7 @@ def save_state(state: dict):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, STATE_FILE)
+        os.chmod(STATE_FILE, 0o644)
     except Exception as e:
         try:
             os.unlink(tmp_path)
@@ -2262,6 +2263,7 @@ def calc_pnl(stats: dict, current_usd: float, current_price: float = 0) -> dict:
             "cost_basis_eth": 0.0,
             "fee_apy": 0,
             "net_apy": 0,
+            "net_apy_eth": 0,
             "days_running": 0,
             "valid": False,
         }
@@ -2283,7 +2285,7 @@ def calc_pnl(stats: dict, current_usd: float, current_price: float = 0) -> dict:
     # Annualized yields
     started = stats.get("started_at", "")
     started_dt = _safe_isoparse(started) if started else None
-    days = (datetime.now() - started_dt).total_seconds() / 86400 if started_dt else 0
+    days = (datetime.now(timezone.utc) - started_dt).total_seconds() / 86400 if started_dt else 0
     days = max(days, 0.01)
 
     total_fees = stats.get("total_fees_claimed_usd", 0) + stats.get(
@@ -2291,6 +2293,7 @@ def calc_pnl(stats: dict, current_usd: float, current_price: float = 0) -> dict:
     )
     fee_apy = (total_fees / cost_basis / days * 365 * 100) if cost_basis > 0 else 0
     net_apy = (pnl_usd / cost_basis / days * 365 * 100) if cost_basis > 0 else 0
+    net_apy_eth = (pnl_eth / cost_basis_eth / days * 365 * 100) if cost_basis_eth > 0 else 0
 
     return {
         "pnl_usd": pnl_usd,
@@ -2301,6 +2304,7 @@ def calc_pnl(stats: dict, current_usd: float, current_price: float = 0) -> dict:
         "cost_basis_eth": round(cost_basis_eth, 6),
         "fee_apy": round(fee_apy, 1),
         "net_apy": round(net_apy, 1),
+        "net_apy_eth": round(net_apy_eth, 1),
         "days_running": round(days, 1),
         "valid": True,
     }
@@ -2853,8 +2857,10 @@ def _tick_inner():
         "il_usd": il_usd,
         "fee_apy": pnl["fee_apy"],
         "net_apy": pnl["net_apy"],
+        "net_apy_eth": pnl["net_apy_eth"],
         "days_running": pnl["days_running"],
         "cost_basis": pnl["cost_basis"],
+        "cost_basis_eth": pnl["cost_basis_eth"],
         "balances": {
             "eth": round(eth_bal, 6),
             "usdc": round(usdc_bal, 2),
@@ -3130,8 +3136,10 @@ def status():
         "il_usd": il_usd,
         "fee_apy": pnl["fee_apy"],
         "net_apy": pnl["net_apy"],
+        "net_apy_eth": pnl["net_apy_eth"],
         "days_running": pnl["days_running"],
         "cost_basis": pnl["cost_basis"],
+        "cost_basis_eth": pnl["cost_basis_eth"],
         "balances": {
             "eth": round(eth_bal, 6),
             "usdc": round(usdc_bal, 2),
@@ -3226,8 +3234,10 @@ def report():
         "pnl_valid": pnl["valid"],
         "fee_apy": pnl["fee_apy"],
         "net_apy": pnl["net_apy"],
+        "net_apy_eth": pnl["net_apy_eth"],
         "days_running": pnl["days_running"],
         "cost_basis": pnl["cost_basis"],
+        "cost_basis_eth": pnl["cost_basis_eth"],
         "total_fees_claimed_usd": round(claimed_fee, 2),
         "unclaimed_fee_usd": round(unclaimed_fee, 2),
         "il_pct": round(il_pct, 2),
