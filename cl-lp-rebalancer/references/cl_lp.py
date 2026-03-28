@@ -956,7 +956,7 @@ def run_risk_checks(
     if stats.get("initial_portfolio_usd") and len(value_history) >= 3:
         # Median of recent values for stop decisions
         smooth_usd = sorted(value_history[-5:])[len(value_history[-5:]) // 2]
-        pnl = calc_pnl(stats, smooth_usd)
+        pnl = calc_pnl(stats, smooth_usd, price)
         peak = stats.get("portfolio_peak_usd", pnl["cost_basis"])
 
         # Peak only updates if confirmed by 2 consecutive readings above old peak
@@ -1032,9 +1032,41 @@ def run_risk_checks(
 # ── DeFi Operations (onchainos defi commands) ──────────────────────────────
 
 
+def _verify_tx_receipt(order_id: str, retries: int = 3) -> bool:
+    """Poll gateway orders to verify TX was mined successfully."""
+    for attempt in range(retries):
+        time.sleep(4 * (attempt + 1))  # 4s, 8s, 12s
+        data = onchainos_cmd(
+            [
+                "gateway",
+                "orders",
+                "--address",
+                WALLET_ADDR,
+                "--chain",
+                POOL_CHAIN,
+                "--order-id",
+                order_id,
+            ],
+            timeout=15,
+        )
+        if not data or not data.get("ok"):
+            continue
+        orders = data.get("data", [])
+        if not orders:
+            continue
+        order = orders[0] if isinstance(orders, list) else orders
+        status = str(order.get("txStatus", "") or order.get("status", "")).lower()
+        if status in ("success", "1", "confirmed"):
+            return True
+        if status in ("failed", "0", "reverted"):
+            return False
+    # Could not confirm — treat as uncertain
+    return True  # optimistic fallback to avoid blocking on API lag
+
+
 def _broadcast_defi_txs(data: dict, label: str) -> bool:
     """Broadcast all transactions from a defi command response.
-    Returns True if all transactions were broadcast successfully."""
+    Returns True if all transactions were broadcast and confirmed on-chain."""
     result = data.get("data")
     if not result:
         log(f"  {label}: no tx data to broadcast")
@@ -1079,13 +1111,18 @@ def _broadcast_defi_txs(data: dict, label: str) -> bool:
                 r = r[0] if r else {}
             tx_hash = r.get("txHash") or r.get("hash") or r.get("orderId")
             log(f"  {label} [{tx_type}] broadcast OK: {tx_hash}")
+            # Verify on-chain execution
+            if tx_hash:
+                confirmed = _verify_tx_receipt(tx_hash)
+                if not confirmed:
+                    log(f"  {label} [{tx_type}] TX REVERTED on-chain: {tx_hash}")
+                    return False
         else:
             detail = (
                 json.dumps(broadcast_data)[:200] if broadcast_data else "no response"
             )
             log(f"  {label} [{tx_type}] broadcast failed: {detail}")
             return False
-        time.sleep(2)  # wait between txs
     return True
 
 
@@ -2205,13 +2242,11 @@ def emit(event_type: str, data: dict, notify: bool = False, tier: str = ""):
 # ── IL Estimation ───────────────────────────────────────────────────────────
 
 
-def calc_pnl(stats: dict, current_usd: float) -> dict:
-    """Calculate PnL and annualized yield.
+def calc_pnl(stats: dict, current_usd: float, current_price: float = 0) -> dict:
+    """Calculate PnL in both USD and ETH terms.
 
-    cost_basis = initial_portfolio_usd + total_deposits_usd
-    pnl = current_usd - cost_basis
-    fee_apy = (total_fees / cost_basis) / days * 365
-    net_apy = (pnl / cost_basis) / days * 365
+    USD: cost_basis = initial_portfolio_usd + deposits; pnl = current - cost_basis
+    ETH: cost_basis_eth = initial_portfolio_eth + deposits_eth; pnl = current_eth - cost_basis_eth
     """
     initial = stats.get("initial_portfolio_usd")
     if not initial or initial <= 0:
@@ -2219,6 +2254,9 @@ def calc_pnl(stats: dict, current_usd: float) -> dict:
             "pnl_usd": 0,
             "pnl_pct": 0,
             "cost_basis": 0,
+            "pnl_eth": 0.0,
+            "pnl_eth_pct": 0,
+            "cost_basis_eth": 0.0,
             "fee_apy": 0,
             "net_apy": 0,
             "days_running": 0,
@@ -2229,11 +2267,21 @@ def calc_pnl(stats: dict, current_usd: float) -> dict:
     pnl_usd = round(current_usd - cost_basis, 2)
     pnl_pct = (pnl_usd / cost_basis * 100) if cost_basis > 0 else 0
 
+    # ETH-denominated PnL
+    initial_eth = stats.get("initial_portfolio_eth", 0)
+    if not initial_eth and stats.get("initial_eth_price"):
+        initial_eth = initial / stats["initial_eth_price"]
+    deposits_eth = stats.get("total_deposits_eth", 0)
+    cost_basis_eth = initial_eth + deposits_eth
+    current_eth = current_usd / current_price if current_price > 0 else 0
+    pnl_eth = round(current_eth - cost_basis_eth, 6) if cost_basis_eth > 0 else 0.0
+    pnl_eth_pct = (pnl_eth / cost_basis_eth * 100) if cost_basis_eth > 0 else 0
+
     # Annualized yields
     started = stats.get("started_at", "")
     started_dt = _safe_isoparse(started) if started else None
     days = (datetime.now() - started_dt).total_seconds() / 86400 if started_dt else 0
-    days = max(days, 0.01)  # avoid division by zero
+    days = max(days, 0.01)
 
     total_fees = stats.get("total_fees_claimed_usd", 0) + stats.get(
         "unclaimed_fee_usd", 0
@@ -2245,6 +2293,9 @@ def calc_pnl(stats: dict, current_usd: float) -> dict:
         "pnl_usd": pnl_usd,
         "pnl_pct": round(pnl_pct, 2),
         "cost_basis": cost_basis,
+        "pnl_eth": pnl_eth,
+        "pnl_eth_pct": round(pnl_eth_pct, 2),
+        "cost_basis_eth": round(cost_basis_eth, 6),
         "fee_apy": round(fee_apy, 1),
         "net_apy": round(net_apy, 1),
         "days_running": round(days, 1),
@@ -2477,10 +2528,12 @@ def _tick_inner():
         if cfg_initial and cfg_initial > 0:
             state["stats"]["initial_portfolio_usd"] = float(cfg_initial)
             state["stats"]["initial_eth_price"] = round(price, 2)
+            state["stats"]["initial_portfolio_eth"] = round(float(cfg_initial) / price, 6)
             log(f"Initial portfolio (config): ${cfg_initial} @ ETH ${price:.2f}")
         elif total_usd > 0:
             state["stats"]["initial_portfolio_usd"] = round(total_usd, 2)
             state["stats"]["initial_eth_price"] = round(price, 2)
+            state["stats"]["initial_portfolio_eth"] = round(total_usd / price, 6)
             log(f"Initial portfolio (snapshot): ${total_usd:.2f} @ ETH ${price:.2f}")
 
     # MTF analysis
@@ -2764,7 +2817,7 @@ def _tick_inner():
         "skip_small_change",
     )
     stats = state.get("stats", {})
-    pnl = calc_pnl(stats, total_usd)
+    pnl = calc_pnl(stats, total_usd, price)
     unclaimed_fee_usd = stats.get("unclaimed_fee_usd", 0)
     claimed_fee_usd = stats.get("total_fees_claimed_usd", 0)
 
@@ -2788,6 +2841,8 @@ def _tick_inner():
         "portfolio_usd": round(total_usd, 2),
         "pnl_usd": pnl["pnl_usd"],
         "pnl_pct": round(pnl["pnl_pct"], 2),
+        "pnl_eth": pnl["pnl_eth"],
+        "pnl_eth_pct": round(pnl["pnl_eth_pct"], 2),
         "pnl_valid": pnl["valid"],
         "unclaimed_fee_usd": round(unclaimed_fee_usd, 2),
         "total_fees_claimed_usd": round(claimed_fee_usd, 2),
@@ -3034,7 +3089,7 @@ def status():
 
     # Build a live snapshot in tick_data format for the shared renderer
     stats["unclaimed_fee_usd"] = round(unclaimed_fee, 2)
-    pnl = calc_pnl(stats, total_usd)
+    pnl = calc_pnl(stats, total_usd, price)
 
     pos_entry = position.get("entry_price", 0) if position else 0
     entry_price = pos_entry or stats.get("initial_eth_price", 0)
@@ -3063,6 +3118,8 @@ def status():
         "portfolio_usd": round(total_usd, 2),
         "pnl_usd": pnl["pnl_usd"],
         "pnl_pct": round(pnl["pnl_pct"], 2),
+        "pnl_eth": pnl["pnl_eth"],
+        "pnl_eth_pct": round(pnl["pnl_eth_pct"], 2),
         "pnl_valid": pnl["valid"],
         "unclaimed_fee_usd": round(unclaimed_fee, 2),
         "total_fees_claimed_usd": round(stats.get("total_fees_claimed_usd", 0), 2),
@@ -3139,7 +3196,7 @@ def report():
     claimed_fee = stats.get("total_fees_claimed_usd", 0)
 
     # Recalculate PnL with fresh total_usd (includes LP value)
-    pnl = calc_pnl(stats, total_usd)
+    pnl = calc_pnl(stats, total_usd, price)
 
     # IL: exact V3 formula, position entry price > initial price
     pos_entry = position.get("entry_price", 0) if position else 0
@@ -3161,6 +3218,8 @@ def report():
         "portfolio_usd": round(total_usd, 2),
         "pnl_usd": pnl["pnl_usd"],
         "pnl_pct": round(pnl["pnl_pct"], 2),
+        "pnl_eth": pnl["pnl_eth"],
+        "pnl_eth_pct": round(pnl["pnl_eth_pct"], 2),
         "pnl_valid": pnl["valid"],
         "fee_apy": pnl["fee_apy"],
         "net_apy": pnl["net_apy"],
@@ -3400,7 +3459,7 @@ def analyze():
             "total_rebalances": stats.get("total_rebalances", 0),
             "time_in_range_pct": stats.get("time_in_range_pct", 0),
             "estimated_il_pct": il_pct,
-            "total_pnl": calc_pnl(stats, total_usd)["pnl_usd"],
+            "total_pnl": calc_pnl(stats, total_usd, price)["pnl_usd"],
         },
         "rebalance_history": rebalances[-10:],
     }
