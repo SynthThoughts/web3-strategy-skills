@@ -610,12 +610,26 @@ def _query_all_positions() -> list[dict]:
     return result
 
 
-def find_latest_token_id() -> str:
-    """Query position-detail to find the latest LP token ID for this pool."""
+def find_latest_token_id(after_token_id: str = "") -> str:
+    """Query position-detail to find the latest LP token ID for this pool.
+
+    If after_token_id is provided, only return a token_id numerically greater
+    than it (i.e. newly created after the reference point). This prevents
+    adopting old positions from previous deploys.
+    """
     positions = _query_all_positions()
-    if positions:
-        return positions[-1]["tokenId"]
-    return ""
+    if not positions:
+        return ""
+    if after_token_id:
+        try:
+            threshold = int(after_token_id)
+            candidates = [p for p in positions if int(p["tokenId"]) > threshold]
+            if candidates:
+                return candidates[-1]["tokenId"]
+            return ""
+        except (ValueError, TypeError):
+            pass
+    return positions[-1]["tokenId"]
 
 
 def cleanup_residual_positions(keep_token_id: str) -> int:
@@ -1509,6 +1523,12 @@ def execute_rebalance(
     )
 
     # Step 5: Deposit at new range
+    # Record current max token_id so we only find positions created AFTER deposit
+    pre_deposit_max_tid = ""
+    existing = _query_all_positions()
+    if existing:
+        pre_deposit_max_tid = max(existing, key=lambda p: int(p["tokenId"]))["tokenId"]
+
     log(f"  Deposit input: {user_input_json[:200]}")
     deposit_result = defi_deposit(user_input_json, new_tick_lower, new_tick_upper)
     if not deposit_result:
@@ -1516,12 +1536,12 @@ def execute_rebalance(
         return _emergency_deposit(state, price, trigger)
 
     # Deposit returns bool; recover token_id and verify on-chain value
-    # Retry verification with increasing delays (chain indexing can lag)
+    # Only look for token_ids created after pre_deposit_max_tid
     new_token_id = ""
     lp_value = 0.0
     for verify_attempt, delay in enumerate([8, 15, 25], 1):
         time.sleep(delay)
-        new_token_id = find_latest_token_id()
+        new_token_id = find_latest_token_id(after_token_id=pre_deposit_max_tid)
         if new_token_id:
             detail = get_position_detail(new_token_id)
             lp_value = detail.get("value", 0)
@@ -1656,14 +1676,20 @@ def _emergency_deposit(state: dict, price: float, trigger: dict) -> bool:
         ]
     )
 
+    # Record current max token_id before deposit
+    pre_deposit_max_tid = ""
+    existing = _query_all_positions()
+    if existing:
+        pre_deposit_max_tid = max(existing, key=lambda p: int(p["tokenId"]))["tokenId"]
+
     deposit_result = defi_deposit(user_input, tick_lower, tick_upper)
     if deposit_result:
-        # Retry verification with increasing delays
+        # Retry verification — only look for newly created positions
         new_token_id = ""
         lp_value = 0.0
         for verify_attempt, delay in enumerate([8, 15, 25], 1):
             time.sleep(delay)
-            new_token_id = find_latest_token_id()
+            new_token_id = find_latest_token_id(after_token_id=pre_deposit_max_tid)
             if new_token_id:
                 detail = get_position_detail(new_token_id)
                 lp_value = detail.get("value", 0)
