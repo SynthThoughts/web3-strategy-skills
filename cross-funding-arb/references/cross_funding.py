@@ -1060,18 +1060,17 @@ class HLClient:
     # ---- Account ----
 
     def get_usdc_balance(self) -> float:
-        """Get available balance (perp accountValue + spot USDC)."""
-        state = self.info.user_state(self.balance_address)
-        perp_value = float(state["marginSummary"]["accountValue"])
+        """Get total equity: spot USDC total (includes perp margin + unrealized PnL)."""
         try:
             spot_state = self.info.spot_user_state(self.balance_address)
             for bal in spot_state.get("balances", []):
                 if bal["coin"] == "USDC":
-                    perp_value += float(bal["total"]) - float(bal["hold"])
-                    break
+                    return float(bal["total"])
         except Exception:
             pass
-        return perp_value
+        # Fallback: perp accountValue only (spot API unavailable)
+        state = self.info.user_state(self.balance_address)
+        return float(state["marginSummary"]["accountValue"])
 
     def get_withdrawable(self) -> float:
         state = self.info.user_state(self.balance_address)
@@ -3186,7 +3185,10 @@ def export_dashboard(
         bn_bal = engine.bn.get_usdt_balance()
         entry_total = state.get("entry_total_balance", 0.0)
         current_total = round(hl_bal + bn_bal, 2)
-        total_pnl = round(current_total - entry_total, 2) if entry_total else 0.0
+
+        # PnL & ROI based on trade history funding totals
+        trades = _load_trade_history()
+        total_pnl = round(sum(t.get("funding_pnl", 0) for t in trades if t.get("funding_pnl") is not None), 2)
         roi_pct = round(total_pnl / entry_total * 100, 4) if entry_total else 0.0
 
         annualized_roi_pct = 0.0
