@@ -917,6 +917,9 @@ def run_risk_checks(
 
     # [2] Circuit breaker
     errors = state.get("errors", {})
+    if not isinstance(errors, dict):
+        errors = {"consecutive": 0, "cooldown_until": None}
+        state["errors"] = errors
     if errors.get("consecutive", 0) >= MAX_CONSECUTIVE_ERRORS:
         cooldown_dt = _safe_isoparse(errors.get("cooldown_until", ""))
         if cooldown_dt and cooldown_dt > datetime.now():
@@ -2304,6 +2307,9 @@ def _tick_inner():
 
     # Circuit breaker
     errors = state.get("errors", {})
+    if not isinstance(errors, dict):
+        errors = {"consecutive": 0, "cooldown_until": None}
+        state["errors"] = errors
     if errors.get("consecutive", 0) >= MAX_CONSECUTIVE_ERRORS:
         cooldown_dt = _safe_isoparse(errors.get("cooldown_until", ""))
         if cooldown_dt and cooldown_dt > datetime.now():
