@@ -2425,8 +2425,14 @@ class CrossFundingEngine:
         long_size = abs(long_pos["size"]) if long_pos else 0.0
         short_size = abs(short_pos["size"]) if short_pos else 0.0
 
-        avg_size = (long_size + short_size) / 2 if (long_size + short_size) > 0 else 1
-        delta_pct = abs(long_size - short_size) / avg_size * 100
+        # Notional-based delta: use each exchange's mark price to get USD exposure
+        long_mark_px = long_pos.get("mark_px", 0.0) if long_pos else 0.0
+        short_mark_px = short_pos.get("mark_px", 0.0) if short_pos else 0.0
+        long_notional = long_size * long_mark_px if long_mark_px > 0 else 0.0
+        short_notional = short_size * short_mark_px if short_mark_px > 0 else 0.0
+        avg_notional = (long_notional + short_notional) / 2 if (long_notional + short_notional) > 0 else 1
+        delta_notional = abs(long_notional - short_notional)
+        delta_pct = delta_notional / avg_notional * 100
 
         hl_rate = self.hl.get_funding_rate(coin)
         bn_rate = self.bn.get_funding_rate(coin)
@@ -2445,7 +2451,10 @@ class CrossFundingEngine:
             "short_exchange": short_ex,
             "long_size": long_size,
             "short_size": short_size,
+            "long_mark_px": long_mark_px,
+            "short_mark_px": short_mark_px,
             "delta_pct": round(delta_pct, 2),
+            "delta_notional_usd": round(delta_notional, 4),
             "current_spread": current_spread,
             "current_apr": round(current_apr, 2),
             "spread_favorable": spread_favorable,
@@ -2486,20 +2495,33 @@ class CrossFundingEngine:
         long_size = health.get("long_size", 0.0)
         short_size = health.get("short_size", 0.0)
 
+        # Use each exchange's mark price for notional-based delta
+        long_mark_px = health.get("long_mark_px", 0.0)
+        short_mark_px = health.get("short_mark_px", 0.0)
         current_price = self.hl.get_mid_price(coin)
-        avg_size = (long_size + short_size) / 2 if (long_size + short_size) > 0 else 1
+        # Fallback to mid price if mark prices unavailable
+        if long_mark_px <= 0:
+            long_mark_px = current_price
+        if short_mark_px <= 0:
+            short_mark_px = current_price
 
-        # Signed delta: positive = net long, negative = net short
-        signed_delta = long_size - short_size
-        signed_delta_pct = signed_delta / avg_size * 100 if avg_size else 0
+        long_notional = long_size * long_mark_px
+        short_notional = short_size * short_mark_px
+        avg_notional = (long_notional + short_notional) / 2 if (long_notional + short_notional) > 0 else 1
+
+        # Signed delta in notional USD: positive = net long exposure
+        signed_delta_notional = long_notional - short_notional
+        signed_delta_pct = signed_delta_notional / avg_notional * 100 if avg_notional else 0
         abs_delta_pct = abs(signed_delta_pct)
 
-        # Delta PnL: profit/loss from the size mismatch × price movement
-        price_move = current_price - entry_price
-        delta_pnl_usd = signed_delta * price_move
+        # Delta PnL: actual unrealized PnL difference between the two legs
+        # This captures the real USD impact of the delta drift
+        long_pnl = (long_mark_px - entry_price) * long_size if long_size > 0 else 0
+        short_pnl = (entry_price - short_mark_px) * short_size if short_size > 0 else 0
+        delta_pnl_usd = long_pnl + short_pnl
 
         # Trading cost: notional × round_trip_cost_pct / 100 (one-way close)
-        notional = avg_size * current_price
+        notional = avg_notional
         trading_cost_usd = notional * (self.round_trip_cost_pct / 100) / 2  # half of round-trip
 
         # Funding bleed per tick: how much we lose per 5-min tick when spread
@@ -3399,8 +3421,10 @@ def _build_position_dashboard(
         long_payments = bn_payments
         short_payments = hl_payments
 
-    long_notional = round(long_size * current_price, 2)
-    short_notional = round(short_size * current_price, 2)
+    long_mark_px = long_pos.get("mark_px", current_price) if long_pos else current_price
+    short_mark_px = short_pos.get("mark_px", current_price) if short_pos else current_price
+    long_notional = round(long_size * long_mark_px, 2)
+    short_notional = round(short_size * short_mark_px, 2)
 
     # Pending (unrealized) funding: rate * notional * elapsed fraction
     # Sign: positive rate means longs pay shorts
@@ -3420,11 +3444,9 @@ def _build_position_dashboard(
         short_leg_extra["settlement_cycle_h"], short_leg_extra["next_settlement_min"],
     )
 
-    avg_size = (long_size + short_size) / 2 if (long_size + short_size) > 0 else 1
-    delta_exposure = abs(long_size - short_size)
-    delta_pct = round(delta_exposure / avg_size * 100, 2)
-
-    avg_notional = (long_notional + short_notional) / 2
+    avg_notional = (long_notional + short_notional) / 2 if (long_notional + short_notional) > 0 else 1
+    delta_exposure = abs(long_notional - short_notional)
+    delta_pct = round(delta_exposure / avg_notional * 100, 2)
 
     # APR & daily projection based on actual funding PnL
     total_funding_with_pending = total_funding + long_pending + short_pending
