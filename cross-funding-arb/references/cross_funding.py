@@ -3007,7 +3007,6 @@ def _build_position_dashboard(
 
     rate_map = {"hyperliquid": hl_rate, "binance": bn_rate}
     current_spread = rate_map[short_ex] - rate_map[long_ex]
-    current_apr = round(current_spread * 3 * 365 * 100, 2)
 
     # Settlement countdown
     now = datetime.now(timezone.utc)
@@ -3125,7 +3124,16 @@ def _build_position_dashboard(
     delta_pct = round(delta_exposure / avg_size * 100, 2)
 
     avg_notional = (long_notional + short_notional) / 2
-    projected_daily = round(abs(current_spread) * 3 * avg_notional, 2)
+
+    # APR & daily projection based on actual funding PnL
+    total_funding_with_pending = total_funding + long_pending + short_pending
+    if hours_held > 0 and avg_notional > 0:
+        actual_rate_per_hour = total_funding_with_pending / avg_notional / hours_held
+        current_apr = round(actual_rate_per_hour * 8760 * 100, 2)
+        projected_daily = round(actual_rate_per_hour * 24 * avg_notional, 2)
+    else:
+        current_apr = 0.0
+        projected_daily = 0.0
 
     return {
         "has_position": True,
