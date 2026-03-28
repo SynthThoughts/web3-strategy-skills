@@ -1834,6 +1834,16 @@ class CrossFundingEngine:
         self.max_positions: int = cfg.get("max_positions", 3)
         self.min_position_usd: float = cfg.get("min_position_usd", 50)
 
+        # Delta-aware exit parameters
+        delta_exit_cfg = cfg.get("delta_exit", {})
+        self.delta_exit_enabled: bool = delta_exit_cfg.get("enabled", True)
+        # Delta % below which we consider the position "neutral" (safe to close)
+        self.delta_neutral_threshold_pct: float = delta_exit_cfg.get("neutral_threshold_pct", 2.0)
+        # Max ticks to wait for favorable delta before force-closing (12 × 5min = 1h)
+        self.delta_max_defer_ticks: int = delta_exit_cfg.get("max_defer_ticks", 12)
+        # Force close if delta exceeds this regardless of PnL
+        self.delta_force_close_pct: float = delta_exit_cfg.get("force_close_delta_pct", 15.0)
+
     # ---- State management ----
 
     def _load(self) -> dict:
@@ -2449,6 +2459,228 @@ class CrossFundingEngine:
 
         return result
 
+    def _assess_delta_for_exit(self, pos_data: dict, health: dict) -> dict:
+        """Assess whether delta conditions are favorable for closing a position.
+
+        Weighs three cost components:
+          1. Trading cost (fixed, incurred on close regardless of timing)
+          2. Delta PnL (variable, depends on when we close)
+          3. Funding bleed (ongoing cost of holding an unfavorable-spread position)
+
+        If the adverse delta PnL is smaller than the funding we'd lose by
+        waiting one more tick, deferring is not worth it — close now.
+
+        Returns a dict with:
+          - favorable: bool — True if delta state is good for exit
+          - reason: str — human-readable reason
+          - delta_pnl_usd: float — signed PnL from delta drift
+          - trading_cost_usd: float — one-way trading cost to close
+          - funding_bleed_per_tick: float — funding loss per tick if spread unfavorable
+          - net_exit_cost_usd: float — trading_cost - delta_pnl (lower is better)
+          - signed_delta_pct: float — positive = net long exposure
+          - should_force: bool — True if delta is dangerously high
+          - defer_count: int — how many times we've already deferred
+        """
+        coin = pos_data["coin"]
+        entry_price = pos_data.get("entry_price", 0.0)
+        long_size = health.get("long_size", 0.0)
+        short_size = health.get("short_size", 0.0)
+
+        current_price = self.hl.get_mid_price(coin)
+        avg_size = (long_size + short_size) / 2 if (long_size + short_size) > 0 else 1
+
+        # Signed delta: positive = net long, negative = net short
+        signed_delta = long_size - short_size
+        signed_delta_pct = signed_delta / avg_size * 100 if avg_size else 0
+        abs_delta_pct = abs(signed_delta_pct)
+
+        # Delta PnL: profit/loss from the size mismatch × price movement
+        price_move = current_price - entry_price
+        delta_pnl_usd = signed_delta * price_move
+
+        # Trading cost: notional × round_trip_cost_pct / 100 (one-way close)
+        notional = avg_size * current_price
+        trading_cost_usd = notional * (self.round_trip_cost_pct / 100) / 2  # half of round-trip
+
+        # Funding bleed per tick: how much we lose per 5-min tick when spread
+        # is unfavorable. Spread is per 8h settlement, tick is 5 min.
+        # bleed = |spread| × notional × (5min / 480min)
+        current_spread = health.get("current_spread", 0.0)
+        tick_minutes = 5.0
+        bleed_per_tick = abs(current_spread) * notional * (tick_minutes / 480.0)
+
+        # Pending funding: unrealized funding that would be forfeited if we
+        # close before the next settlement. Binance settles every 8h
+        # (00:00/08:00/16:00 UTC), Hyperliquid settles every 1h.
+        direction = pos_data.get("direction", {})
+        long_ex = direction.get("long_exchange", "hyperliquid")
+        hl_rate = health.get("hl_rate", 0.0)
+        bn_rate = health.get("bn_rate", 0.0)
+        now = datetime.now(timezone.utc)
+
+        bn_elapsed_h = (now.hour % 8) + now.minute / 60
+        bn_fraction = bn_elapsed_h / 8.0
+        hl_elapsed_m = now.minute + now.second / 60
+        hl_fraction = hl_elapsed_m / 60.0
+
+        # Pending funding for each leg (positive = we earn, negative = we pay)
+        # For the short leg, we earn when rate > 0 (longs pay shorts)
+        # For the long leg, we earn when rate < 0 (shorts pay longs)
+        if long_ex == "binance":
+            bn_pending = -bn_rate * bn_fraction * notional  # long BN: earn when rate < 0
+            hl_pending = hl_rate * hl_fraction * notional   # short HL: earn when rate > 0
+        else:
+            hl_pending = -hl_rate * hl_fraction * notional  # long HL: earn when rate < 0
+            bn_pending = bn_rate * bn_fraction * notional   # short BN: earn when rate > 0
+
+        pending_funding_usd = bn_pending + hl_pending
+
+        # Net exit cost = trading_cost - delta_pnl + forfeited_funding
+        # - trading_cost: always paid on close
+        # - delta_pnl: positive reduces cost, negative increases cost
+        # - pending_funding: if positive, we forfeit earnings by closing now;
+        #                    if negative, we avoid paying by closing now
+        forfeited_funding = max(pending_funding_usd, 0.0)
+        avoided_payment = max(-pending_funding_usd, 0.0)
+        net_exit_cost_usd = trading_cost_usd - delta_pnl_usd + forfeited_funding - avoided_payment
+
+        # Track how many times this position has been deferred
+        defer_count = pos_data.get("delta_exit_defer_count", 0)
+
+        # Cumulative bleed already lost from prior deferrals
+        cumulative_bleed = bleed_per_tick * defer_count
+
+        # Time until next settlement for each exchange
+        bn_remaining_h = 8.0 - bn_elapsed_h
+        bn_remaining_ticks = bn_remaining_h * 60 / tick_minutes
+        hl_remaining_m = 60.0 - hl_elapsed_m
+        hl_remaining_ticks = hl_remaining_m / tick_minutes
+        # Use the nearest settlement that has positive pending
+        nearest_remaining_ticks = min(
+            bn_remaining_ticks if bn_pending > 0 else float("inf"),
+            hl_remaining_ticks if hl_pending > 0 else float("inf"),
+        )
+        nearest_remaining_h = min(
+            bn_remaining_h if bn_pending > 0 else float("inf"),
+            hl_remaining_m / 60 if hl_pending > 0 else float("inf"),
+        )
+
+        # Decision logic — ordered by priority
+        should_force = abs_delta_pct >= self.delta_force_close_pct
+        exceeded_max_defer = defer_count >= self.delta_max_defer_ticks
+
+        if should_force:
+            favorable = True
+            reason = (
+                f"delta {signed_delta_pct:+.2f}% exceeds force-close "
+                f"threshold {self.delta_force_close_pct}%"
+            )
+        elif exceeded_max_defer:
+            favorable = True
+            reason = (
+                f"max defer ticks reached ({defer_count}/{self.delta_max_defer_ticks}), "
+                f"delta PnL ${delta_pnl_usd:+.2f}, "
+                f"cumulative bleed ${cumulative_bleed:.2f}, "
+                f"forfeited funding ${forfeited_funding:.2f}"
+            )
+        elif forfeited_funding > 0 and nearest_remaining_ticks <= 3:
+            # Near settlement with positive pending funding — wait to collect it
+            # 3 ticks = 15 min, close enough to just hold on
+            favorable = False
+            reason = (
+                f"settlement in {nearest_remaining_h:.2f}h "
+                f"({nearest_remaining_ticks:.0f} ticks), "
+                f"pending funding ${pending_funding_usd:+.2f} "
+                f"(BN ${bn_pending:+.4f}, HL ${hl_pending:+.4f}) "
+                f"would be forfeited, deferring to collect "
+                f"(defer {defer_count+1}/{self.delta_max_defer_ticks})"
+            )
+        elif abs_delta_pct <= self.delta_neutral_threshold_pct:
+            # Delta is near zero — ideal exit window
+            favorable = True
+            reason = (
+                f"delta neutral ({signed_delta_pct:+.2f}% within "
+                f"±{self.delta_neutral_threshold_pct}%), "
+                f"net exit cost ${net_exit_cost_usd:+.2f}"
+            )
+        elif delta_pnl_usd >= trading_cost_usd + forfeited_funding:
+            # Delta PnL covers trading cost + forfeited funding — close and profit
+            net_gain = delta_pnl_usd - trading_cost_usd - forfeited_funding
+            favorable = True
+            reason = (
+                f"delta PnL ${delta_pnl_usd:+.2f} covers trading cost "
+                f"${trading_cost_usd:.2f} + forfeited funding "
+                f"${forfeited_funding:.2f}, net +${net_gain:.2f}"
+            )
+        elif delta_pnl_usd >= 0:
+            # Delta PnL is positive but doesn't fully cover all costs — still OK
+            favorable = True
+            reason = (
+                f"delta PnL ${delta_pnl_usd:+.2f} partially offsets costs "
+                f"(trade ${trading_cost_usd:.2f} + forfeit ${forfeited_funding:.2f}), "
+                f"net exit cost ${net_exit_cost_usd:.2f}"
+            )
+        elif bleed_per_tick > 0 and abs(delta_pnl_usd) <= bleed_per_tick:
+            # Adverse delta PnL is smaller than one tick of funding bleed —
+            # deferring costs more than the delta loss, close now
+            favorable = True
+            reason = (
+                f"adverse delta PnL ${delta_pnl_usd:+.2f} < bleed/tick "
+                f"${bleed_per_tick:.4f}, deferring not worth it"
+            )
+        else:
+            # Adverse delta PnL exceeds bleed/tick — worth waiting for recovery
+            favorable = False
+            remaining_ticks = self.delta_max_defer_ticks - defer_count
+            max_total_bleed = bleed_per_tick * remaining_ticks
+            reason = (
+                f"delta PnL adverse ${delta_pnl_usd:+.2f} > bleed/tick "
+                f"${bleed_per_tick:.4f}, deferring "
+                f"(delta {signed_delta_pct:+.2f}%, "
+                f"defer {defer_count+1}/{self.delta_max_defer_ticks}, "
+                f"max bleed if waiting ${max_total_bleed:.2f}, "
+                f"pending funding ${pending_funding_usd:+.2f})"
+            )
+
+        return {
+            "favorable": favorable,
+            "reason": reason,
+            "delta_pnl_usd": round(delta_pnl_usd, 4),
+            "trading_cost_usd": round(trading_cost_usd, 4),
+            "pending_funding_usd": round(pending_funding_usd, 4),
+            "forfeited_funding_usd": round(forfeited_funding, 4),
+            "funding_bleed_per_tick": round(bleed_per_tick, 6),
+            "net_exit_cost_usd": round(net_exit_cost_usd, 4),
+            "cumulative_bleed_usd": round(cumulative_bleed, 4),
+            "signed_delta_pct": round(signed_delta_pct, 2),
+            "abs_delta_pct": round(abs_delta_pct, 2),
+            "should_force": should_force,
+            "defer_count": defer_count,
+            "current_price": current_price,
+            "entry_price": entry_price,
+            "bn_remaining_h": round(bn_remaining_h, 2),
+            "hl_remaining_m": round(hl_remaining_m, 2),
+            "nearest_settlement_ticks": round(nearest_remaining_ticks, 1),
+        }
+
+    def _increment_defer_count(self, coin: str) -> None:
+        """Increment the delta exit defer counter for a position in state."""
+        state = self._load()
+        for pos in state.get("positions", []):
+            if pos["coin"] == coin:
+                pos["delta_exit_defer_count"] = pos.get("delta_exit_defer_count", 0) + 1
+                break
+        self._save(state)
+
+    def _reset_defer_count(self, coin: str) -> None:
+        """Reset the delta exit defer counter (e.g. when spread becomes favorable again)."""
+        state = self._load()
+        for pos in state.get("positions", []):
+            if pos["coin"] == coin:
+                pos.pop("delta_exit_defer_count", None)
+                break
+        self._save(state)
+
     def check_health(self) -> dict:
         """Check health for ALL positions. Returns aggregate + per-position health."""
         positions = self._get_positions()
@@ -2644,20 +2876,66 @@ class CrossFundingEngine:
         for pos in list(positions):
             coin = pos["coin"]
             ph = self._check_position_health(pos)
+
+            # Reset defer counter when spread recovers to favorable
+            if ph["spread_favorable"] and pos.get("delta_exit_defer_count", 0) > 0:
+                self._reset_defer_count(coin)
+
             if not ph["spread_favorable"]:
-                emit(
-                    "manage_close",
-                    {
-                        "coin": coin,
-                        "reason": "spread unfavorable",
-                        "current_spread": ph["current_spread"],
-                        "current_apr": ph["current_apr"],
-                    },
-                    notify=True,
-                    tier="risk_alert",
-                )
-                self.close_position(coin)
-                acted = True
+                # Delta-aware exit: defer close if delta PnL is adverse
+                if self.delta_exit_enabled:
+                    delta_assessment = self._assess_delta_for_exit(pos, ph)
+                    if delta_assessment["favorable"]:
+                        emit(
+                            "manage_close",
+                            {
+                                "coin": coin,
+                                "reason": "spread unfavorable, delta favorable for exit",
+                                "current_spread": ph["current_spread"],
+                                "current_apr": ph["current_apr"],
+                                "delta_reason": delta_assessment["reason"],
+                                "delta_pnl_usd": delta_assessment["delta_pnl_usd"],
+                                "signed_delta_pct": delta_assessment["signed_delta_pct"],
+                            },
+                            notify=True,
+                            tier="risk_alert",
+                        )
+                        self._reset_defer_count(coin)
+                        self.close_position(coin)
+                        acted = True
+                    else:
+                        # Defer: delta PnL is adverse, wait for better window
+                        self._increment_defer_count(coin)
+                        emit(
+                            "exit_deferred_delta",
+                            {
+                                "coin": coin,
+                                "reason": delta_assessment["reason"],
+                                "delta_pnl_usd": delta_assessment["delta_pnl_usd"],
+                                "signed_delta_pct": delta_assessment["signed_delta_pct"],
+                                "defer_count": delta_assessment["defer_count"] + 1,
+                                "max_defer": self.delta_max_defer_ticks,
+                                "current_spread": ph["current_spread"],
+                                "current_apr": ph["current_apr"],
+                            },
+                            notify=True,
+                            tier="info",
+                        )
+                else:
+                    # Delta exit disabled — close immediately as before
+                    emit(
+                        "manage_close",
+                        {
+                            "coin": coin,
+                            "reason": "spread unfavorable",
+                            "current_spread": ph["current_spread"],
+                            "current_apr": ph["current_apr"],
+                        },
+                        notify=True,
+                        tier="risk_alert",
+                    )
+                    self.close_position(coin)
+                    acted = True
             elif not ph["has_both_legs"]:
                 emit(
                     "manage_close",
@@ -2751,6 +3029,28 @@ class CrossFundingEngine:
                 worst_coin, worst_apr, worst_health, opportunities,
             )
             if switch:
+                # Delta-aware exit check before switching
+                worst_pos = self._get_position_by_coin(worst_coin)
+                if self.delta_exit_enabled and worst_pos:
+                    delta_assessment = self._assess_delta_for_exit(worst_pos, worst_health)
+                    if not delta_assessment["favorable"]:
+                        self._increment_defer_count(worst_coin)
+                        emit(
+                            "switch_deferred_delta",
+                            {
+                                "from": worst_coin,
+                                "to": switch["candidate"]["coin"],
+                                "reason": delta_assessment["reason"],
+                                "delta_pnl_usd": delta_assessment["delta_pnl_usd"],
+                                "signed_delta_pct": delta_assessment["signed_delta_pct"],
+                                "defer_count": delta_assessment["defer_count"] + 1,
+                                "max_defer": self.delta_max_defer_ticks,
+                            },
+                            notify=True,
+                            tier="info",
+                        )
+                        return acted
+
                 candidate = switch["candidate"]
                 direction = switch["direction"]
                 emit(
@@ -2772,6 +3072,7 @@ class CrossFundingEngine:
                     notify=True,
                     tier="trade_alert",
                 )
+                self._reset_defer_count(worst_coin)
                 self.close_position(worst_coin)
                 time.sleep(2)
                 success = self.open_position(candidate["coin"], direction)

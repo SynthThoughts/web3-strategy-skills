@@ -16,6 +16,12 @@
     "close_spread_threshold": 0.0001,
     "switch_threshold_apr": 5.0,
     "max_price_basis_pct": 0.5,
-    "round_trip_cost_pct": 0.12
+    "round_trip_cost_pct": 0.12,
+    "delta_exit": {
+      "enabled": true,
+      "neutral_threshold_pct": 2.0,
+      "max_defer_ticks": 12,
+      "force_close_delta_pct": 15.0
+    }
   }
 }
