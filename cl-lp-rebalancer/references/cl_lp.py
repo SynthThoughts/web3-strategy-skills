@@ -1453,6 +1453,117 @@ def execute_swap(
     return None, {"reason": "max_retries", "detail": "exhausted", "retriable": True}
 
 
+def _calc_balanced_deposit(
+    available_eth: float,
+    usdc_bal: float,
+    price: float,
+    tick_lower: int,
+    tick_upper: int,
+) -> str | None:
+    """Calculate deposit amounts, pre-swapping ETH↔USDC if ratio is unbalanced.
+
+    Returns JSON string for defi_deposit --user-input, or None on failure.
+    """
+    deposit_eth_wei = int(available_eth * 0.95 * (10 ** TOKEN0["decimals"]))
+
+    # First call: probe the ratio using ETH as input
+    calculated = defi_calculate_entry(
+        input_token=NATIVE_TOKEN,
+        input_amount=str(deposit_eth_wei),
+        token_decimal=TOKEN0["decimals"],
+        tick_lower=tick_lower,
+        tick_upper=tick_upper,
+    )
+    if not calculated or not isinstance(calculated, list):
+        log("  calculate-entry failed")
+        return None
+
+    # Check if USDC needed exceeds wallet balance
+    usdc_needed = 0.0
+    for item in calculated:
+        addr = item.get("tokenAddress", "").lower()
+        if addr == USDC_ADDR.lower():
+            usdc_needed = float(item.get("coinAmount", 0)) / (10 ** TOKEN1["decimals"])
+            break
+
+    if usdc_needed <= usdc_bal * 0.98:
+        # Wallet has enough USDC — use as-is
+        log(f"  Ratio OK: need {usdc_needed:.2f} USDC, have {usdc_bal:.2f}")
+        return json.dumps(calculated)
+
+    # Need to swap some ETH → USDC to balance
+    usdc_gap = usdc_needed - usdc_bal
+    # Swap enough ETH to cover the gap + 3% buffer for slippage/fees
+    swap_eth = usdc_gap / price * 1.03
+    if swap_eth > available_eth * 0.9:
+        # Safety: don't swap more than 90% of available ETH
+        swap_eth = available_eth * 0.45  # swap roughly half
+    swap_eth_wei = int(swap_eth * (10 ** TOKEN0["decimals"]))
+    log(f"  Pre-swap: {swap_eth:.6f} ETH → USDC (need {usdc_needed:.2f}, have {usdc_bal:.2f})")
+
+    tx_hash, fail = execute_swap(NATIVE_TOKEN, USDC_ADDR, swap_eth_wei, price)
+    if not tx_hash:
+        log(f"  Pre-swap failed: {fail}")
+        return None
+    log(f"  Pre-swap OK: {tx_hash}")
+
+    # Wait for swap to settle, then re-check balances
+    time.sleep(8)
+    new_eth, new_usdc, bal_failed = get_balances(force=True)
+    if bal_failed:
+        log("  Balance check failed after swap")
+        return None
+
+    new_available = new_eth - GAS_RESERVE_ETH
+    if new_available < 0:
+        new_available = 0
+    log(f"  Post-swap balances: ETH={new_eth:.6f} USDC={new_usdc:.2f}")
+
+    # Recalculate with updated ETH balance
+    new_eth_wei = int(new_available * 0.95 * (10 ** TOKEN0["decimals"]))
+    recalculated = defi_calculate_entry(
+        input_token=NATIVE_TOKEN,
+        input_amount=str(new_eth_wei),
+        token_decimal=TOKEN0["decimals"],
+        tick_lower=tick_lower,
+        tick_upper=tick_upper,
+    )
+    if recalculated and isinstance(recalculated, list):
+        # Verify USDC fits now
+        for item in recalculated:
+            addr = item.get("tokenAddress", "").lower()
+            if addr == USDC_ADDR.lower():
+                new_usdc_needed = float(item.get("coinAmount", 0)) / (10 ** TOKEN1["decimals"])
+                if new_usdc_needed > new_usdc * 0.98:
+                    log(f"  Still short on USDC after swap ({new_usdc_needed:.2f} > {new_usdc:.2f})")
+                    # Last resort: use USDC as input
+                    return _calc_entry_usdc_base(new_usdc, tick_lower, tick_upper)
+                break
+        return json.dumps(recalculated)
+
+    log("  Recalculate-entry failed after swap")
+    return _calc_entry_usdc_base(new_usdc, tick_lower, tick_upper)
+
+
+def _calc_entry_usdc_base(
+    usdc_bal: float, tick_lower: int, tick_upper: int,
+) -> str | None:
+    """Fallback: use USDC as input token for calculate-entry."""
+    usdc_amount = int(usdc_bal * 0.90 * (10 ** TOKEN1["decimals"]))
+    calculated = defi_calculate_entry(
+        input_token=USDC_ADDR,
+        input_amount=str(usdc_amount),
+        token_decimal=TOKEN1["decimals"],
+        tick_lower=tick_lower,
+        tick_upper=tick_upper,
+    )
+    if calculated and isinstance(calculated, list):
+        log(f"  Using USDC-base fallback: {usdc_bal * 0.90:.2f} USDC")
+        return json.dumps(calculated)
+    log("  USDC-base calculate-entry also failed")
+    return None
+
+
 # ── Rebalance Execution ────────────────────────────────────────────────────
 
 
@@ -1544,33 +1655,15 @@ def execute_rebalance(
         log(f"  Balance too low after redeem: ${total_usd:.2f}")
         return False
 
-    # Step 4: Calculate optimal dual-token deposit using available ETH + USDC
-    deposit_eth = int(available_eth * 0.95 * (10 ** TOKEN0["decimals"]))  # wei
+    # Step 4: Calculate dual-token deposit — swap to balance if needed
     log(f"  Balances: ETH={eth_bal:.6f} USDC={usdc_bal:.2f}")
-    # Use calculate-entry to get proper dual-token ratio for the tick range
-    calculated = defi_calculate_entry(
-        input_token=NATIVE_TOKEN,
-        input_amount=str(deposit_eth),
-        token_decimal=TOKEN0["decimals"],
-        tick_lower=new_tick_lower,
-        tick_upper=new_tick_upper,
+    user_input_json = _calc_balanced_deposit(
+        available_eth, usdc_bal, price,
+        new_tick_lower, new_tick_upper,
     )
-    if calculated and isinstance(calculated, list):
-        user_input_json = json.dumps(calculated)
-    else:
-        # Fallback: deposit USDC only
-        usdc_deposit = int(usdc_bal * 0.95 * (10 ** TOKEN1["decimals"]))
-        log(f"  calculate-entry failed, falling back to USDC-only: {usdc_deposit}")
-        user_input_json = json.dumps(
-            [
-                {
-                    "chainIndex": CHAIN_ID,
-                    "coinAmount": str(usdc_deposit),
-                    "tokenAddress": USDC_ADDR,
-                    "tokenPrecision": str(TOKEN1["decimals"]),
-                }
-            ]
-        )
+    if not user_input_json:
+        log("  Deposit calculation failed — aborting")
+        return False
 
     # Step 5: Deposit at new range
     # Record current max token_id so we only find positions created AFTER deposit
@@ -2585,8 +2678,8 @@ def _tick_inner():
         il_pct = estimate_il(
             entry_price,
             price,
-            position.get("lower_price", 0),
-            position.get("upper_price", 0),
+            (position.get("lower_price") or 0),
+            (position.get("upper_price") or 0),
         )
         state["stats"]["estimated_il_pct"] = il_pct
 
@@ -2726,10 +2819,10 @@ def _tick_inner():
     claimed_fee_usd = stats.get("total_fees_claimed_usd", 0)
 
     # IL estimation: exact V3 formula, position entry price > initial price
-    pos_entry = position.get("entry_price", 0) if position else 0
+    pos_entry = (position.get("entry_price") or 0) if position else 0
     entry_price = pos_entry or stats.get("initial_eth_price", 0)
-    pos_lower = position.get("lower_price", 0) if position else 0
-    pos_upper = position.get("upper_price", 0) if position else 0
+    pos_lower = (position.get("lower_price") or 0) if position else 0
+    pos_upper = (position.get("upper_price") or 0) if position else 0
     il_pct = (
         estimate_il(entry_price, price, pos_lower, pos_upper) if entry_price else 0.0
     )
@@ -2995,10 +3088,10 @@ def status():
     stats["unclaimed_fee_usd"] = round(unclaimed_fee, 2)
     pnl = calc_pnl(stats, total_usd, price)
 
-    pos_entry = position.get("entry_price", 0) if position else 0
+    pos_entry = (position.get("entry_price") or 0) if position else 0
     entry_price = pos_entry or stats.get("initial_eth_price", 0)
-    pos_lower = position.get("lower_price", 0) if position else 0
-    pos_upper = position.get("upper_price", 0) if position else 0
+    pos_lower = (position.get("lower_price") or 0) if position else 0
+    pos_upper = (position.get("upper_price") or 0) if position else 0
     il_pct = (
         estimate_il(entry_price, price, pos_lower, pos_upper) if entry_price else 0.0
     )
@@ -3103,10 +3196,10 @@ def report():
     pnl = calc_pnl(stats, total_usd, price)
 
     # IL: exact V3 formula, position entry price > initial price
-    pos_entry = position.get("entry_price", 0) if position else 0
+    pos_entry = (position.get("entry_price") or 0) if position else 0
     entry_price = pos_entry or stats.get("initial_eth_price")
-    pos_lower = position.get("lower_price", 0) if position else 0
-    pos_upper = position.get("upper_price", 0) if position else 0
+    pos_lower = (position.get("lower_price") or 0) if position else 0
+    pos_upper = (position.get("upper_price") or 0) if position else 0
     il_pct = (
         estimate_il(entry_price, price, pos_lower, pos_upper)
         if entry_price and price
@@ -3316,10 +3409,10 @@ def analyze():
 
     # IL (exact V3, position entry price > initial price)
     position = state.get("position")
-    pos_entry = position.get("entry_price", 0) if position else 0
+    pos_entry = (position.get("entry_price") or 0) if position else 0
     initial_price = pos_entry or stats.get("initial_eth_price", price)
-    pos_lower = position.get("lower_price", 0) if position else 0
-    pos_upper = position.get("upper_price", 0) if position else 0
+    pos_lower = (position.get("lower_price") or 0) if position else 0
+    pos_upper = (position.get("upper_price") or 0) if position else 0
     il_pct = estimate_il(initial_price, price, pos_lower, pos_upper)
 
     analysis = {
