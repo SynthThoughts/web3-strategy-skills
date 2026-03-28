@@ -618,8 +618,15 @@ def find_latest_token_id() -> str:
     return ""
 
 
+DUST_THRESHOLD_USD = 1.0  # Positions below this use precise redeem
+
+
 def cleanup_residual_positions(keep_token_id: str) -> int:
-    """Redeem all positions except keep_token_id. Returns count of cleaned positions."""
+    """Redeem all positions except keep_token_id. Returns count of cleaned positions.
+
+    Uses --ratio 1 for normal positions and --user-input with exact amounts
+    for dust positions (< $DUST_THRESHOLD_USD) to ensure clean NFT burn.
+    """
     positions = _query_all_positions()
     cleaned = 0
     for pos in positions:
@@ -627,8 +634,12 @@ def cleanup_residual_positions(keep_token_id: str) -> int:
         if tid == keep_token_id or not tid:
             continue
         val = pos["value"]
-        log(f"  Cleaning residual position #{tid} (${val:.2f})")
-        ok = defi_redeem(tid)
+        if val < DUST_THRESHOLD_USD:
+            log(f"  Cleaning dust position #{tid} (${val:.4f})")
+            ok = _redeem_dust(tid, pos.get("assets", []))
+        else:
+            log(f"  Cleaning residual position #{tid} (${val:.2f})")
+            ok = defi_redeem(tid)
         if ok:
             cleaned += 1
             log(f"  Redeemed #{tid}")
@@ -1104,59 +1115,78 @@ def defi_claim_fees(token_id: str) -> bool:
 
 
 def defi_redeem(token_id: str) -> bool:
-    """Remove all liquidity from V3 position.
-
-    Queries position assets first and passes exact token amounts via --user-input
-    so the contract can do a clean removeLiquidity + collect + burn (no dust).
-    Falls back to --ratio 1 if asset query fails.
-    """
+    """Remove all liquidity from V3 position using --ratio 1 (full exit)."""
     if not token_id:
         return False
-
-    # Build --user-input from position assets for precise full exit
-    user_input_arg = None
-    detail = get_position_detail(token_id)
-    assets = detail.get("assets", [])
-    if assets:
-        user_input_tokens = []
-        for asset in assets:
-            addr = asset.get("tokenAddress", "")
-            amount = asset.get("coinAmount", "0")
-            precision = asset.get("tokenPrecision") or asset.get("decimal", "18")
-            if addr and float(amount) > 0:
-                user_input_tokens.append(
-                    {
-                        "tokenAddress": addr,
-                        "chainIndex": CHAIN_ID,
-                        "coinAmount": amount,
-                        "tokenPrecision": str(precision),
-                    }
-                )
-        if user_input_tokens:
-            user_input_arg = json.dumps(user_input_tokens)
-
-    cmd = [
-        "defi",
-        "redeem",
-        "--id",
-        INVESTMENT_ID,
-        "--address",
-        WALLET_ADDR,
-        "--chain",
-        POOL_CHAIN,
-        "--token-id",
-        token_id,
-        "--ratio",
-        "1",
-    ]
-    if user_input_arg:
-        cmd.extend(["--user-input", user_input_arg])
-
-    data = onchainos_cmd(cmd, timeout=60)
+    data = onchainos_cmd(
+        [
+            "defi",
+            "redeem",
+            "--id",
+            INVESTMENT_ID,
+            "--address",
+            WALLET_ADDR,
+            "--chain",
+            POOL_CHAIN,
+            "--token-id",
+            token_id,
+            "--ratio",
+            "1",
+        ],
+        timeout=60,
+    )
     if data and data.get("ok"):
         log(f"Redeem calldata for token_id={token_id}")
         return _broadcast_defi_txs(data, "redeem")
     log(f"Redeem failed: {json.dumps(data)[:200] if data else 'no response'}")
+    return False
+
+
+def _redeem_dust(token_id: str, assets: list) -> bool:
+    """Redeem a dust position by passing exact token amounts via --user-input.
+
+    For positions with negligible value, --ratio 1 may round to zero due to
+    integer division. Passing precise amounts ensures clean burn of the NFT.
+    """
+    if not token_id or not assets:
+        return False
+    user_input_tokens = []
+    for asset in assets:
+        addr = asset.get("tokenAddress", "")
+        amount = asset.get("coinAmount", "0")
+        precision = asset.get("tokenPrecision") or asset.get("decimal", "18")
+        if addr:
+            user_input_tokens.append(
+                {
+                    "tokenAddress": addr,
+                    "chainIndex": CHAIN_ID,
+                    "coinAmount": amount,
+                    "tokenPrecision": str(precision),
+                }
+            )
+    if not user_input_tokens:
+        return False
+    data = onchainos_cmd(
+        [
+            "defi",
+            "redeem",
+            "--id",
+            INVESTMENT_ID,
+            "--address",
+            WALLET_ADDR,
+            "--chain",
+            POOL_CHAIN,
+            "--token-id",
+            token_id,
+            "--user-input",
+            json.dumps(user_input_tokens),
+        ],
+        timeout=60,
+    )
+    if data and data.get("ok"):
+        log(f"Dust redeem calldata for token_id={token_id}")
+        return _broadcast_defi_txs(data, "redeem [dust]")
+    log(f"Dust redeem failed: {json.dumps(data)[:200] if data else 'no response'}")
     return False
 
 
