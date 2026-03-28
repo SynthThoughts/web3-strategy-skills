@@ -618,15 +618,8 @@ def find_latest_token_id() -> str:
     return ""
 
 
-DUST_THRESHOLD_USD = 1.0  # Positions below this use precise redeem
-
-
 def cleanup_residual_positions(keep_token_id: str) -> int:
-    """Redeem all positions except keep_token_id. Returns count of cleaned positions.
-
-    Uses --ratio 1 for normal positions and --user-input with exact amounts
-    for dust positions (< $DUST_THRESHOLD_USD) to ensure clean NFT burn.
-    """
+    """Redeem all positions except keep_token_id. Returns count of cleaned positions."""
     positions = _query_all_positions()
     cleaned = 0
     for pos in positions:
@@ -634,12 +627,8 @@ def cleanup_residual_positions(keep_token_id: str) -> int:
         if tid == keep_token_id or not tid:
             continue
         val = pos["value"]
-        if val < DUST_THRESHOLD_USD:
-            log(f"  Cleaning dust position #{tid} (${val:.4f})")
-            ok = _redeem_dust(tid, pos.get("assets", []))
-        else:
-            log(f"  Cleaning residual position #{tid} (${val:.2f})")
-            ok = defi_redeem(tid)
+        log(f"  Cleaning residual position #{tid} (${val:.2f})")
+        ok = defi_redeem(tid)
         if ok:
             cleaned += 1
             log(f"  Redeemed #{tid}")
@@ -1142,53 +1131,6 @@ def defi_redeem(token_id: str) -> bool:
     return False
 
 
-def _redeem_dust(token_id: str, assets: list) -> bool:
-    """Redeem a dust position by passing exact token amounts via --user-input.
-
-    For positions with negligible value, --ratio 1 may round to zero due to
-    integer division. Passing precise amounts ensures clean burn of the NFT.
-    """
-    if not token_id or not assets:
-        return False
-    user_input_tokens = []
-    for asset in assets:
-        addr = asset.get("tokenAddress", "")
-        amount = asset.get("coinAmount", "0")
-        precision = asset.get("tokenPrecision") or asset.get("decimal", "18")
-        if addr:
-            user_input_tokens.append(
-                {
-                    "tokenAddress": addr,
-                    "chainIndex": CHAIN_ID,
-                    "coinAmount": amount,
-                    "tokenPrecision": str(precision),
-                }
-            )
-    if not user_input_tokens:
-        return False
-    data = onchainos_cmd(
-        [
-            "defi",
-            "redeem",
-            "--id",
-            INVESTMENT_ID,
-            "--address",
-            WALLET_ADDR,
-            "--chain",
-            POOL_CHAIN,
-            "--token-id",
-            token_id,
-            "--user-input",
-            json.dumps(user_input_tokens),
-        ],
-        timeout=60,
-    )
-    if data and data.get("ok"):
-        log(f"Dust redeem calldata for token_id={token_id}")
-        return _broadcast_defi_txs(data, "redeem [dust]")
-    log(f"Dust redeem failed: {json.dumps(data)[:200] if data else 'no response'}")
-    return False
-
 
 def defi_calculate_entry(
     input_token: str,
@@ -1596,39 +1538,46 @@ def execute_rebalance(
         else:
             log(f"  Verify attempt {verify_attempt}: no token_id found yet")
     else:
-        # All verification attempts failed
-        dep_fails = state.get("_consecutive_deposit_failures", 0) + 1
-        state["_consecutive_deposit_failures"] = dep_fails
-        log(
-            f"  Deposit verification FAILED after 3 attempts "
-            f"(consecutive failures: {dep_fails}/{MAX_DEPOSIT_FAILURES})"
-        )
-        if dep_fails >= MAX_DEPOSIT_FAILURES:
-            state["stop_triggered"] = (
-                f"deposit_failures ({dep_fails} consecutive deposit verifications failed)"
-            )
-            save_state(state)
-            emit(
-                "stop_triggered",
-                {
-                    "status": "stop_triggered",
-                    "trigger": state["stop_triggered"],
-                    "price": round(price, 2),
-                },
-                notify=True,
-                tier="risk_alert",
-            )
+        # All verification attempts exhausted
+        if new_token_id:
+            # Token exists on-chain but value reads low (indexing lag).
+            # Adopt it instead of creating another position that becomes dust.
             log(
-                f"  AUTO-PAUSED: {dep_fails} consecutive deposit failures — "
-                f"manual intervention required (resume-trading to restart)"
+                f"  Deposit value unconfirmed but token_id={new_token_id} exists "
+                f"on-chain — adopting (value=${lp_value:.2f}, may update next tick)"
             )
         else:
-            save_state(state)
-        # Clean up any dust positions created by the failed deposit
-        cleanup_residual_positions(token_id or "")
-        return _emergency_deposit(state, price, trigger)
+            # No token_id found at all — deposit likely reverted
+            dep_fails = state.get("_consecutive_deposit_failures", 0) + 1
+            state["_consecutive_deposit_failures"] = dep_fails
+            log(
+                f"  Deposit verification FAILED: no token_id found after 3 attempts "
+                f"(consecutive failures: {dep_fails}/{MAX_DEPOSIT_FAILURES})"
+            )
+            if dep_fails >= MAX_DEPOSIT_FAILURES:
+                state["stop_triggered"] = (
+                    f"deposit_failures ({dep_fails} consecutive deposit verifications failed)"
+                )
+                save_state(state)
+                emit(
+                    "stop_triggered",
+                    {
+                        "status": "stop_triggered",
+                        "trigger": state["stop_triggered"],
+                        "price": round(price, 2),
+                    },
+                    notify=True,
+                    tier="risk_alert",
+                )
+                log(
+                    f"  AUTO-PAUSED: {dep_fails} consecutive deposit failures — "
+                    f"manual intervention required (resume-trading to restart)"
+                )
+            else:
+                save_state(state)
+            return _emergency_deposit(state, price, trigger)
 
-    # Verification passed — reset failure counter
+    # Have a valid token_id (verified or adopted) — reset failure counter
     state["_consecutive_deposit_failures"] = 0
     if new_token_id:
         cleanup_residual_positions(new_token_id)
@@ -1679,9 +1628,6 @@ def execute_rebalance(
 
 def _emergency_deposit(state: dict, price: float, trigger: dict) -> bool:
     """Emergency fallback: deposit with extra-wide range."""
-    # Clean up any residual positions before emergency deposit
-    current_token = (state.get("position") or {}).get("token_id", "")
-    cleanup_residual_positions(current_token)
     log("EMERGENCY: deploying with wide range")
     # MAX_RANGE_PCT is in percentage points (10 = 10%), same as calc_optimal_range
     half_width = MAX_RANGE_PCT * EMERGENCY_RANGE_MULT  # e.g. 10 * 2.0 = 20%
@@ -1734,31 +1680,37 @@ def _emergency_deposit(state: dict, price: float, trigger: dict) -> bool:
             else:
                 log(f"  Emergency verify attempt {verify_attempt}: no token_id")
         else:
-            dep_fails = state.get("_consecutive_deposit_failures", 0) + 1
-            state["_consecutive_deposit_failures"] = dep_fails
-            log(
-                f"  Emergency deposit verification FAILED "
-                f"(consecutive: {dep_fails}/{MAX_DEPOSIT_FAILURES})"
-            )
-            if dep_fails >= MAX_DEPOSIT_FAILURES:
-                state["stop_triggered"] = (
-                    f"deposit_failures ({dep_fails} consecutive)"
+            if new_token_id:
+                # Token exists on-chain — adopt it to avoid creating dust
+                log(
+                    f"  Emergency value unconfirmed but token_id={new_token_id} "
+                    f"exists — adopting (value=${lp_value:.2f})"
                 )
-                save_state(state)
-                emit(
-                    "stop_triggered",
-                    {
-                        "status": "stop_triggered",
-                        "trigger": state["stop_triggered"],
-                    },
-                    notify=True,
-                    tier="risk_alert",
+            else:
+                # No token_id — deposit likely reverted
+                dep_fails = state.get("_consecutive_deposit_failures", 0) + 1
+                state["_consecutive_deposit_failures"] = dep_fails
+                log(
+                    f"  Emergency deposit FAILED: no token_id found "
+                    f"(consecutive: {dep_fails}/{MAX_DEPOSIT_FAILURES})"
                 )
-                log("  AUTO-PAUSED: too many deposit failures")
-            # Clean up dust from failed emergency deposit
-            cleanup_residual_positions("")
-            return False
-        # Verification passed
+                if dep_fails >= MAX_DEPOSIT_FAILURES:
+                    state["stop_triggered"] = (
+                        f"deposit_failures ({dep_fails} consecutive)"
+                    )
+                    save_state(state)
+                    emit(
+                        "stop_triggered",
+                        {
+                            "status": "stop_triggered",
+                            "trigger": state["stop_triggered"],
+                        },
+                        notify=True,
+                        tier="risk_alert",
+                    )
+                    log("  AUTO-PAUSED: too many deposit failures")
+                return False
+        # Have a valid token_id (verified or adopted)
         state["_consecutive_deposit_failures"] = 0
 
         state["position"] = {
