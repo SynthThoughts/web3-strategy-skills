@@ -4,7 +4,7 @@ description: "Uniswap V3 集中流动性 LP 自动调仓策略。基于波动率
 license: Apache-2.0
 metadata:
   author: SynthThoughts
-  version: "3.8.1"
+  version: "3.8.2"
   pattern: "pipeline, tool-wrapper"
   steps: "5"
 ---
@@ -157,7 +157,6 @@ onchainos defi search --chain <chain> --token "<token0>,<token1>" --product-grou
   "gas_to_fee_ratio": 0.5,
   "max_il_tolerance_pct": 5.0,
   "edge_proximity_threshold": 0.15,
-  "emergency_range_mult": 2.0,
   "stop_loss_pct": 0.15,
   "trailing_stop_pct": 0.1,
   "slippage_pct": 1,

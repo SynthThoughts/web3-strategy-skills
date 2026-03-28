@@ -86,7 +86,6 @@ MIN_POSITION_AGE = CFG["min_position_age_seconds"]
 MAX_REBALANCES_24H = CFG["max_rebalances_24h"]
 GAS_TO_FEE_RATIO = CFG["gas_to_fee_ratio"]
 MAX_IL_TOLERANCE_PCT = CFG["max_il_tolerance_pct"]
-EMERGENCY_RANGE_MULT = CFG["emergency_range_mult"]
 
 STOP_LOSS_PCT = CFG["stop_loss_pct"]
 TRAILING_STOP_PCT = CFG["trailing_stop_pct"]
@@ -1509,8 +1508,8 @@ def execute_rebalance(
     if token_id:
         redeemed = defi_redeem(token_id)
         if not redeemed:
-            log("  Redeem failed — attempting emergency wide deposit")
-            return _emergency_deposit(state, price, trigger)
+            log("  Redeem failed — will retry next tick")
+            return False
         # Mark position as redeemed immediately to prevent stale state
         state["_rebalance_in_progress"] = True
         state["position"] = {
@@ -1583,8 +1582,11 @@ def execute_rebalance(
     log(f"  Deposit input: {user_input_json[:200]}")
     deposit_result = defi_deposit(user_input_json, new_tick_lower, new_tick_upper)
     if not deposit_result:
-        log("  Deposit failed — attempting emergency wide deposit")
-        return _emergency_deposit(state, price, trigger)
+        dep_fails = state.get("_consecutive_deposit_failures", 0) + 1
+        state["_consecutive_deposit_failures"] = dep_fails
+        save_state(state)
+        log(f"  Deposit failed (consecutive: {dep_fails}/{MAX_DEPOSIT_FAILURES}) — will retry next tick")
+        return False
 
     # Deposit returns bool; recover token_id and verify on-chain value
     # Only look for token_ids created after pre_deposit_max_tid
@@ -1646,7 +1648,7 @@ def execute_rebalance(
                 )
             else:
                 save_state(state)
-            return _emergency_deposit(state, price, trigger)
+            return False
 
     # Have a valid token_id (verified or adopted) — reset failure counter
     state["_consecutive_deposit_failures"] = 0
@@ -1696,138 +1698,6 @@ def execute_rebalance(
     )
     return True
 
-
-def _emergency_deposit(state: dict, price: float, trigger: dict) -> bool:
-    """Emergency fallback: deposit with extra-wide range."""
-    log("EMERGENCY: deploying with wide range")
-    # MAX_RANGE_PCT is in percentage points (10 = 10%), same as calc_optimal_range
-    half_width = MAX_RANGE_PCT * EMERGENCY_RANGE_MULT  # e.g. 10 * 2.0 = 20%
-
-    lower_price = price * (1 - half_width / 100)
-    upper_price = price * (1 + half_width / 100)
-    tick_lower = price_to_tick(lower_price)
-    tick_upper = price_to_tick(upper_price)
-
-    eth_bal, usdc_bal, bal_failed = get_balances(force=True)
-    if bal_failed:
-        log("  Emergency: balance query failed — cannot proceed")
-        return False
-    available_eth = eth_bal - ETH_RESERVE
-    if available_eth < 0:
-        available_eth = 0
-    total_usd = available_eth * price + usdc_bal
-    if total_usd < MIN_TRADE_USD:
-        log(f"  Emergency: total balance too low (${total_usd:.2f})")
-        return False
-    log(f"  Emergency balances: ETH={eth_bal:.6f} USDC={usdc_bal:.2f}")
-
-    # Use calculate-entry for dual-token deposit (same as execute_rebalance)
-    deposit_eth = int(available_eth * 0.9 * (10 ** TOKEN0["decimals"]))  # wei
-    calculated = defi_calculate_entry(
-        input_token=NATIVE_TOKEN,
-        input_amount=str(deposit_eth),
-        token_decimal=TOKEN0["decimals"],
-        tick_lower=tick_lower,
-        tick_upper=tick_upper,
-    )
-    if calculated and isinstance(calculated, list):
-        user_input = json.dumps(calculated)
-    else:
-        # Fallback: deposit USDC only
-        usdc_deposit = int(usdc_bal * 0.9 * (10 ** TOKEN1["decimals"]))
-        log(f"  Emergency calculate-entry failed, falling back to USDC-only: {usdc_deposit}")
-        user_input = json.dumps(
-            [
-                {
-                    "chainIndex": CHAIN_ID,
-                    "coinAmount": str(usdc_deposit),
-                    "tokenAddress": USDC_ADDR,
-                    "tokenPrecision": str(TOKEN1["decimals"]),
-                }
-            ]
-        )
-
-    # Record current max token_id before deposit
-    pre_deposit_max_tid = ""
-    existing = _query_all_positions()
-    if existing:
-        pre_deposit_max_tid = max(existing, key=lambda p: int(p["tokenId"]))["tokenId"]
-
-    deposit_result = defi_deposit(user_input, tick_lower, tick_upper)
-    if deposit_result:
-        # Retry verification — only look for newly created positions
-        new_token_id = ""
-        lp_value = 0.0
-        for verify_attempt, delay in enumerate([8, 15, 25], 1):
-            time.sleep(delay)
-            new_token_id = find_latest_token_id(after_token_id=pre_deposit_max_tid)
-            if new_token_id:
-                detail = get_position_detail(new_token_id)
-                lp_value = detail.get("value", 0)
-                if lp_value >= MIN_TRADE_USD:
-                    log(
-                        f"  Emergency verified (attempt {verify_attempt}): "
-                        f"token_id={new_token_id} value=${lp_value:.2f}"
-                    )
-                    break
-                log(
-                    f"  Emergency verify attempt {verify_attempt}: "
-                    f"token_id={new_token_id} value=${lp_value:.2f}"
-                )
-            else:
-                log(f"  Emergency verify attempt {verify_attempt}: no token_id")
-        else:
-            if new_token_id:
-                # Token exists on-chain — adopt it to avoid creating dust
-                log(
-                    f"  Emergency value unconfirmed but token_id={new_token_id} "
-                    f"exists — adopting (value=${lp_value:.2f})"
-                )
-            else:
-                # No token_id — deposit likely reverted
-                dep_fails = state.get("_consecutive_deposit_failures", 0) + 1
-                state["_consecutive_deposit_failures"] = dep_fails
-                log(
-                    f"  Emergency deposit FAILED: no token_id found "
-                    f"(consecutive: {dep_fails}/{MAX_DEPOSIT_FAILURES})"
-                )
-                if dep_fails >= MAX_DEPOSIT_FAILURES:
-                    state["stop_triggered"] = (
-                        f"deposit_failures ({dep_fails} consecutive)"
-                    )
-                    save_state(state)
-                    emit(
-                        "stop_triggered",
-                        {
-                            "status": "stop_triggered",
-                            "trigger": state["stop_triggered"],
-                        },
-                        notify=True,
-                        tier="risk_alert",
-                    )
-                    log("  AUTO-PAUSED: too many deposit failures")
-                return False
-        # Have a valid token_id (verified or adopted)
-        state["_consecutive_deposit_failures"] = 0
-
-        state["position"] = {
-            "token_id": new_token_id,
-            "tick_lower": tick_lower,
-            "tick_upper": tick_upper,
-            "lower_price": round(lower_price, 2),
-            "upper_price": round(upper_price, 2),
-            "created_at": datetime.now().isoformat(),
-            "created_atr_pct": round(half_width, 2),
-            "entry_price": round(price, 2),
-        }
-        log(
-            f"  Emergency deposit OK: [{tick_lower},{tick_upper}] "
-            f"(${lower_price:.2f}-${upper_price:.2f})"
-        )
-        return True
-
-    log("  Emergency deposit also failed — funds sitting idle")
-    return False
 
 
 # ── State Management ────────────────────────────────────────────────────────
