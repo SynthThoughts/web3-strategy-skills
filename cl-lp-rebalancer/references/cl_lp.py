@@ -1507,9 +1507,15 @@ def _calc_balanced_deposit(
         return None
     log(f"  Pre-swap OK: {tx_hash}")
 
-    # Wait for swap to settle, then re-check balances
-    time.sleep(8)
-    new_eth, new_usdc, bal_failed = get_balances(force=True)
+    # Wait for swap to settle, then re-check balances with retry
+    new_eth, new_usdc, bal_failed = 0.0, usdc_bal, True
+    for wait in [12, 10, 10]:
+        time.sleep(wait)
+        new_eth, new_usdc, bal_failed = get_balances(force=True)
+        if not bal_failed and new_usdc > usdc_bal + 1:
+            # USDC increased — swap reflected
+            break
+        log(f"  Waiting for swap to reflect (USDC={new_usdc:.2f}, was {usdc_bal:.2f})")
     if bal_failed:
         log("  Balance check failed after swap")
         return None
@@ -1534,7 +1540,7 @@ def _calc_balanced_deposit(
             addr = item.get("tokenAddress", "").lower()
             if addr == USDC_ADDR.lower():
                 new_usdc_needed = float(item.get("coinAmount", 0)) / (10 ** TOKEN1["decimals"])
-                if new_usdc_needed > new_usdc * 0.98:
+                if new_usdc_needed > new_usdc:
                     log(f"  Still short on USDC after swap ({new_usdc_needed:.2f} > {new_usdc:.2f})")
                     # Last resort: use USDC as input
                     return _calc_entry_usdc_base(new_usdc, tick_lower, tick_upper)
