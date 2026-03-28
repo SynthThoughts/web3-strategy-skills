@@ -1565,6 +1565,8 @@ def execute_rebalance(
             )
         else:
             save_state(state)
+        # Clean up any dust positions created by the failed deposit
+        cleanup_residual_positions(token_id or "")
         return _emergency_deposit(state, price, trigger)
 
     # Verification passed — reset failure counter
@@ -1618,6 +1620,9 @@ def execute_rebalance(
 
 def _emergency_deposit(state: dict, price: float, trigger: dict) -> bool:
     """Emergency fallback: deposit with extra-wide range."""
+    # Clean up any residual positions before emergency deposit
+    current_token = (state.get("position") or {}).get("token_id", "")
+    cleanup_residual_positions(current_token)
     log("EMERGENCY: deploying with wide range")
     # MAX_RANGE_PCT is in percentage points (10 = 10%), same as calc_optimal_range
     half_width = MAX_RANGE_PCT * EMERGENCY_RANGE_MULT  # e.g. 10 * 2.0 = 20%
@@ -1691,6 +1696,8 @@ def _emergency_deposit(state: dict, price: float, trigger: dict) -> bool:
                     tier="risk_alert",
                 )
                 log("  AUTO-PAUSED: too many deposit failures")
+            # Clean up dust from failed emergency deposit
+            cleanup_residual_positions("")
             return False
         # Verification passed
         state["_consecutive_deposit_failures"] = 0
@@ -2601,7 +2608,12 @@ def _tick_inner():
     rebalanced = False
 
     if not position or not position.get("tick_lower"):
-        # No position — initial deposit
+        # No position — clean up any orphaned positions before creating new one
+        residual_cleaned = cleanup_residual_positions("")
+        if residual_cleaned:
+            log(f"Cleaned {residual_cleaned} orphaned position(s) before initial deposit")
+            eth_bal, usdc_bal, balance_failed = get_balances(force=True)
+            total_usd = eth_bal * price + usdc_bal
         log("No active position — creating initial LP position")
         new_range = calc_optimal_range(price, atr_pct, mtf)
         log(
