@@ -1104,26 +1104,55 @@ def defi_claim_fees(token_id: str) -> bool:
 
 
 def defi_redeem(token_id: str) -> bool:
-    """Remove all liquidity from V3 position."""
+    """Remove all liquidity from V3 position.
+
+    Queries position assets first and passes exact token amounts via --user-input
+    so the contract can do a clean removeLiquidity + collect + burn (no dust).
+    Falls back to --ratio 1 if asset query fails.
+    """
     if not token_id:
         return False
-    data = onchainos_cmd(
-        [
-            "defi",
-            "redeem",
-            "--id",
-            INVESTMENT_ID,
-            "--address",
-            WALLET_ADDR,
-            "--chain",
-            POOL_CHAIN,
-            "--token-id",
-            token_id,
-            "--ratio",
-            "1",
-        ],
-        timeout=60,
-    )
+
+    # Build --user-input from position assets for precise full exit
+    user_input_arg = None
+    detail = get_position_detail(token_id)
+    assets = detail.get("assets", [])
+    if assets:
+        user_input_tokens = []
+        for asset in assets:
+            addr = asset.get("tokenAddress", "")
+            amount = asset.get("coinAmount", "0")
+            precision = asset.get("tokenPrecision") or asset.get("decimal", "18")
+            if addr and float(amount) > 0:
+                user_input_tokens.append(
+                    {
+                        "tokenAddress": addr,
+                        "chainIndex": CHAIN_ID,
+                        "coinAmount": amount,
+                        "tokenPrecision": str(precision),
+                    }
+                )
+        if user_input_tokens:
+            user_input_arg = json.dumps(user_input_tokens)
+
+    cmd = [
+        "defi",
+        "redeem",
+        "--id",
+        INVESTMENT_ID,
+        "--address",
+        WALLET_ADDR,
+        "--chain",
+        POOL_CHAIN,
+        "--token-id",
+        token_id,
+        "--ratio",
+        "1",
+    ]
+    if user_input_arg:
+        cmd.extend(["--user-input", user_input_arg])
+
+    data = onchainos_cmd(cmd, timeout=60)
     if data and data.get("ok"):
         log(f"Redeem calldata for token_id={token_id}")
         return _broadcast_defi_txs(data, "redeem")
