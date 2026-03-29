@@ -4,7 +4,7 @@ description: "跨交易所资金费率套利策略。在费率低的交易所做
 license: Apache-2.0
 metadata:
   author: SynthThoughts
-  version: "2.5.1"
+  version: "2.6.0"
   pattern: "pipeline"
   steps: "5"
   openclaw:

@@ -1824,6 +1824,7 @@ class CrossFundingEngine:
         self.bn_budget_cfg: float = cfg.get("bn_budget_usd", 0)
         self.leverage: int = cfg.get("leverage", 1)
         self.min_apr: float = cfg["min_apr_pct"]
+        self.min_hold_apr: float = cfg.get("min_hold_apr_pct", self.min_apr)
         self.stability_snapshots: int = cfg.get("stability_snapshots", 3)
         self.close_spread_threshold: float = cfg.get("close_spread_threshold", 0.0001)
         self.switch_threshold_apr: float = cfg.get("switch_threshold_apr", 5.0)
@@ -2966,6 +2967,41 @@ class CrossFundingEngine:
                         "reason": "missing leg",
                         "long_size": ph["long_size"],
                         "short_size": ph["short_size"],
+                    },
+                    notify=True,
+                    tier="risk_alert",
+                )
+                self.close_position(coin)
+                acted = True
+            elif ph["current_apr"] < self.min_hold_apr:
+                # APR decayed below minimum hold threshold — exit
+                if self.delta_exit_enabled:
+                    delta_assessment = self._assess_delta_for_exit(pos, ph)
+                    if not delta_assessment["favorable"]:
+                        self._increment_defer_count(coin)
+                        emit(
+                            "exit_deferred_delta",
+                            {
+                                "coin": coin,
+                                "reason": f"APR decayed ({ph['current_apr']:.1f}% < "
+                                f"{self.min_hold_apr:.1f}%), "
+                                + delta_assessment["reason"],
+                                "current_apr": ph["current_apr"],
+                                "min_hold_apr": self.min_hold_apr,
+                                "defer_count": delta_assessment["defer_count"] + 1,
+                                "max_defer": self.delta_max_defer_ticks,
+                            },
+                            notify=True,
+                            tier="info",
+                        )
+                        continue
+                emit(
+                    "manage_close",
+                    {
+                        "coin": coin,
+                        "reason": "APR decayed below minimum",
+                        "current_apr": ph["current_apr"],
+                        "min_hold_apr": self.min_hold_apr,
                     },
                     notify=True,
                     tier="risk_alert",
