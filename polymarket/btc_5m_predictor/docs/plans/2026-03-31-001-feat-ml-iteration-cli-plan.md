@@ -1,7 +1,7 @@
 ---
 title: "feat: BTC ML 模型迭代 CLI 平台"
 type: feat
-status: active
+status: completed
 date: 2026-03-31
 origin: docs/brainstorms/2026-03-31-ml-iteration-platform-requirements.md
 deepened: 2026-03-31
@@ -296,7 +296,7 @@ graph TB
 
 ### Phase 2: Training Core
 
-- [ ] **Unit 4: train_pipeline 参数化 + 训练质量守护**
+- [x] **Unit 4: train_pipeline 参数化 + 训练质量守护**
 
 **Goal:** 重构 `main()` 接受外部参数，集成穿越检测、过拟合监控、loss/eval 可配置、自动对比
 
@@ -377,7 +377,7 @@ main() 当前签名: def main() -> str
 
 ---
 
-- [ ] **Unit 5: Feature 命令（metadata 增强 + validate/explore）**
+- [x] **Unit 5: Feature 命令（metadata 增强 + validate/explore）**
 
 **Goal:** 增强特征元数据，提供特征验证和探索 CLI
 
@@ -415,7 +415,7 @@ main() 当前签名: def main() -> str
 
 ### Phase 3: Monitoring & Attribution
 
-- [ ] **Unit 6: 漂移检测 + 分布监控**
+- [x] **Unit 6: 漂移检测 + 分布监控**
 
 **Goal:** 实现输入特征/输出概率的分布监控和漂移检测
 
@@ -460,7 +460,7 @@ main() 当前签名: def main() -> str
 
 ---
 
-- [ ] **Unit 7: 归因分析 + SHAP 解释**
+- [x] **Unit 7: 归因分析 + SHAP 解释**
 
 **Goal:** 实现 SHAP 特征解释、市场状态切片、线上三层归因
 
@@ -509,7 +509,7 @@ main() 当前签名: def main() -> str
 
 ### Phase 4: Deployment
 
-- [ ] **Unit 8: Deploy 命令（promote/shadow/compare）**
+- [x] **Unit 8: Deploy 命令（promote/shadow/compare）**
 
 **Goal:** 通过 CLI 暴露模型部署、shadow 测试和对比功能
 
