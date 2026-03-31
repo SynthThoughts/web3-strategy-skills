@@ -220,7 +220,7 @@ graph TB
 
 ---
 
-- [ ] **Unit 2: Data 命令（status/fetch/sync/health/validate）**
+- [x] **Unit 2: Data 命令（status/fetch/sync/health/validate）**
 
 **Goal:** 统一数据管理 CLI，覆盖本地数据状态、远程采集、同步、健康检查、完整性验证
 

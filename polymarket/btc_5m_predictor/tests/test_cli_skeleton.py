@@ -28,10 +28,9 @@ def test_data_no_action(capsys):
 
 
 def test_data_status(capsys):
-    """btc data status returns 0 (stub)."""
+    """btc data status returns 0."""
     ret = main(["data", "status"])
     assert ret == 0
-    assert "todo" in capsys.readouterr().out.lower()
 
 
 def test_feature_no_action(capsys):
