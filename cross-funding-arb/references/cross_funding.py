@@ -1552,6 +1552,24 @@ class BinanceClient:
                 }
         return None
 
+    def get_all_positions(self) -> list[dict]:
+        data = self._request("GET", "/fapi/v3/positionRisk", signed=True)
+        positions = []
+        for pos in data:
+            size = float(pos["positionAmt"])
+            if size != 0:
+                symbol: str = pos["symbol"]
+                coin = symbol[: -len("USDT")] if symbol.endswith("USDT") else symbol
+                positions.append(
+                    {
+                        "coin": coin,
+                        "size": size,
+                        "entry_px": float(pos["entryPrice"]),
+                        "unrealized_pnl": float(pos["unRealizedProfit"]),
+                    }
+                )
+        return positions
+
     def get_funding_income(self, coin: str, start_time_ms: int) -> float:
         """Get total realized funding income since start_time_ms."""
         symbol = self._to_symbol(coin)
@@ -2336,6 +2354,17 @@ class CrossFundingEngine:
 
     # ---- Close position ----
 
+    def _verify_leg_closed(self, client, coin: str) -> bool:
+        """Check that a position on the given exchange is actually closed."""
+        try:
+            pos = client.get_position(coin)
+            if pos and abs(pos.get("size", 0)) > 0:
+                return False
+            return True
+        except Exception as e:
+            emit_error("verify_leg_closed", e)
+            return False
+
     def close_position(self, coin: str) -> bool:
         state = self._load()
         positions = state.get("positions", [])
@@ -2363,17 +2392,43 @@ class CrossFundingEngine:
         pre_hl = self.hl.get_usdc_balance()
         pre_bn = self.bn.get_usdt_balance()
 
+        short_ok = False
+        long_ok = False
+
         try:
             short_client.close_position(coin)
         except Exception as e:
             emit_error("close_short", e)
         time.sleep(1)
+        short_ok = self._verify_leg_closed(short_client, coin)
 
         try:
             long_client.close_position(coin)
         except Exception as e:
             emit_error("close_long", e)
         time.sleep(1)
+        long_ok = self._verify_leg_closed(long_client, coin)
+
+        if not short_ok or not long_ok:
+            failed_legs = []
+            if not short_ok:
+                failed_legs.append(f"short({short_ex})")
+            if not long_ok:
+                failed_legs.append(f"long({long_ex})")
+            emit(
+                "close_incomplete",
+                {
+                    "coin": coin,
+                    "failed_legs": failed_legs,
+                    "short_closed": short_ok,
+                    "long_closed": long_ok,
+                },
+                notify=True,
+                tier="risk_alert",
+            )
+            # Do NOT remove from state — position needs manual intervention
+            # or will be retried on next tick
+            return False
 
         funding_earned = pos_data.get("total_funding_earned", 0.0)
         current_price = self.hl.get_mid_price(coin)
@@ -2412,6 +2467,40 @@ class CrossFundingEngine:
         state["positions"] = positions
         self._save(state)
         return True
+
+    # ---- Reconciliation ----
+
+    def reconcile_positions(self) -> list[dict]:
+        """Compare state positions vs actual exchange positions.
+
+        Returns a list of orphan positions (on-exchange but not in state).
+        Emits risk_alert for each orphan found.
+        """
+        state_coins = {p["coin"] for p in self._get_positions()}
+
+        orphans: list[dict] = []
+        for exchange_name, client in [("hyperliquid", self.hl), ("binance", self.bn)]:
+            try:
+                actual = client.get_all_positions()
+            except Exception as e:
+                emit_error(f"reconcile_{exchange_name}", e)
+                continue
+            for pos in actual:
+                if pos["coin"] not in state_coins:
+                    orphan = {
+                        "coin": pos["coin"],
+                        "exchange": exchange_name,
+                        "size": pos["size"],
+                        "unrealized_pnl": pos.get("unrealized_pnl", 0),
+                    }
+                    orphans.append(orphan)
+                    emit(
+                        "orphan_position",
+                        orphan,
+                        notify=True,
+                        tier="risk_alert",
+                    )
+        return orphans
 
     # ---- Health check ----
 
@@ -3705,6 +3794,21 @@ def tick() -> None:
             return
 
         engine = _build_engine()
+
+        # Reconcile state vs actual exchange positions every tick
+        orphans = engine.reconcile_positions()
+        if orphans:
+            emit(
+                "reconciliation_alert",
+                {
+                    "orphan_count": len(orphans),
+                    "orphans": orphans,
+                    "action": "manual intervention required",
+                },
+                notify=True,
+                tier="risk_alert",
+            )
+
         state = engine._load()
         positions = state.get("positions", [])
         opportunities: list[dict] = []
