@@ -260,7 +260,7 @@ graph TB
 
 ---
 
-- [ ] **Unit 3: Experiment 命令（list/compare）**
+- [x] **Unit 3: Experiment 命令（list/compare）**
 
 **Goal:** 提供实验查询和对比的 CLI 接口
 

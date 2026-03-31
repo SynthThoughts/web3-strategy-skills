@@ -58,15 +58,23 @@ def test_experiment_no_action(capsys):
 
 
 def test_experiment_list(capsys):
-    """btc experiment list returns 0 (stub)."""
-    ret = main(["experiment", "list"])
+    """btc experiment list returns 0 (tested in detail in test_cmd_experiment.py)."""
+    from unittest.mock import MagicMock, patch
+    con = MagicMock()
+    con.execute.return_value.fetchall.return_value = []
+    with patch("db.get_connection", return_value=con):
+        ret = main(["experiment", "list"])
     assert ret == 0
 
 
 def test_experiment_compare(capsys):
-    """btc experiment compare requires two IDs."""
-    ret = main(["experiment", "compare", "run_a", "run_b"])
-    assert ret == 0
+    """btc experiment compare dispatches (tested in detail in test_cmd_experiment.py)."""
+    from unittest.mock import MagicMock, patch
+    con = MagicMock()
+    con.execute.return_value.fetchone.return_value = None
+    with patch("db.get_connection", return_value=con):
+        ret = main(["experiment", "compare", "run_a", "run_b"])
+    assert ret == 1  # not found
 
 
 def test_deploy_no_action(capsys):
@@ -95,14 +103,23 @@ def test_monitor_drift(capsys):
 
 def test_all_subcommands_dispatch():
     """Every top-level subcommand dispatches without import errors."""
-    commands = [
-        ["data", "status"],
+    from unittest.mock import MagicMock, patch
+
+    # Commands that don't hit DB
+    simple_commands = [
         ["feature", "validate", "x"],
         ["train"],
-        ["experiment", "list"],
         ["deploy", "promote", "x"],
         ["monitor", "drift"],
     ]
-    for argv in commands:
+    for argv in simple_commands:
         ret = main(argv)
         assert ret == 0, f"Command {argv} returned {ret}"
+
+    # Commands that hit DB — mock the connection
+    con = MagicMock()
+    con.execute.return_value.fetchall.return_value = []
+    con.execute.return_value.fetchone.return_value = None
+    with patch("db.get_connection", return_value=con):
+        ret = main(["experiment", "list"])
+        assert ret == 0
