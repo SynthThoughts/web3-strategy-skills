@@ -1,0 +1,33 @@
+[project]
+name = "btc-5m-predictor"
+version = "0.1.0"
+description = "LightGBM binary classifier for Polymarket BTC 5-minute Up/Down markets"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.0",
+    "pyarrow",
+    "lightgbm>=4.0",
+    "scikit-learn",
+    "TA-Lib",
+    "httpx[socks]",
+    "matplotlib",
+    "numpy",
+    "optuna>=4.8.0",
+    "xgboost>=2.0",
+    "catboost>=1.2",
+    "duckdb>=1.5.1",
+    "pytz>=2026.1.post1",
+    "py-clob-client>=0.34.6",
+    "shap>=0.51.0",
+    "websocket-client>=1.9.0",
+]
+
+[project.scripts]
+btc = "cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
