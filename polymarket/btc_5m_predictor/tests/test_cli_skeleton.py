@@ -105,9 +105,13 @@ def test_deploy_no_action(capsys):
 
 
 def test_deploy_promote(capsys):
-    """btc deploy promote returns 0 (stub)."""
-    ret = main(["deploy", "promote", "run_123"])
-    assert ret == 0
+    """btc deploy promote dispatches (returns 1 when run not found)."""
+    from unittest.mock import MagicMock, patch
+    con = MagicMock()
+    con.execute.return_value.fetchone.return_value = None
+    with patch("db.get_connection", return_value=con):
+        ret = main(["deploy", "promote", "run_123"])
+    assert ret == 1
 
 
 def test_monitor_no_action(capsys):
@@ -130,11 +134,9 @@ def test_all_subcommands_dispatch():
     """Every top-level subcommand dispatches without import errors."""
     from unittest.mock import MagicMock, patch
 
-    # Commands that don't hit DB
+    # Commands that don't hit DB — none left after implementation
     simple_commands = [
-        # feature validate needs mock — tested in test_cmd_feature.py
-        ["deploy", "promote", "x"],
-        # monitor drift now hits DB — tested below with mocks
+        # All commands now hit DB — tested below with mocks
     ]
     for argv in simple_commands:
         ret = main(argv)
