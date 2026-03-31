@@ -89,8 +89,48 @@ def _drift() -> int:
 
 
 def _diagnose() -> int:
-    """Run online performance attribution analysis."""
-    print("[TODO] btc monitor diagnose - not yet implemented")
+    """Run three-layer online performance attribution analysis."""
+    from training.explain import compute_diagnose, format_diagnose_report
+    from training.drift_monitor import load_reference_distribution
+    import db
+
+    # Find latest model
+    con = db.get_connection(read_only=True)
+    try:
+        row = con.execute(
+            "SELECT run_id, version FROM model_runs ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        con.close()
+
+    if row is None:
+        print("No model runs found. Train a model first.")
+        return 1
+
+    run_id, version = row[0], row[1]
+    print(f"  Analyzing: {version} (run_id: {run_id})")
+
+    # Load reference distribution for feature drift layer
+    model_dir = f"models/{version}"
+    ref_dist = load_reference_distribution(model_dir)
+
+    # Load live prediction data
+    con = db.get_connection(read_only=True)
+    try:
+        live_df = con.execute(
+            "SELECT * FROM live_predictions ORDER BY timestamp DESC LIMIT 5000"
+        ).fetchdf()
+    except Exception:
+        live_df = None
+    finally:
+        con.close()
+
+    if live_df is None or live_df.empty:
+        print("  No live prediction data found. Run `btc data sync` first.")
+        return 1
+
+    result = compute_diagnose(live_df, reference_dist=ref_dist)
+    print(format_diagnose_report(result))
     return 0
 
 

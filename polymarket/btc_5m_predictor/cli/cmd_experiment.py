@@ -229,5 +229,73 @@ def _compare(id1: str, id2: str, as_json: bool) -> int:
 
 
 def _explain(run_id: str, with_slice: bool) -> int:
-    print(f"[TODO] btc experiment explain {run_id} - not yet implemented (Unit 7)")
+    """SHAP feature explanation for a model run."""
+    from db import get_connection
+    from pathlib import Path
+
+    con = get_connection(read_only=True)
+    try:
+        row = con.execute(
+            "SELECT version, feature_set FROM model_runs WHERE run_id = ?",
+            [run_id],
+        ).fetchone()
+    finally:
+        con.close()
+
+    if row is None:
+        print(f"Error: run_id '{run_id}' not found")
+        return 1
+
+    version, feature_set_raw = row[0], row[1]
+
+    # Resolve feature list
+    if isinstance(feature_set_raw, str):
+        feature_cols = json.loads(feature_set_raw)
+    elif feature_set_raw:
+        feature_cols = list(feature_set_raw)
+    else:
+        print(f"Error: no feature_set recorded for run '{run_id}'")
+        return 1
+
+    # Find model file
+    model_dir = Path(f"models/{version}")
+    model_path = model_dir / "model.cbm"
+    if not model_path.exists():
+        print(f"Error: model file not found at {model_path}")
+        return 1
+
+    # Load data for SHAP computation
+    try:
+        import db
+        from data import build_features
+
+        con = db.get_connection(read_only=True)
+        try:
+            df_1m = con.execute("SELECT * FROM klines_1m ORDER BY open_time").fetchdf()
+        finally:
+            con.close()
+
+        df_feat = build_features.build(df_1m)
+
+        # Filter to columns that exist
+        available = [c for c in feature_cols if c in df_feat.columns]
+        if not available:
+            print("Error: none of the recorded features exist in built feature data")
+            return 1
+
+        from training.explain import compute_shap, format_shap_report
+        result = compute_shap(model_path, available, df_feat.dropna(subset=available))
+        print(format_shap_report(result))
+
+        if with_slice:
+            from training.explain import compute_market_slices, format_slice_report
+            slice_result = compute_market_slices(df_feat)
+            print(format_slice_report(slice_result))
+
+    except Exception as e:
+        print(f"Error computing SHAP: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
     return 0
