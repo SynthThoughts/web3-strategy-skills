@@ -42,8 +42,14 @@ def test_feature_no_action(capsys):
 
 
 def test_feature_validate(capsys):
-    """btc feature validate returns 0 (stub)."""
-    ret = main(["feature", "validate", "test_feature"])
+    """btc feature validate dispatches correctly."""
+    from unittest.mock import patch
+    mock_stats = {
+        "mean": 0.0, "std": 0.05, "missing_pct": 1.0, "outlier_pct": 1.0,
+        "min": -0.1, "max": 0.1, "median": 0.0, "univariate_auc": 0.55,
+    }
+    with patch("cli.cmd_feature._compute_feature_stats", return_value=mock_stats):
+        ret = main(["feature", "validate", "ret_3"])
     assert ret == 0
 
 
@@ -122,7 +128,7 @@ def test_all_subcommands_dispatch():
 
     # Commands that don't hit DB
     simple_commands = [
-        ["feature", "validate", "x"],
+        # feature validate needs mock — tested in test_cmd_feature.py
         ["deploy", "promote", "x"],
         ["monitor", "drift"],
     ]
@@ -139,10 +145,17 @@ def test_all_subcommands_dispatch():
         "ho_auc": 0.63, "bt_sharpe": 1.0, "n_features": 5,
         "overfit_report": None, "model_path": "/tmp/t",
     }
+    mock_feat_stats = {
+        "mean": 0.0, "std": 0.05, "missing_pct": 1.0, "outlier_pct": 1.0,
+        "min": -0.1, "max": 0.1, "median": 0.0, "univariate_auc": 0.55,
+    }
     with patch("db.get_data_coverage", return_value={}), \
          patch("db.get_connection", return_value=con), \
-         patch("training.train_pipeline.main", return_value=mock_result):
+         patch("training.train_pipeline.main", return_value=mock_result), \
+         patch("cli.cmd_feature._compute_feature_stats", return_value=mock_feat_stats):
         ret = main(["data", "status"])
+        assert ret == 0
+        ret = main(["feature", "validate", "ret_3"])
         assert ret == 0
         ret = main(["train"])
         assert ret == 0
