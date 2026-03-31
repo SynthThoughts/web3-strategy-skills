@@ -1292,13 +1292,13 @@ class HLClient:
         self._log_order("spot_sell", coin, False, size, px, result)
         return result
 
-    def close_position(self, coin: str) -> dict | None:
+    def close_position(self, coin: str, *, slippage: float = 0.001) -> dict | None:
         pos = self.get_position(coin)
         if not pos or pos["size"] == 0:
             return None
         is_buy = pos["size"] < 0
         size = abs(pos["size"])
-        return self.market_order(coin, is_buy, size)
+        return self.market_order(coin, is_buy, size, slippage=slippage)
 
     # ---- Utils ----
 
@@ -1615,13 +1615,13 @@ class BinanceClient:
             }
         return self._request("POST", "/fapi/v1/order", params, signed=True)
 
-    def close_position(self, coin: str) -> dict | None:
+    def close_position(self, coin: str, *, slippage: float = 0.001) -> dict | None:
         pos = self.get_position(coin)
         if not pos or pos["size"] == 0:
             return None
         is_buy = pos["size"] < 0
         size = abs(pos["size"])
-        return self.market_order(coin, is_buy, size)
+        return self.market_order(coin, is_buy, size, slippage=slippage)
 
     # ---- Utils ----
 
@@ -1834,6 +1834,10 @@ class CrossFundingEngine:
         self.round_trip_cost_pct: float = cfg.get("round_trip_cost_pct", 0.12)
         self.max_positions: int = cfg.get("max_positions", 3)
         self.min_position_usd: float = cfg.get("min_position_usd", 50)
+
+        # PnL stop-loss and minimum hold time
+        self.pnl_stop_loss_pct: float = cfg.get("pnl_stop_loss_pct", -1.0)
+        self.min_hold_ticks: int = cfg.get("min_hold_ticks", 96)
 
         # Delta-aware exit parameters
         delta_exit_cfg = cfg.get("delta_exit", {})
@@ -2443,7 +2447,28 @@ class CrossFundingEngine:
 
         spread_favorable = current_spread > self.close_spread_threshold
         has_both_legs = long_size > 0 and short_size > 0
-        healthy = has_both_legs and spread_favorable and delta_pct < 20
+
+        # PnL stop-loss: compute unrealized PnL as % of notional
+        long_pnl = long_pos.get("unrealized_pnl", 0.0) if long_pos else 0.0
+        short_pnl = short_pos.get("unrealized_pnl", 0.0) if short_pos else 0.0
+        funding_earned = pos_data.get("total_funding_earned", 0.0)
+        total_pnl_usd = long_pnl + short_pnl + funding_earned
+        pnl_pct = total_pnl_usd / avg_notional * 100 if avg_notional > 1 else 0.0
+        pnl_stop_triggered = pnl_pct < self.pnl_stop_loss_pct
+
+        # Min hold time: count ticks since entry
+        entry_time_str = pos_data.get("entry_time", "")
+        hold_ticks = 0
+        if entry_time_str:
+            try:
+                entry_dt = datetime.fromisoformat(entry_time_str)
+                elapsed_s = (datetime.now(timezone.utc) - entry_dt).total_seconds()
+                hold_ticks = int(elapsed_s / 300)  # 5 min per tick
+            except (ValueError, TypeError):
+                pass
+        within_min_hold = hold_ticks < self.min_hold_ticks
+
+        healthy = has_both_legs and spread_favorable and delta_pct < 20 and not pnl_stop_triggered
 
         result = {
             "coin": coin,
@@ -2462,6 +2487,11 @@ class CrossFundingEngine:
             "has_both_legs": has_both_legs,
             "hl_rate": hl_rate,
             "bn_rate": bn_rate,
+            "pnl_pct": round(pnl_pct, 4),
+            "pnl_stop_triggered": pnl_stop_triggered,
+            "total_pnl_usd": round(total_pnl_usd, 4),
+            "hold_ticks": hold_ticks,
+            "within_min_hold": within_min_hold,
         }
 
         if not healthy:
@@ -2904,6 +2934,26 @@ class CrossFundingEngine:
             if ph["spread_favorable"] and pos.get("delta_exit_defer_count", 0) > 0:
                 self._reset_defer_count(coin)
 
+            # PnL stop-loss: force close regardless of spread or delta
+            if ph["pnl_stop_triggered"]:
+                emit(
+                    "manage_close",
+                    {
+                        "coin": coin,
+                        "reason": "pnl_stop_loss",
+                        "pnl_pct": ph["pnl_pct"],
+                        "total_pnl_usd": ph["total_pnl_usd"],
+                        "threshold": self.pnl_stop_loss_pct,
+                        "hold_ticks": ph["hold_ticks"],
+                    },
+                    notify=True,
+                    tier="risk_alert",
+                )
+                self._reset_defer_count(coin)
+                self.close_position(coin)
+                acted = True
+                continue
+
             if not ph["spread_favorable"]:
                 # Delta-aware exit: defer close if delta PnL is adverse
                 if self.delta_exit_enabled:
@@ -3083,6 +3133,18 @@ class CrossFundingEngine:
                 worst_health = ph
 
         if worst_coin and worst_health:
+            # Min hold time: skip switch if position is too young
+            if worst_health.get("within_min_hold", False):
+                emit(
+                    "switch_skipped_min_hold",
+                    {
+                        "coin": worst_coin,
+                        "hold_ticks": worst_health["hold_ticks"],
+                        "min_hold_ticks": self.min_hold_ticks,
+                    },
+                )
+                return acted
+
             switch = self._evaluate_switch_candidate(
                 worst_coin, worst_apr, worst_health, opportunities,
             )
