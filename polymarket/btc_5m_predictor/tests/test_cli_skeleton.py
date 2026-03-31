@@ -29,7 +29,9 @@ def test_data_no_action(capsys):
 
 def test_data_status(capsys):
     """btc data status returns 0."""
-    ret = main(["data", "status"])
+    from unittest.mock import patch
+    with patch("db.get_data_coverage", return_value={}):
+        ret = main(["data", "status"])
     assert ret == 0
 
 
@@ -46,9 +48,22 @@ def test_feature_validate(capsys):
 
 
 def test_train(capsys):
-    """btc train returns 0 (stub)."""
-    ret = main(["train"])
+    """btc train dispatches to cmd_train (actual training tested separately)."""
+    from unittest.mock import patch, MagicMock
+    mock_result = {
+        "run_id": "test_run_id",
+        "version": "v999",
+        "cv_auc": 0.65,
+        "ho_auc": 0.63,
+        "bt_sharpe": 1.2,
+        "n_features": 10,
+        "overfit_report": None,
+        "model_path": "/tmp/test",
+    }
+    with patch("training.train_pipeline.main", return_value=mock_result) as m:
+        ret = main(["train"])
     assert ret == 0
+    m.assert_called_once()
 
 
 def test_experiment_no_action(capsys):
@@ -108,7 +123,6 @@ def test_all_subcommands_dispatch():
     # Commands that don't hit DB
     simple_commands = [
         ["feature", "validate", "x"],
-        ["train"],
         ["deploy", "promote", "x"],
         ["monitor", "drift"],
     ]
@@ -116,10 +130,21 @@ def test_all_subcommands_dispatch():
         ret = main(argv)
         assert ret == 0, f"Command {argv} returned {ret}"
 
-    # Commands that hit DB — mock the connection
+    # Commands that hit DB — mock at the right level
     con = MagicMock()
     con.execute.return_value.fetchall.return_value = []
     con.execute.return_value.fetchone.return_value = None
-    with patch("db.get_connection", return_value=con):
+    mock_result = {
+        "run_id": "test", "version": "v1", "cv_auc": 0.65,
+        "ho_auc": 0.63, "bt_sharpe": 1.0, "n_features": 5,
+        "overfit_report": None, "model_path": "/tmp/t",
+    }
+    with patch("db.get_data_coverage", return_value={}), \
+         patch("db.get_connection", return_value=con), \
+         patch("training.train_pipeline.main", return_value=mock_result):
+        ret = main(["data", "status"])
+        assert ret == 0
+        ret = main(["train"])
+        assert ret == 0
         ret = main(["experiment", "list"])
         assert ret == 0
