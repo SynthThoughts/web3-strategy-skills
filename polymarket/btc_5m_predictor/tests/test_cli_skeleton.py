@@ -117,9 +117,13 @@ def test_monitor_no_action(capsys):
 
 
 def test_monitor_drift(capsys):
-    """btc monitor drift returns 0 (stub)."""
-    ret = main(["monitor", "drift"])
-    assert ret == 0
+    """btc monitor drift dispatches (returns 1 when no model runs)."""
+    from unittest.mock import MagicMock, patch
+    con = MagicMock()
+    con.execute.return_value.fetchone.return_value = None
+    with patch("db.get_connection", return_value=con):
+        ret = main(["monitor", "drift"])
+    assert ret == 1  # no model runs found
 
 
 def test_all_subcommands_dispatch():
@@ -130,7 +134,7 @@ def test_all_subcommands_dispatch():
     simple_commands = [
         # feature validate needs mock — tested in test_cmd_feature.py
         ["deploy", "promote", "x"],
-        ["monitor", "drift"],
+        # monitor drift now hits DB — tested below with mocks
     ]
     for argv in simple_commands:
         ret = main(argv)
@@ -161,3 +165,8 @@ def test_all_subcommands_dispatch():
         assert ret == 0
         ret = main(["experiment", "list"])
         assert ret == 0
+        # monitor drift/retrain-check return 1 (no model runs) with mock
+        ret = main(["monitor", "drift"])
+        assert ret == 1
+        ret = main(["monitor", "retrain-check"])
+        assert ret == 1
