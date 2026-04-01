@@ -1023,10 +1023,24 @@ def main(
 
     # --- Sample range filtering ---
     if sample_start or sample_end:
-        if sample_start:
-            df_1m = df_1m[df_1m["open_time"] >= pd.Timestamp(sample_start, tz="UTC")]
-        if sample_end:
-            df_1m = df_1m[df_1m["open_time"] <= pd.Timestamp(sample_end, tz="UTC")]
+        ts_start = pd.Timestamp(sample_start, tz="UTC") if sample_start else None
+        ts_end = pd.Timestamp(sample_end, tz="UTC") if sample_end else None
+
+        def _filter_df(df, time_col="open_time"):
+            if df is None:
+                return None
+            out = df
+            if ts_start is not None:
+                out = out[out[time_col] >= ts_start]
+            if ts_end is not None:
+                out = out[out[time_col] <= ts_end]
+            return out.reset_index(drop=True)
+
+        df_1m = _filter_df(df_1m)
+        df_30m = _filter_df(df_30m)
+        df_4h = _filter_df(df_4h)
+        df_coinbase = _filter_df(df_coinbase)
+        df_eth = _filter_df(df_eth)
         print(f"  Filtered to {len(df_1m)} candles ({sample_start or '...'} → {sample_end or '...'})")
 
     # ===================================================================
@@ -1058,12 +1072,20 @@ def main(
             FEATURE_META = {}
 
         def _expand_names(names: list[str]) -> set[str]:
-            """Expand category names to individual feature names."""
+            """Expand category names to individual feature names.
+
+            Supports both FEATURE_META categories and FEATURE_CATEGORIES
+            lambda matchers.
+            """
             expanded = set()
-            categories = {m.get("category", "") for m in FEATURE_META.values() if m.get("category")}
+            meta_categories = {m.get("category", "") for m in FEATURE_META.values() if m.get("category")}
             for name in names:
-                if name in categories:
+                if name in meta_categories:
                     expanded |= {k for k, m in FEATURE_META.items() if m.get("category") == name}
+                elif name in FEATURE_CATEGORIES:
+                    # Match using FEATURE_CATEGORIES lambda
+                    matcher = FEATURE_CATEGORIES[name]
+                    expanded |= {c for c in all_feat_cols if matcher(c)}
                 else:
                     expanded.add(name)
             return expanded

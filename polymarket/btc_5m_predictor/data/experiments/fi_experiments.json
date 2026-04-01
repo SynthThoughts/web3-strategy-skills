@@ -1,0 +1,118 @@
+{
+  "experiment_group": "FI Feature Interaction",
+  "sample_start": "2026-03-01",
+  "sample_end": "2026-03-31",
+  "cv_params": {
+    "n_splits": 4,
+    "purge_gap": 12
+  },
+  "catboost_params": {
+    "depth": 3,
+    "iterations": 200,
+    "learning_rate": 0.05,
+    "early_stopping_rounds": 30,
+    "nan_mode": "Min",
+    "random_seed": 42
+  },
+  "n_samples": 6329,
+  "results": [
+    {
+      "experiment": "FI-baseline",
+      "features": [
+        "taker_vol_raw",
+        "price_vs_rvwap_60",
+        "cvd_slope_10",
+        "hour4_sin",
+        "vpt_sum_30"
+      ],
+      "n_features": 5,
+      "cv_auc_mean": 0.564375,
+      "cv_auc_std": 0.014146,
+      "delta_vs_baseline": 0.0,
+      "elapsed_s": 0.5
+    },
+    {
+      "experiment": "FI-1",
+      "features": [
+        "taker_vol_raw",
+        "price_vs_rvwap_60",
+        "cvd_slope_10",
+        "hour4_sin",
+        "vpt_sum_30",
+        "ix_mul_taker_cvd",
+        "ix_mul_taker_pvr",
+        "ix_mul_taker_vpt",
+        "ix_time_taker_h4sin"
+      ],
+      "n_features": 9,
+      "cv_auc_mean": 0.562139,
+      "cv_auc_std": 0.018795,
+      "delta_vs_baseline": -0.002236,
+      "elapsed_s": 0.3
+    },
+    {
+      "experiment": "FI-2",
+      "features": [
+        "taker_vol_raw",
+        "price_vs_rvwap_60",
+        "cvd_slope_10",
+        "hour4_sin",
+        "vpt_sum_30",
+        "ix_ratio_taker_cvd",
+        "ix_ratio_taker_vpt"
+      ],
+      "n_features": 7,
+      "cv_auc_mean": 0.56172,
+      "cv_auc_std": 0.013698,
+      "delta_vs_baseline": -0.002656,
+      "elapsed_s": 0.3
+    },
+    {
+      "experiment": "FI-3",
+      "features": [
+        "taker_vol_raw",
+        "price_vs_rvwap_60",
+        "cvd_slope_10",
+        "hour4_sin",
+        "vpt_sum_30",
+        "ix_mul_taker_cvd",
+        "ix_mul_taker_pvr",
+        "ix_mul_taker_vpt",
+        "ix_mul_cvd_pvr",
+        "ix_mul_pvr_vpt",
+        "ix_ratio_taker_cvd",
+        "ix_ratio_taker_vpt",
+        "ix_ratio_cvd_pvr",
+        "ix_cond_taker_cvdpos",
+        "ix_cond_taker_pvrpos",
+        "ix_cond_pvr_cvdpos",
+        "ix_time_taker_h4sin",
+        "ix_time_cvd_h4sin"
+      ],
+      "n_features": 18,
+      "cv_auc_mean": 0.563498,
+      "cv_auc_std": 0.01994,
+      "delta_vs_baseline": -0.000878,
+      "elapsed_s": 0.4
+    },
+    {
+      "experiment": "FI-4",
+      "features": [
+        "taker_vol_raw",
+        "price_vs_rvwap_60",
+        "cvd_slope_10",
+        "hour4_sin",
+        "vpt_sum_30",
+        "ix_cond_taker_cvdpos",
+        "ix_cond_taker_pvrpos",
+        "ix_cond_pvr_cvdpos"
+      ],
+      "n_features": 8,
+      "cv_auc_mean": 0.562151,
+      "cv_auc_std": 0.014088,
+      "delta_vs_baseline": -0.002224,
+      "elapsed_s": 0.4
+    }
+  ],
+  "total_elapsed_s": 1.8
+}
