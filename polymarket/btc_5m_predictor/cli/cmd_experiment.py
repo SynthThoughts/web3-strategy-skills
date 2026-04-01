@@ -119,6 +119,7 @@ _METRIC_COLS = [
     ("cv_std_auc", "CV Std", ".4f"),
     ("cv_mean_acc", "CV Acc", ".4f"),
     ("cv_mean_brier", "CV Brier", ".4f"),
+    ("ho_auc", "HO AUC", ".4f"),
     ("bt_sharpe", "Sharpe", ".3f"),
     ("bt_win_rate", "Win Rate", ".1%"),
     ("bt_total_pnl", "Total PnL", ".2f"),
@@ -236,7 +237,7 @@ def _explain(run_id: str, with_slice: bool) -> int:
     con = get_connection(read_only=True)
     try:
         row = con.execute(
-            "SELECT version, feature_set FROM model_runs WHERE run_id = ?",
+            "SELECT model_path, feature_set FROM model_runs WHERE run_id = ?",
             [run_id],
         ).fetchone()
     finally:
@@ -246,7 +247,7 @@ def _explain(run_id: str, with_slice: bool) -> int:
         print(f"Error: run_id '{run_id}' not found")
         return 1
 
-    version, feature_set_raw = row[0], row[1]
+    model_path_str, feature_set_raw = row[0], row[1]
 
     # Resolve feature list
     if isinstance(feature_set_raw, str):
@@ -258,7 +259,7 @@ def _explain(run_id: str, with_slice: bool) -> int:
         return 1
 
     # Find model file
-    model_dir = Path(f"models/{version}")
+    model_dir = Path(model_path_str or f"models/{run_id}")
     model_path = model_dir / "model.cbm"
     if not model_path.exists():
         print(f"Error: model file not found at {model_path}")

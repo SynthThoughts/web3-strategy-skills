@@ -91,15 +91,15 @@ def test_experiment_list_sort_by(capsys):
 
 def test_experiment_compare_both_exist(capsys):
     """btc experiment compare outputs metrics diff table."""
-    # _METRIC_COLS has 14 entries, plus 7 extra cols = 21 total
+    # _METRIC_COLS has 15 entries, plus 7 extra cols = 22 total
     row_data = [
-        0.65, 0.02, 0.60, 0.25, 1.2, 0.55, 40.0, -10.0, 1.5, 100,
-        0.70, 0.05, 0.03, 0.02,  # metric cols (14)
+        0.65, 0.02, 0.60, 0.25, 0.63, 1.2, 0.55, 40.0, -10.0, 1.5, 100,
+        0.70, 0.05, 0.03, 0.02,  # metric cols (15)
         80, 1000, "Logloss", "AUC", None, None,  # extra (n_features, n_samples, loss, eval, feature_set, best_params)
         datetime(2026, 3, 30, tzinfo=timezone.utc),  # created_at
     ]
     row_data2 = [
-        0.68, 0.01, 0.63, 0.22, 1.5, 0.58, 55.0, -8.0, 1.8, 120,
+        0.68, 0.01, 0.63, 0.22, 0.66, 1.5, 0.58, 55.0, -8.0, 1.8, 120,
         0.72, 0.04, 0.02, 0.01,
         85, 1200, "Logloss", "AUC", None, None,
         datetime(2026, 3, 31, tzinfo=timezone.utc),
@@ -148,7 +148,7 @@ def test_experiment_compare_missing_run(capsys):
 def test_experiment_compare_json(capsys):
     """btc experiment compare --json outputs valid JSON."""
     row_data = [
-        0.65, 0.02, 0.60, 0.25, 1.2, 0.55, 40.0, -10.0, 1.5, 100,
+        0.65, 0.02, 0.60, 0.25, 0.63, 1.2, 0.55, 40.0, -10.0, 1.5, 100,
         0.70, 0.05, 0.03, 0.02,
         80, 1000, "Logloss", "AUC", None, None,
         datetime(2026, 3, 30, tzinfo=timezone.utc),

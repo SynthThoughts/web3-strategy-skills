@@ -106,6 +106,7 @@ FEATURE_CATEGORIES = {
     "time":               lambda c: any(c.startswith(p) for p in (
         "hour_", "dow_", "is_", "session_",
     )),
+    "interaction":        lambda c: c.startswith("ix_"),
 }
 
 
@@ -1309,6 +1310,7 @@ def main(
             "bt_win_rate": float(primary_trades["correct"].mean()) if not primary_trades.empty else 0.0,
             "bt_total_pnl": primary_trades["pnl"].sum() if not primary_trades.empty else 0.0,
             "bt_max_drawdown": float((primary_trades["pnl"].cumsum() - primary_trades["pnl"].cumsum().cummax()).min()) if not primary_trades.empty else 0.0,
+            "ho_auc": _ho_auc,
             "bt_sharpe": bt_sharpe,
             "bt_profit_factor": float(primary_trades[primary_trades["correct"]]["pnl"].sum() / (abs(primary_trades[~primary_trades["correct"]]["pnl"].sum()) + 1e-10)) if not primary_trades.empty else 0.0,
             "model_path": str(version_dir),

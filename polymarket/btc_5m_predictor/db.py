@@ -475,6 +475,7 @@ def init_db() -> None:
             "overfit_train_cv_gap": "DOUBLE",
             "overfit_cv_ho_gap": "DOUBLE",
             "cv_fold_std": "DOUBLE",
+            "ho_auc": "DOUBLE",
         }
         for col, dtype in _new_model_run_cols.items():
             try:
@@ -1232,6 +1233,7 @@ def insert_model_run(run: dict, run_id: str | None = None) -> str:
             "overfit_train_cv_gap": run.get("overfit_train_cv_gap"),
             "overfit_cv_ho_gap": run.get("overfit_cv_ho_gap"),
             "cv_fold_std": run.get("cv_fold_std"),
+            "ho_auc": run.get("ho_auc"),
         }
 
         # Only INSERT columns that have non-None values
