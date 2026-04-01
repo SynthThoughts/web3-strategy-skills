@@ -1,0 +1,34 @@
+{
+  "version": "v15_20260401",
+  "created_at": "2026-04-01T03:52:57.115447+00:00",
+  "dual_model": true,
+  "base_model_features": [
+    "cvd_slope_10",
+    "hour4_sin",
+    "skew_30",
+    "trix_30",
+    "vpt_sum_30",
+    "mfi_14",
+    "rally_30",
+    "price_vs_rvwap_60",
+    "macd_signal"
+  ],
+  "enhanced_model_features": [
+    "cvd_slope_10",
+    "hour4_sin",
+    "skew_30",
+    "trix_30",
+    "vpt_sum_30",
+    "mfi_14",
+    "rally_30",
+    "price_vs_rvwap_60",
+    "macd_signal",
+    "taker_vol_raw"
+  ],
+  "n_base_features": 9,
+  "n_enhanced_features": 10,
+  "n_futures_in_enhanced": 1,
+  "source_hashes": {
+    "features.py": "b3b33819d62282f0"
+  }
+}

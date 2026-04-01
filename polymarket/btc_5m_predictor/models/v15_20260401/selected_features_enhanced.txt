@@ -1,0 +1,10 @@
+cvd_slope_10
+hour4_sin
+skew_30
+trix_30
+vpt_sum_30
+mfi_14
+rally_30
+price_vs_rvwap_60
+macd_signal
+taker_vol_raw
