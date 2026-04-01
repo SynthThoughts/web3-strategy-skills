@@ -1520,6 +1520,10 @@ def _calc_balanced_deposit(
         log("  Balance check failed after swap")
         return None
 
+    if new_usdc <= usdc_bal + 1:
+        log(f"  Swap may have reverted (USDC unchanged: {new_usdc:.2f}) — falling back to USDC-base")
+        return _calc_entry_usdc_base(new_usdc, tick_lower, tick_upper)
+
     new_available = new_eth - GAS_RESERVE_ETH
     if new_available < 0:
         new_available = 0
@@ -1554,7 +1558,37 @@ def _calc_balanced_deposit(
 def _calc_entry_usdc_base(
     usdc_bal: float, tick_lower: int, tick_upper: int,
 ) -> str | None:
-    """Fallback: use USDC as input token for calculate-entry."""
+    """Fallback: swap remaining ETH → USDC, then use total USDC as input."""
+    # Check if there's ETH worth swapping
+    eth_bal, _, _ = get_balances(force=True)
+    available_eth = eth_bal - GAS_RESERVE_ETH
+    price = get_eth_price()
+
+    if available_eth > 0 and price > 0:
+        eth_usd_value = available_eth * price
+        if eth_usd_value >= MIN_TRADE_USD:
+            # Swap all available ETH to USDC (keep gas reserve)
+            swap_eth_wei = int(available_eth * 0.95 * (10 ** TOKEN0["decimals"]))
+            log(f"  USDC-base: swapping {available_eth * 0.95:.6f} ETH (~${eth_usd_value * 0.95:.2f}) → USDC")
+            tx_hash, fail = execute_swap(NATIVE_TOKEN, USDC_ADDR, swap_eth_wei, price)
+            if tx_hash:
+                # Wait for swap to settle
+                for wait in [10, 10, 10]:
+                    time.sleep(wait)
+                    _, new_usdc, bal_fail = get_balances(force=True)
+                    if not bal_fail and new_usdc > usdc_bal + 1:
+                        usdc_bal = new_usdc
+                        log(f"  USDC-base: swap settled, total USDC={usdc_bal:.2f}")
+                        break
+                    log(f"  USDC-base: waiting for swap (USDC={new_usdc:.2f})")
+                else:
+                    log("  USDC-base: swap may not have settled, proceeding with current balance")
+                    _, new_usdc, _ = get_balances(force=True)
+                    if new_usdc > usdc_bal:
+                        usdc_bal = new_usdc
+            else:
+                log(f"  USDC-base: ETH swap failed ({fail}), proceeding with USDC only")
+
     usdc_amount = int(usdc_bal * 0.90 * (10 ** TOKEN1["decimals"]))
     calculated = defi_calculate_entry(
         input_token=USDC_ADDR,
@@ -1640,14 +1674,29 @@ def execute_rebalance(
             "_redeemed_from": token_id,
         }
         save_state(state)
-        time.sleep(3)
+
+        # Wait for redeem funds to arrive — poll until balance increases or timeout
+        pre_eth, pre_usdc, _ = get_balances(force=True)
+        log(f"  Pre-redeem balances: ETH={pre_eth:.6f} USDC={pre_usdc:.2f}")
+        for poll_i, poll_wait in enumerate([5, 8, 10, 12, 15, 15], 1):
+            time.sleep(poll_wait)
+            post_eth, post_usdc, post_fail = get_balances(force=True)
+            if post_fail:
+                log(f"  Redeem poll {poll_i}: balance query failed, retrying...")
+                continue
+            gained = (post_eth - pre_eth) * price + (post_usdc - pre_usdc)
+            if gained > MIN_TRADE_USD:
+                log(f"  Redeem funds arrived (poll {poll_i}): ETH={post_eth:.6f} USDC={post_usdc:.2f} (+${gained:.2f})")
+                break
+            log(f"  Redeem poll {poll_i}: ETH={post_eth:.6f} USDC={post_usdc:.2f} (gained ${gained:.2f}, waiting...)")
+        else:
+            log("  Redeem funds not detected after 65s — proceeding with current balances")
 
     # Step 3: Get current balances after redeem (force refresh to bypass cache)
     eth_bal, usdc_bal, bal_failed = get_balances(force=True)
     if bal_failed:
         log("  Balance query failed after redeem — funds may be idle")
-        # Don't crash, but try to continue with what we have
-        time.sleep(5)
+        time.sleep(10)
         eth_bal, usdc_bal, bal_failed = get_balances(force=True)
         if bal_failed:
             log("  Balance still unavailable — aborting, funds sitting idle in wallet")
