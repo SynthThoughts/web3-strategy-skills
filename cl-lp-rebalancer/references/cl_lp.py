@@ -1460,102 +1460,218 @@ def _calc_balanced_deposit(
     tick_lower: int,
     tick_upper: int,
 ) -> str | None:
-    """Calculate deposit amounts, pre-swapping ETH↔USDC if ratio is unbalanced.
+    """Calculate deposit amounts, pre-swapping ETH↔USDC to maximize utilization.
+
+    Strategy:
+      1. Probe ratio with a small ETH amount to discover the target ETH:USDC split.
+      2. Compute how much to swap so that total funds match the target ratio.
+      3. Execute swap, then call calculate-entry with the larger side as input.
 
     Returns JSON string for defi_deposit --user-input, or None on failure.
     """
-    deposit_eth_wei = int(available_eth * 0.95 * (10 ** TOKEN0["decimals"]))
+    total_usd = available_eth * price + usdc_bal
+    if total_usd < MIN_TRADE_USD:
+        log(f"  Total balance too low: ${total_usd:.2f}")
+        return None
 
-    # First call: probe the ratio using ETH as input
+    # ── Step 1: Probe ratio with a small amount ──────────────────────────────
+    # Use $20 worth of ETH (or all available if less) just to discover the ratio.
+    probe_eth = min(available_eth * 0.95, max(20.0 / price, 0.001))
+    probe_eth_wei = int(probe_eth * (10 ** TOKEN0["decimals"]))
+
     calculated = defi_calculate_entry(
         input_token=NATIVE_TOKEN,
-        input_amount=str(deposit_eth_wei),
+        input_amount=str(probe_eth_wei),
         token_decimal=TOKEN0["decimals"],
         tick_lower=tick_lower,
         tick_upper=tick_upper,
     )
     if not calculated or not isinstance(calculated, list):
-        log("  calculate-entry failed")
-        return None
+        log("  Ratio probe failed — falling back to USDC-base")
+        return _calc_entry_usdc_base(usdc_bal, tick_lower, tick_upper)
 
-    # Check if USDC needed exceeds wallet balance
-    usdc_needed = 0.0
+    # Parse the returned amounts to determine ratio
+    probe_eth_amt, probe_usdc_amt = 0.0, 0.0
     for item in calculated:
         addr = item.get("tokenAddress", "").lower()
         if addr == USDC_ADDR.lower():
-            usdc_needed = float(item.get("coinAmount", 0)) / (10 ** TOKEN1["decimals"])
-            break
+            probe_usdc_amt = float(item.get("coinAmount", 0)) / (10 ** TOKEN1["decimals"])
+        elif addr in (NATIVE_TOKEN.lower(), ETH_ADDR.lower()):
+            probe_eth_amt = float(item.get("coinAmount", 0)) / (10 ** TOKEN0["decimals"])
 
-    if usdc_needed <= usdc_bal * 0.98:
-        # Wallet has enough USDC — use as-is
-        log(f"  Ratio OK: need {usdc_needed:.2f} USDC, have {usdc_bal:.2f}")
-        return json.dumps(calculated)
+    probe_eth_usd = probe_eth_amt * price
+    probe_total = probe_eth_usd + probe_usdc_amt
+    if probe_total < 0.01:
+        log("  Probe returned zero amounts — falling back to USDC-base")
+        return _calc_entry_usdc_base(usdc_bal, tick_lower, tick_upper)
 
-    # Need to swap some ETH → USDC to balance
-    usdc_gap = usdc_needed - usdc_bal
-    # Swap enough ETH to cover the gap + 3% buffer for slippage/fees
-    swap_eth = usdc_gap / price * 1.03
-    if swap_eth > available_eth * 0.9:
-        # Safety: don't swap more than 90% of available ETH
-        swap_eth = available_eth * 0.45  # swap roughly half
-    swap_eth_wei = int(swap_eth * (10 ** TOKEN0["decimals"]))
-    log(f"  Pre-swap: {swap_eth:.6f} ETH → USDC (need {usdc_needed:.2f}, have {usdc_bal:.2f})")
+    # Target ratio: what fraction of total value should be in ETH
+    eth_ratio = probe_eth_usd / probe_total  # e.g. 0.3 means 30% ETH, 70% USDC
+    usdc_ratio = 1.0 - eth_ratio
+    log(f"  Ratio probe: ETH={eth_ratio:.1%} USDC={usdc_ratio:.1%} (from {probe_eth:.6f} ETH → need {probe_usdc_amt:.2f} USDC)")
 
-    tx_hash, fail = execute_swap(NATIVE_TOKEN, USDC_ADDR, swap_eth_wei, price)
-    if not tx_hash:
-        log(f"  Pre-swap failed: {fail}")
-        return None
-    log(f"  Pre-swap OK: {tx_hash}")
+    # ── Step 2: Calculate target allocation ──────────────────────────────────
+    # Use 95% of total to leave room for slippage and gas
+    usable_usd = total_usd * 0.95
+    target_eth_usd = usable_usd * eth_ratio
+    target_usdc = usable_usd * usdc_ratio
 
-    # Wait for swap to settle, then re-check balances with retry
-    new_eth, new_usdc, bal_failed = 0.0, usdc_bal, True
-    for wait in [12, 10, 10]:
-        time.sleep(wait)
-        new_eth, new_usdc, bal_failed = get_balances(force=True)
-        if not bal_failed and new_usdc > usdc_bal + 1:
-            # USDC increased — swap reflected
-            break
-        log(f"  Waiting for swap to reflect (USDC={new_usdc:.2f}, was {usdc_bal:.2f})")
-    if bal_failed:
-        log("  Balance check failed after swap")
-        return None
+    current_eth_usd = available_eth * price
+    current_usdc = usdc_bal
 
-    new_available = new_eth - GAS_RESERVE_ETH
-    if new_available < 0:
-        new_available = 0
-    log(f"  Post-swap balances: ETH={new_eth:.6f} USDC={new_usdc:.2f}")
+    log(f"  Target: ETH=${target_eth_usd:.2f} USDC=${target_usdc:.2f} | Current: ETH=${current_eth_usd:.2f} USDC=${current_usdc:.2f}")
 
-    # Recalculate with updated ETH balance
-    new_eth_wei = int(new_available * 0.95 * (10 ** TOKEN0["decimals"]))
-    recalculated = defi_calculate_entry(
-        input_token=NATIVE_TOKEN,
-        input_amount=str(new_eth_wei),
-        token_decimal=TOKEN0["decimals"],
+    # ── Step 3: Swap to reach target ratio ───────────────────────────────────
+    swap_needed = False
+    if target_usdc > current_usdc + 1:
+        # Need more USDC — sell ETH
+        swap_usd = target_usdc - current_usdc
+        swap_eth = swap_usd / price * 1.02  # 2% buffer for slippage
+        # Safety: never swap more than what's available minus gas reserve
+        max_swap = available_eth * 0.92
+        if swap_eth > max_swap:
+            swap_eth = max_swap
+        if swap_eth * price >= MIN_TRADE_USD:
+            swap_needed = True
+            swap_eth_wei = int(swap_eth * (10 ** TOKEN0["decimals"]))
+            log(f"  Swap: {swap_eth:.6f} ETH → USDC (${swap_eth * price:.2f})")
+            tx_hash, fail = execute_swap(NATIVE_TOKEN, USDC_ADDR, swap_eth_wei, price)
+            if not tx_hash:
+                log(f"  Swap failed: {fail} — falling back to USDC-base")
+                return _calc_entry_usdc_base(usdc_bal, tick_lower, tick_upper)
+            log(f"  Swap OK: {tx_hash}")
+    elif target_eth_usd > current_eth_usd + 1:
+        # Need more ETH — sell USDC
+        swap_usdc = target_eth_usd - current_eth_usd
+        swap_usdc *= 1.02  # 2% buffer
+        max_swap_usdc = current_usdc * 0.92
+        if swap_usdc > max_swap_usdc:
+            swap_usdc = max_swap_usdc
+        if swap_usdc >= MIN_TRADE_USD:
+            swap_needed = True
+            swap_usdc_raw = int(swap_usdc * (10 ** TOKEN1["decimals"]))
+            log(f"  Swap: {swap_usdc:.2f} USDC → ETH")
+            tx_hash, fail = execute_swap(USDC_ADDR, NATIVE_TOKEN, swap_usdc_raw, price)
+            if not tx_hash:
+                log(f"  Swap failed: {fail} — falling back to USDC-base")
+                return _calc_entry_usdc_base(usdc_bal, tick_lower, tick_upper)
+            log(f"  Swap OK: {tx_hash}")
+
+    # ── Step 4: Wait for swap and get fresh balances ─────────────────────────
+    if swap_needed:
+        new_eth, new_usdc, bal_failed = 0.0, usdc_bal, True
+        for wait in [12, 10, 10]:
+            time.sleep(wait)
+            new_eth, new_usdc, bal_failed = get_balances(force=True)
+            if not bal_failed and (new_usdc != usdc_bal or new_eth != available_eth + GAS_RESERVE_ETH):
+                break
+            log(f"  Waiting for swap to reflect (ETH={new_eth:.6f} USDC={new_usdc:.2f})")
+        if bal_failed:
+            log("  Balance check failed after swap")
+            return None
+        available_eth = max(new_eth - GAS_RESERVE_ETH, 0)
+        usdc_bal = new_usdc
+        log(f"  Post-swap: ETH={available_eth:.6f} USDC={usdc_bal:.2f}")
+    else:
+        log("  No swap needed — ratio already balanced")
+
+    # ── Step 5: Final calculate-entry using the larger-value side as input ───
+    eth_usd_val = available_eth * price
+    if eth_usd_val >= usdc_bal:
+        # Use ETH as input
+        final_eth_wei = int(available_eth * 0.95 * (10 ** TOKEN0["decimals"]))
+        final = defi_calculate_entry(
+            input_token=NATIVE_TOKEN,
+            input_amount=str(final_eth_wei),
+            token_decimal=TOKEN0["decimals"],
+            tick_lower=tick_lower,
+            tick_upper=tick_upper,
+        )
+        if final and isinstance(final, list):
+            # Verify USDC side fits
+            for item in final:
+                addr = item.get("tokenAddress", "").lower()
+                if addr == USDC_ADDR.lower():
+                    needed = float(item.get("coinAmount", 0)) / (10 ** TOKEN1["decimals"])
+                    if needed <= usdc_bal * 1.01:
+                        log(f"  Final deposit (ETH-base): ETH-input={available_eth * 0.95:.6f}, USDC-needed={needed:.2f}")
+                        return json.dumps(final)
+                    log(f"  USDC short after swap ({needed:.2f} > {usdc_bal:.2f}) — trying USDC-base")
+                    break
+    # Use USDC as input (either larger or ETH-base didn't fit)
+    usdc_amount = int(usdc_bal * 0.95 * (10 ** TOKEN1["decimals"]))
+    final = defi_calculate_entry(
+        input_token=USDC_ADDR,
+        input_amount=str(usdc_amount),
+        token_decimal=TOKEN1["decimals"],
         tick_lower=tick_lower,
         tick_upper=tick_upper,
     )
-    if recalculated and isinstance(recalculated, list):
-        # Verify USDC fits now
-        for item in recalculated:
+    if final and isinstance(final, list):
+        # Verify ETH side fits
+        for item in final:
             addr = item.get("tokenAddress", "").lower()
-            if addr == USDC_ADDR.lower():
-                new_usdc_needed = float(item.get("coinAmount", 0)) / (10 ** TOKEN1["decimals"])
-                if new_usdc_needed > new_usdc:
-                    log(f"  Still short on USDC after swap ({new_usdc_needed:.2f} > {new_usdc:.2f})")
-                    # Last resort: use USDC as input
-                    return _calc_entry_usdc_base(new_usdc, tick_lower, tick_upper)
+            if addr in (NATIVE_TOKEN.lower(), ETH_ADDR.lower()):
+                needed_eth = float(item.get("coinAmount", 0)) / (10 ** TOKEN0["decimals"])
+                if needed_eth <= available_eth * 1.01:
+                    log(f"  Final deposit (USDC-base): USDC-input={usdc_bal * 0.95:.2f}, ETH-needed={needed_eth:.6f}")
+                    return json.dumps(final)
+                log(f"  ETH short ({needed_eth:.6f} > {available_eth:.6f}) — reducing USDC input")
                 break
-        return json.dumps(recalculated)
+        # ETH doesn't fit — reduce USDC input proportionally
+        if available_eth > 0 and needed_eth > 0:
+            scale = available_eth / needed_eth * 0.95
+            reduced_usdc = int(usdc_bal * 0.95 * scale * (10 ** TOKEN1["decimals"]))
+            final = defi_calculate_entry(
+                input_token=USDC_ADDR,
+                input_amount=str(reduced_usdc),
+                token_decimal=TOKEN1["decimals"],
+                tick_lower=tick_lower,
+                tick_upper=tick_upper,
+            )
+            if final and isinstance(final, list):
+                log(f"  Final deposit (reduced USDC-base): scale={scale:.2f}")
+                return json.dumps(final)
 
-    log("  Recalculate-entry failed after swap")
-    return _calc_entry_usdc_base(new_usdc, tick_lower, tick_upper)
+    log("  All deposit calculation attempts failed")
+    return None
 
 
 def _calc_entry_usdc_base(
     usdc_bal: float, tick_lower: int, tick_upper: int,
 ) -> str | None:
-    """Fallback: use USDC as input token for calculate-entry."""
-    usdc_amount = int(usdc_bal * 0.90 * (10 ** TOKEN1["decimals"]))
+    """Fallback: swap remaining ETH → USDC, then use total USDC as input."""
+    # Check if there's ETH worth swapping
+    eth_bal, _, _ = get_balances(force=True)
+    available_eth = eth_bal - GAS_RESERVE_ETH
+    price = get_eth_price()
+
+    if available_eth > 0 and price > 0:
+        eth_usd_value = available_eth * price
+        if eth_usd_value >= MIN_TRADE_USD:
+            # Swap all available ETH to USDC (keep gas reserve)
+            swap_eth_wei = int(available_eth * 0.95 * (10 ** TOKEN0["decimals"]))
+            log(f"  USDC-base: swapping {available_eth * 0.95:.6f} ETH (~${eth_usd_value * 0.95:.2f}) → USDC")
+            tx_hash, fail = execute_swap(NATIVE_TOKEN, USDC_ADDR, swap_eth_wei, price)
+            if tx_hash:
+                # Wait for swap to settle
+                for wait in [10, 10, 10]:
+                    time.sleep(wait)
+                    _, new_usdc, bal_fail = get_balances(force=True)
+                    if not bal_fail and new_usdc > usdc_bal + 1:
+                        usdc_bal = new_usdc
+                        log(f"  USDC-base: swap settled, total USDC={usdc_bal:.2f}")
+                        break
+                    log(f"  USDC-base: waiting for swap (USDC={new_usdc:.2f})")
+                else:
+                    log("  USDC-base: swap may not have settled, proceeding with current balance")
+                    _, new_usdc, _ = get_balances(force=True)
+                    if new_usdc > usdc_bal:
+                        usdc_bal = new_usdc
+            else:
+                log(f"  USDC-base: ETH swap failed ({fail}), proceeding with USDC only")
+
+    usdc_amount = int(usdc_bal * 0.95 * (10 ** TOKEN1["decimals"]))
     calculated = defi_calculate_entry(
         input_token=USDC_ADDR,
         input_amount=str(usdc_amount),
@@ -1640,14 +1756,29 @@ def execute_rebalance(
             "_redeemed_from": token_id,
         }
         save_state(state)
-        time.sleep(3)
+
+        # Wait for redeem funds to arrive — poll until balance increases or timeout
+        pre_eth, pre_usdc, _ = get_balances(force=True)
+        log(f"  Pre-redeem balances: ETH={pre_eth:.6f} USDC={pre_usdc:.2f}")
+        for poll_i, poll_wait in enumerate([5, 8, 10, 12, 15, 15], 1):
+            time.sleep(poll_wait)
+            post_eth, post_usdc, post_fail = get_balances(force=True)
+            if post_fail:
+                log(f"  Redeem poll {poll_i}: balance query failed, retrying...")
+                continue
+            gained = (post_eth - pre_eth) * price + (post_usdc - pre_usdc)
+            if gained > MIN_TRADE_USD:
+                log(f"  Redeem funds arrived (poll {poll_i}): ETH={post_eth:.6f} USDC={post_usdc:.2f} (+${gained:.2f})")
+                break
+            log(f"  Redeem poll {poll_i}: ETH={post_eth:.6f} USDC={post_usdc:.2f} (gained ${gained:.2f}, waiting...)")
+        else:
+            log("  Redeem funds not detected after 65s — proceeding with current balances")
 
     # Step 3: Get current balances after redeem (force refresh to bypass cache)
     eth_bal, usdc_bal, bal_failed = get_balances(force=True)
     if bal_failed:
         log("  Balance query failed after redeem — funds may be idle")
-        # Don't crash, but try to continue with what we have
-        time.sleep(5)
+        time.sleep(10)
         eth_bal, usdc_bal, bal_failed = get_balances(force=True)
         if bal_failed:
             log("  Balance still unavailable — aborting, funds sitting idle in wallet")
