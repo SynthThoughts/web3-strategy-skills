@@ -519,6 +519,30 @@ def get_balances(force: bool = False) -> tuple[float, float, bool]:
                     eth = float(token.get("balance", "0"))
                 elif token.get("tokenAddress", "").lower() == USDC_ADDR.lower():
                     usdc = float(token.get("balance", "0"))
+
+    # `wallet balance` on Base does not return native ETH (only ERC20s).
+    # Fall back to `portfolio token-balances` for the native asset so the
+    # strategy doesn't undercount its own gas balance.
+    if eth == 0.0 and WALLET_ADDR:
+        nat = onchainos_cmd(
+            [
+                "portfolio",
+                "token-balances",
+                "--address",
+                WALLET_ADDR,
+                "--tokens",
+                f"{CHAIN_ID}:",
+            ],
+            timeout=10,
+        )
+        try:
+            for entry in (nat or {}).get("data", []):
+                for token in entry.get("tokenAssets", []):
+                    if token.get("symbol") == "ETH" and not token.get("tokenContractAddress"):
+                        eth = float(token.get("balance", "0"))
+                        break
+        except (TypeError, ValueError) as e:
+            log(f"Native ETH fallback parse failed: {e}")
     return eth, usdc, False
 
 
