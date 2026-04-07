@@ -1921,6 +1921,20 @@ def execute_rebalance(
     state["rebalance_history"] = rebalances
     state["stats"]["total_rebalances"] = state["stats"].get("total_rebalances", 0) + 1
 
+    # Reset trailing-stop baseline after rebalance: the old peak belongs to the
+    # previous position (different cost basis after swap+slippage). Carrying it
+    # forward causes false trailing-stop triggers when the new position is fine.
+    try:
+        post_eth, post_usdc, _ = get_balances(force=True)
+        post_lp = get_position_detail(new_token_id).get("value", 0.0) if new_token_id else 0.0
+        post_total = post_eth * rebal_price + post_usdc + post_lp
+        if post_total > 0:
+            state["stats"]["portfolio_peak_usd"] = round(post_total, 2)
+            state["_value_history"] = [round(post_total, 2)]
+            log(f"  Peak reset after rebalance: ${post_total:.2f}")
+    except Exception as e:
+        log(f"  Peak reset skipped: {e}")
+
     log(
         f"  Rebalance complete: [{new_tick_lower},{new_tick_upper}] "
         f"(${new_range['lower_price']:.2f}-${new_range['upper_price']:.2f}) "
@@ -3656,12 +3670,20 @@ def resume_trading():
     # Reset failure counters and resume log on manual resume
     state["_consecutive_deposit_failures"] = 0
     state["_auto_resume_log"] = []
-    # Reset peak to current portfolio to prevent immediate re-trigger
+    # Reset peak to current portfolio (wallet + LP) to prevent immediate re-trigger
     eth_bal, usdc_bal, _ = get_balances(force=True)
     price = get_eth_price()
     if price:
-        current_usd = eth_bal * price + usdc_bal
+        lp_value = 0.0
+        position = state.get("position") or {}
+        if position.get("token_id"):
+            try:
+                lp_value = get_position_detail(position["token_id"]).get("value", 0.0)
+            except Exception:
+                lp_value = 0.0
+        current_usd = eth_bal * price + usdc_bal + lp_value
         state.setdefault("stats", {})["portfolio_peak_usd"] = round(current_usd, 2)
+        state["_value_history"] = [round(current_usd, 2)]
     save_state(state)
     log(f"Trading resumed (was: {old_trigger})")
     emit(
