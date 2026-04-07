@@ -825,9 +825,9 @@ def tick_to_price(tick: int) -> float:
 def classify_volatility(atr_pct: float) -> str:
     if atr_pct < 1.5:
         return "low"
-    elif atr_pct < 3.0:
-        return "medium"
     elif atr_pct < 5.0:
+        return "medium"
+    elif atr_pct < 8.0:
         return "high"
     else:
         return "extreme"
