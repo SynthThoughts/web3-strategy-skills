@@ -2085,16 +2085,51 @@ class CrossFundingEngine:
         HL tiered margin is strict for small coins; auto-halves size on retry (max 3x).
         Multi-position: appends to positions array. Checks duplicates and max slots.
         """
+        _append_trade_log("open_request", {"coin": coin, "direction": direction})
         state = self._load()
         positions = state.get("positions", [])
 
-        # Guard: duplicate coin
+        # Guard: blocked coin
+        blocked = set(state.get("blocked_coins", []))
+        if coin in blocked:
+            emit(
+                "warn",
+                {"msg": f"{coin} is blocked, skip open", "blocked_coins": sorted(blocked)},
+            )
+            return False
+
+        # Guard: duplicate coin in state
         occupied = {p["coin"] for p in positions}
         if coin in occupied:
             emit(
                 "warn",
                 {"msg": f"already has position in {coin}, skip open"},
             )
+            return False
+
+        # Guard: real exchange pre-check — refuse if either leg already has a position
+        try:
+            hl_pre = self.hl.get_position(coin)
+        except Exception as e:
+            emit_error("open_precheck_hl", e, notify=True)
+            return False
+        try:
+            bn_pre = self.bn.get_position(coin)
+        except Exception as e:
+            emit_error("open_precheck_bn", e, notify=True)
+            return False
+        if (hl_pre and abs(hl_pre.get("size", 0)) > 0) or (
+            bn_pre and abs(bn_pre.get("size", 0)) > 0
+        ):
+            emit_error(
+                "open_precheck",
+                RuntimeError(
+                    f"refuse to open {coin}: exchange already has position "
+                    f"(hl={hl_pre}, bn={bn_pre})"
+                ),
+                notify=True,
+            )
+            _add_blocked_coin(coin, "open_precheck: exchange position exists")
             return False
 
         # Guard: max positions
@@ -2350,6 +2385,17 @@ class CrossFundingEngine:
             notify=True,
             tier="trade_alert",
         )
+        _append_trade_log(
+            "open_response",
+            {
+                "coin": coin,
+                "direction": direction,
+                "size": size,
+                "entry_price": price,
+                "hl_rate": hl_rate,
+                "bn_rate": bn_rate,
+            },
+        )
         return True
 
     # ---- Close position ----
@@ -2366,6 +2412,7 @@ class CrossFundingEngine:
             return False
 
     def close_position(self, coin: str) -> bool:
+        _append_trade_log("close_request", {"coin": coin})
         state = self._load()
         positions = state.get("positions", [])
 
@@ -2394,20 +2441,35 @@ class CrossFundingEngine:
 
         short_ok = False
         long_ok = False
+        short_resp = None
+        long_resp = None
 
         try:
-            short_client.close_position(coin)
+            short_resp = short_client.close_position(coin)
         except Exception as e:
             emit_error("close_short", e)
         time.sleep(1)
         short_ok = self._verify_leg_closed(short_client, coin)
 
         try:
-            long_client.close_position(coin)
+            long_resp = long_client.close_position(coin)
         except Exception as e:
             emit_error("close_long", e)
         time.sleep(1)
         long_ok = self._verify_leg_closed(long_client, coin)
+
+        _append_trade_log(
+            "close_response",
+            {
+                "coin": coin,
+                "short_exchange": short_ex,
+                "long_exchange": long_ex,
+                "short_resp": short_resp,
+                "long_resp": long_resp,
+                "short_ok": short_ok,
+                "long_ok": long_ok,
+            },
+        )
 
         if not short_ok or not long_ok:
             failed_legs = []
@@ -2415,6 +2477,19 @@ class CrossFundingEngine:
                 failed_legs.append(f"short({short_ex})")
             if not long_ok:
                 failed_legs.append(f"long({long_ex})")
+            # Block this coin from further tick processing until human intervention
+            _add_blocked_coin(
+                coin,
+                f"close_incomplete: failed_legs={failed_legs}",
+            )
+            emit_error(
+                "close_incomplete",
+                RuntimeError(
+                    f"close failed for {coin}: failed_legs={failed_legs}; "
+                    f"coin added to blocked_coins; MANUAL INTERVENTION REQUIRED"
+                ),
+                notify=True,
+            )
             emit(
                 "close_incomplete",
                 {
@@ -2422,12 +2497,13 @@ class CrossFundingEngine:
                     "failed_legs": failed_legs,
                     "short_closed": short_ok,
                     "long_closed": long_ok,
+                    "blocked": True,
                 },
                 notify=True,
                 tier="risk_alert",
             )
-            # Do NOT remove from state — position needs manual intervention
-            # or will be retried on next tick
+            # Do NOT remove from state — position needs manual intervention.
+            # Coin is added to blocked_coins so engine skips it until human clears.
             return False
 
         funding_earned = pos_data.get("total_funding_earned", 0.0)
@@ -2473,34 +2549,77 @@ class CrossFundingEngine:
     def reconcile_positions(self) -> list[dict]:
         """Compare state positions vs actual exchange positions.
 
-        Returns a list of orphan positions (on-exchange but not in state).
-        Emits risk_alert for each orphan found.
-        """
-        state_coins = {p["coin"] for p in self._get_positions()}
+        Detects both directions:
+          1. On-exchange but not in state → orphan (add to blocked_coins)
+          2. In state but not on-exchange (either leg missing) → ghost (add to blocked_coins)
 
-        orphans: list[dict] = []
+        Returns a list of discrepancy dicts. Emits risk_alert for each.
+        """
+        state_positions = self._get_positions()
+        state_coins = {p["coin"] for p in state_positions}
+
+        actual_by_ex: dict[str, dict[str, dict]] = {}
+        discrepancies: list[dict] = []
+
         for exchange_name, client in [("hyperliquid", self.hl), ("binance", self.bn)]:
             try:
                 actual = client.get_all_positions()
             except Exception as e:
                 emit_error(f"reconcile_{exchange_name}", e)
+                actual_by_ex[exchange_name] = {}
                 continue
+            actual_by_ex[exchange_name] = {p["coin"]: p for p in actual}
+            # Orphan: exchange has it, state does not
             for pos in actual:
                 if pos["coin"] not in state_coins:
                     orphan = {
+                        "type": "orphan",
                         "coin": pos["coin"],
                         "exchange": exchange_name,
                         "size": pos["size"],
                         "unrealized_pnl": pos.get("unrealized_pnl", 0),
                     }
-                    orphans.append(orphan)
+                    discrepancies.append(orphan)
+                    _add_blocked_coin(
+                        pos["coin"],
+                        f"reconcile_orphan: {exchange_name} size={pos['size']}",
+                    )
                     emit(
                         "orphan_position",
                         orphan,
                         notify=True,
                         tier="risk_alert",
                     )
-        return orphans
+
+        # Ghost: state has it, one or both exchanges do not
+        for p in state_positions:
+            coin = p["coin"]
+            hl_live = actual_by_ex.get("hyperliquid", {}).get(coin)
+            bn_live = actual_by_ex.get("binance", {}).get(coin)
+            missing = []
+            if not hl_live or abs(hl_live.get("size", 0)) == 0:
+                missing.append("hyperliquid")
+            if not bn_live or abs(bn_live.get("size", 0)) == 0:
+                missing.append("binance")
+            if missing:
+                ghost = {
+                    "type": "ghost",
+                    "coin": coin,
+                    "missing_on": missing,
+                    "state_size": p.get("size", 0),
+                }
+                discrepancies.append(ghost)
+                _add_blocked_coin(
+                    coin, f"reconcile_ghost: missing_on={missing}"
+                )
+                emit(
+                    "ghost_position",
+                    ghost,
+                    notify=True,
+                    tier="risk_alert",
+                )
+
+        return discrepancies
 
     # ---- Health check ----
 
@@ -3490,6 +3609,45 @@ def log_trade(
         record["funding_pnl"] = funding_pnl
     trades.append(record)
     _save_trade_history(trades)
+
+
+TRADE_LOG_DIR = SCRIPT_DIR / "logs"
+
+
+def _append_trade_log(action: str, payload: dict) -> None:
+    """Persist raw open/close request & response to daily log file."""
+    try:
+        TRADE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        day = datetime.now(timezone.utc).strftime("%Y%m%d")
+        path = TRADE_LOG_DIR / f"trades-{day}.log"
+        rec = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "action": action,
+            **payload,
+        }
+        with path.open("a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+    except Exception as e:
+        emit_error("append_trade_log", e)
+
+
+def _load_blocked_coins() -> set[str]:
+    state = load_state(STATE_NAME)
+    return set(state.get("blocked_coins", []))
+
+
+def _add_blocked_coin(coin: str, reason: str) -> None:
+    state = load_state(STATE_NAME)
+    blocked = set(state.get("blocked_coins", []))
+    blocked.add(coin)
+    state["blocked_coins"] = sorted(blocked)
+    meta = state.get("blocked_coins_meta", {})
+    meta[coin] = {
+        "reason": reason,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    state["blocked_coins_meta"] = meta
+    save_state(STATE_NAME, state)
 
 
 def _build_position_dashboard(
