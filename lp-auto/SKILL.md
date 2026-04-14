@@ -98,7 +98,58 @@ lp-auto/
 - `cl-lp-rebalancer` = 单池版本（WETH-USDC Base 0.3% 硬编码）
 - `lp-auto` = v2，参数化支持任意池 + 自动选池 + 自动换池
 
-现有 cl-lp-rebalancer 部署可以继续运行（state 结构兼容），或通过 `lp-auto import --from-cl-lp-rebalancer` 迁移状态。
+### 从 v1 迁移到 lp-auto (实战步骤，2026-04-15 生产验证过)
+
+1. **复制 state 文件**：
+   ```bash
+   mkdir -p ~/.lp-auto/instances/prod
+   cp ~/scripts/cl-lp/cl_lp_state.json ~/.lp-auto/instances/prod/state.json
+   ```
+
+2. **生成 config.json**（从旧 flat config 映射到 nested `pool_config`）：
+   ```python
+   old = json.load(open("~/scripts/cl-lp/config.json"))
+   new = {
+     "chain": old["pool_chain"],
+     "capital_usd": old["initial_investment_usd"],
+     "pool_config": {
+       "investment_id": old["investment_id"],
+       "chain": old["pool_chain"],
+       "token0_symbol": old["token0"]["symbol"],
+       "token0_address": old["token0"]["address"],
+       "token0_decimals": old["token0"]["decimals"],
+       "token1_symbol": old["token1"]["symbol"],
+       "token1_address": old["token1"]["address"],
+       "token1_decimals": old["token1"]["decimals"],
+       "fee_tier": old["fee_tier"],
+       "tick_spacing": old["tick_spacing"],
+     },
+     "auto_switch": False, "auto_edges": False,
+     "dynamic_width": {"enabled": False},
+   }
+   ```
+
+3. **替换 scheduler cron**（VPS 用 zeroclaw daemon，不是 crontab）：
+   ```bash
+   zeroclaw --config-dir ~/.zeroclaw-strategy cron remove <old_uuid>
+   zeroclaw --config-dir ~/.zeroclaw-strategy cron add --tz "Asia/Shanghai" \
+     "*/5 * * * *" "cd ~/scripts/cl-lp && set -a && . ./.env && set +a && \
+     LP_AUTO_INSTANCE_DIR=~/.lp-auto/instances/prod python3 cl_lp.py tick"
+   ```
+
+4. **更新 nginx alias**（dashboard 数据源）：
+   ```nginx
+   location = /lp/state.json {
+       alias /home/ubuntu/.lp-auto/instances/prod/state.json;
+   }
+   ```
+   然后 `sudo nginx -t && sudo systemctl reload nginx`。
+
+5. **验证**：`lp-auto --instance prod status` + dashboard 刷新看 LP 数据同步。
+
+### 保留 v1 作 backup
+
+旧 `~/scripts/cl-lp/cl_lp_state.json` 迁移后**不要删** — 万一 lp-auto 出问题可以 rollback：回滚步骤是反向执行 step 3+4。
 
 ## 下一步（未实现，见 roadmap）
 
