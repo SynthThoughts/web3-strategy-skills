@@ -3271,18 +3271,20 @@ def _tick_inner():
     # Periodic orphan position check — detect untracked positions on-chain
     position = state.get("position")
     tracked_tid = position.get("token_id", "") if position else ""
+    edge_tids = {str(e.get("token_id")) for e in (state.get("edges") or []) if e.get("token_id")}
+    tracked_ids = ({str(tracked_tid)} if tracked_tid else set()) | edge_tids
     try:
         all_onchain = _query_all_positions()
         active_onchain = [p for p in all_onchain if p.get("value", 0) > 1.0]
-        tracked_count = 1 if tracked_tid else 0
-        if len(active_onchain) > tracked_count:
+        if len(active_onchain) > len(tracked_ids):
             orphan_tids = [
                 p["tokenId"] for p in active_onchain
-                if p["tokenId"] != tracked_tid
+                if str(p["tokenId"]) not in tracked_ids
             ]
             log(
-                f"ORPHAN CHECK: {len(active_onchain)} on-chain positions "
-                f"but only {tracked_count} tracked. Orphans: {orphan_tids}"
+                f"ORPHAN CHECK: {len(active_onchain)} on-chain positions, "
+                f"{len(tracked_ids)} tracked (main={tracked_tid!r}, "
+                f"{len(edge_tids)} edge(s)). True orphans: {orphan_tids}"
             )
             if tracked_tid:
                 cleanup_residual_positions(tracked_tid)
