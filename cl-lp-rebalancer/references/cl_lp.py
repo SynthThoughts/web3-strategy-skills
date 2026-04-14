@@ -521,26 +521,34 @@ def get_balances(force: bool = False) -> tuple[float, float, bool]:
         log(f"Balance query failed, raw: {json.dumps(data)[:200] if data else 'None'}")
         return 0.0, 0.0, True
     eth, usdc = 0.0, 0.0
+    usdc_matches = 0  # sanity: count how many tokenAssets matched USDC_ADDR
+    usdc_addr_lc = USDC_ADDR.lower()
+
+    def _scan_tokens(token_list):
+        nonlocal eth, usdc, usdc_matches
+        for token in token_list:
+            addr_lc = (token.get("tokenAddress") or "").lower()
+            if token.get("tokenAddress") == "" and token.get("symbol") == "ETH":
+                eth = float(token.get("balance", "0"))
+            elif addr_lc == usdc_addr_lc:
+                # Strict address match; multi-variant USDC/USDC.e have different addresses
+                usdc = float(token.get("balance", "0"))
+                usdc_matches += 1
+
     if account_id:
-        # --all returns {details: {accountId: {data: [{tokenAssets: [...]}]}}}
         acct_data = data["data"].get("details", {}).get(account_id)
         if not acct_data or not acct_data.get("data"):
             log(f"Balance: account {account_id} not found in --all response")
             return 0.0, 0.0, True
         for chain_detail in acct_data["data"]:
-            for token in chain_detail.get("tokenAssets", []):
-                if token.get("tokenAddress") == "" and token.get("symbol") == "ETH":
-                    eth = float(token.get("balance", "0"))
-                elif token.get("tokenAddress", "").lower() == USDC_ADDR.lower():
-                    usdc = float(token.get("balance", "0"))
+            _scan_tokens(chain_detail.get("tokenAssets", []))
     else:
-        details = data["data"].get("details", [])
-        for chain_detail in details:
-            for token in chain_detail.get("tokenAssets", []):
-                if token.get("tokenAddress") == "" and token.get("symbol") == "ETH":
-                    eth = float(token.get("balance", "0"))
-                elif token.get("tokenAddress", "").lower() == USDC_ADDR.lower():
-                    usdc = float(token.get("balance", "0"))
+        for chain_detail in data["data"].get("details", []):
+            _scan_tokens(chain_detail.get("tokenAssets", []))
+
+    # Sanity: USDC_ADDR is a unique Base contract; >1 match means OKX glitch
+    if usdc_matches > 1:
+        log(f"⚠ get_balances: {usdc_matches} entries matched USDC_ADDR — using last, but API may be unstable")
 
     # `wallet balance` on Base does not return native ETH (only ERC20s).
     # Fall back to `portfolio token-balances` for the native asset so the
@@ -1572,8 +1580,13 @@ def defi_calculate_entry(
     return None
 
 
-def defi_deposit(user_input: str, tick_lower: int, tick_upper: int) -> bool:
-    """Deposit liquidity into V3 position at specified tick range."""
+def defi_deposit(user_input: str, tick_lower: int, tick_upper: int,
+                 token_id: str = "") -> bool:
+    """Deposit liquidity into V3 position.
+
+    If token_id is provided: add liquidity to EXISTING position (no new NFT mint).
+    Otherwise: mint a new V3 NFT at [tick_lower, tick_upper].
+    """
     # Filter out zero-amount tokens — API rejects coinAmount "0"
     try:
         tokens = json.loads(user_input)
@@ -1585,25 +1598,20 @@ def defi_deposit(user_input: str, tick_lower: int, tick_upper: int) -> bool:
             user_input = json.dumps(tokens)
     except (json.JSONDecodeError, ValueError):
         pass
-    data = onchainos_cmd(
-        [
-            "defi",
-            "deposit",
-            "--investment-id",
-            INVESTMENT_ID,
-            "--address",
-            WALLET_ADDR,
-            "--chain",
-            POOL_CHAIN,
-            "--user-input",
-            user_input,
-            "--tick-lower",
-            str(tick_lower),
-            "--tick-upper",
-            str(tick_upper),
-        ],
-        timeout=60,
-    )
+    args = [
+        "defi", "deposit",
+        "--investment-id", INVESTMENT_ID,
+        "--address", WALLET_ADDR,
+        "--chain", POOL_CHAIN,
+        "--user-input", user_input,
+    ]
+    if token_id:
+        args += ["--token-id", str(token_id)]
+        log(f"Deposit: add-liquidity to existing token_id={token_id}")
+    else:
+        args += ["--tick-lower", str(tick_lower), "--tick-upper", str(tick_upper)]
+        log(f"Deposit: mint new V3 position at [{tick_lower},{tick_upper}]")
+    data = onchainos_cmd(args, timeout=60)
     if data and data.get("ok"):
         log("Deposit calldata received")
         return _broadcast_defi_txs(data, "deposit")
