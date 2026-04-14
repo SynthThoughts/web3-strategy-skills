@@ -1802,6 +1802,61 @@ def execute_swap(
     return None, {"reason": "max_retries", "detail": "exhausted", "retriable": True}
 
 
+def _enforce_gas_reserve(user_input_json: str) -> str | None:
+    """Final safety gate: guarantee wallet ETH - deposit ETH >= GAS_RESERVE_ETH.
+
+    Re-reads live wallet balance and scales both ETH+USDC deposit amounts
+    proportionally if the ETH leg would breach the gas reserve. Returns
+    the (possibly adjusted) JSON, or None if the reserve can't be met at all.
+    """
+    try:
+        items = json.loads(user_input_json)
+    except Exception:
+        return user_input_json
+
+    eth_bal, _, bal_failed = get_balances(force=True)
+    if bal_failed:
+        log("  Gas reserve guard: balance query failed — trusting upstream calc")
+        return user_input_json
+
+    eth_in_deposit = 0.0
+    for it in items:
+        addr = it.get("tokenAddress", "").lower()
+        if addr in (NATIVE_TOKEN.lower(), ETH_ADDR.lower()):
+            eth_in_deposit = float(it.get("coinAmount", 0)) / (10 ** TOKEN0["decimals"])
+            break
+
+    max_deposit_eth = eth_bal - GAS_RESERVE_ETH
+    remaining = eth_bal - eth_in_deposit
+    if eth_in_deposit <= max_deposit_eth:
+        log(
+            f"  Gas reserve guard ✓ wallet={eth_bal:.6f} deposit={eth_in_deposit:.6f} "
+            f"remaining={remaining:.6f} ≥ reserve {GAS_RESERVE_ETH}"
+        )
+        return user_input_json
+
+    if max_deposit_eth <= 0:
+        log(
+            f"  ⚠ Gas reserve guard: wallet ETH={eth_bal:.6f} ≤ reserve {GAS_RESERVE_ETH} "
+            f"— aborting deposit, funds remain in wallet"
+        )
+        return None
+
+    # Scale both legs down so ETH leg fits (0.995 extra buffer for settlement drift)
+    scale = max_deposit_eth / eth_in_deposit * 0.995
+    log(
+        f"  ⚠ Gas reserve guard: deposit ETH {eth_in_deposit:.6f} > max {max_deposit_eth:.6f} "
+        f"— scaling by {scale:.4f}"
+    )
+    scaled = []
+    for it in items:
+        new_it = dict(it)
+        amt = float(it.get("coinAmount", 0))
+        new_it["coinAmount"] = str(int(amt * scale))
+        scaled.append(new_it)
+    return json.dumps(scaled)
+
+
 def _calc_balanced_deposit(
     available_eth: float,
     usdc_bal: float,
@@ -1947,7 +2002,7 @@ def _calc_balanced_deposit(
                 addr = item.get("tokenAddress", "").lower()
                 if addr == USDC_ADDR.lower():
                     needed = float(item.get("coinAmount", 0)) / (10 ** TOKEN1["decimals"])
-                    if needed <= usdc_bal * 1.01:
+                    if needed <= usdc_bal:
                         log(f"  Final deposit (ETH-base): ETH-input={available_eth * 0.95:.6f}, USDC-needed={needed:.2f}")
                         return json.dumps(final)
                     log(f"  USDC short after swap ({needed:.2f} > {usdc_bal:.2f}) — trying USDC-base")
@@ -1967,7 +2022,7 @@ def _calc_balanced_deposit(
             addr = item.get("tokenAddress", "").lower()
             if addr in (NATIVE_TOKEN.lower(), ETH_ADDR.lower()):
                 needed_eth = float(item.get("coinAmount", 0)) / (10 ** TOKEN0["decimals"])
-                if needed_eth <= available_eth * 1.01:
+                if needed_eth <= available_eth:
                     log(f"  Final deposit (USDC-base): USDC-input={usdc_bal * 0.95:.2f}, ETH-needed={needed_eth:.6f}")
                     return json.dumps(final)
                 log(f"  ETH short ({needed_eth:.6f} > {available_eth:.6f}) — reducing USDC input")
@@ -2164,6 +2219,12 @@ def execute_rebalance(
     )
     if not user_input_json:
         log("  Deposit calculation failed — aborting")
+        return False
+
+    # Final gas-reserve safety gate (scales down if deposit ETH would breach 0.02)
+    user_input_json = _enforce_gas_reserve(user_input_json)
+    if not user_input_json:
+        log("  Deposit aborted by gas reserve guard — funds remain in wallet")
         return False
 
     # Step 5: Deposit at new range
