@@ -685,21 +685,41 @@ def find_latest_token_id(after_token_id: str = "") -> str:
     return positions[-1]["tokenId"]
 
 
-def cleanup_residual_positions(keep_token_id: str, max_retries: int = 3) -> int:
-    """Redeem all positions except keep_token_id. Returns count of cleaned positions.
-    Retries failed redemptions up to max_retries times."""
+def cleanup_residual_positions(keep_token_id: str, max_retries: int = 3,
+                                 extra_keep_ids: set[str] | None = None) -> int:
+    """Redeem all positions except keep_token_id and any edge NFTs tracked
+    in state.edges (populated by edge_manager). Returns count of cleaned
+    positions. Retries failed redemptions up to max_retries times.
+
+    extra_keep_ids overrides the state.edges lookup — pass explicitly to
+    skip the default behavior.
+    """
     positions = _query_all_positions()
+    # Build full keep set: main position + all edges from state
+    keep_ids: set[str] = {str(keep_token_id)} if keep_token_id else set()
+    if extra_keep_ids is None:
+        try:
+            state = load_state()
+            for e in state.get("edges", []) or []:
+                tid = e.get("token_id")
+                if tid:
+                    keep_ids.add(str(tid))
+        except Exception as e:
+            log(f"  cleanup: failed to read state.edges, proceeding without: {e}")
+    else:
+        keep_ids |= {str(t) for t in extra_keep_ids}
     cleaned = 0
     failed_tids = []
     for pos in positions:
         tid = pos["tokenId"]
-        if tid == keep_token_id or not tid:
+        if not tid or str(tid) in keep_ids:
             continue
         val = pos["value"]
         if val < 0.01:
             # Skip dust positions (< $0.01)
             continue
-        log(f"  Cleaning residual position #{tid} (${val:.2f})")
+        log(f"  Cleaning residual position #{tid} (${val:.2f}) "
+            f"[kept: main={keep_token_id!r}, {len(keep_ids)-1} edge(s)]")
         ok = defi_redeem(tid)
         if ok:
             cleaned += 1
