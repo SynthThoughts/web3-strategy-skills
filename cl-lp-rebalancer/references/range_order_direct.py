@@ -1,9 +1,23 @@
 #!/usr/bin/env python3
-"""Direct V3 NonfungiblePositionManager mint — bypasses OKX router which
-auto-unwinds single-sided deposits.
+"""Direct V3 NonfungiblePositionManager mint.
 
 Calls NPM.mint(MintParams) directly via onchainos `wallet contract-call`,
 signed by onchainos's internal key.
+
+Why direct instead of `onchainos defi deposit`:
+  OKX's defi deposit works fine for single-sided (confirmed: NFT 4969650
+  was successfully minted with liquidity). The real reason we bypass it:
+  the OKX router keeps custody-chain metadata the `defi_redeem` API can
+  track, which is convenient but also means anything in the position-list
+  is visible to cl_lp.cleanup_residual_positions — which, before the
+  2026-04-15 edges-aware fix, would redeem any NFT not in
+  state.position.token_id. By calling NPM directly, we also keep the
+  code path explicit and pool-agnostic (OKX investmentId not required).
+
+History: initial theory that OKX auto-unwound single-sided mints was
+WRONG. The 2026-04-15 incident (NFT 4969650 decreased 4 seconds after
+mint) was cl_lp's OWN cleanup_residual_positions killing the unknown
+NFT, not OKX. See feedback_cleanup_kills_edges memory for full RCA.
 
 Dependencies:
   - eth_abi (encode struct params)

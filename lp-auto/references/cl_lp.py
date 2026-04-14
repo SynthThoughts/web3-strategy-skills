@@ -3149,6 +3149,44 @@ def _check_auto_switch_pool() -> bool:
     return True
 
 
+def _check_edges():
+    """Phase E4: if auto_edges enabled and main position exists, run the
+    edge_manager cascade — close filled edges, mint missing ones.
+
+    Runs BEFORE main rebalance logic so edges stay in sync with the current
+    main range. Safe to fail: logs and continues.
+    """
+    if not CFG.get("auto_edges", False):
+        return
+    state = load_state()
+    pos = state.get("position") or {}
+    if not pos.get("token_id"):
+        return  # no main position yet
+    try:
+        import edge_manager
+        import capital_efficiency as ce_mod
+        prices = ce_mod.fetch_hourly_prices(INVESTMENT_ID, POOL_CHAIN)
+        eth_price = prices[-1][1] if prices else 0
+        if eth_price <= 0:
+            return
+        edge_capital = float(CFG.get("edge_capital_usd", 20.0))
+        sides_cfg = CFG.get("edge_sides", "buy_weth")  # sell_weth needs WETH wrap
+        sides = [s.strip() for s in sides_cfg.split(",") if s.strip()]
+        summary = edge_manager.check_and_cascade(
+            main_tick_lower=int(pos["tick_lower"]),
+            main_tick_upper=int(pos["tick_upper"]),
+            capital_usd_per_edge=edge_capital,
+            eth_price=eth_price,
+            sides=sides,
+        )
+        if summary.get("closed") or summary.get("minted"):
+            log(f"  auto_edges: closed={summary.get('closed')} minted={summary.get('minted')}")
+        if summary.get("errors"):
+            log(f"  auto_edges errors: {summary.get('errors')}")
+    except Exception as e:
+        log(f"  auto_edges failed: {e}")
+
+
 def tick():
     """Main loop: check position, decide rebalance, execute."""
     # Process lock — prevent concurrent ticks
@@ -3162,6 +3200,8 @@ def tick():
         if _check_auto_switch_pool():
             log("auto_switch completed — exiting tick; next run will use new pool")
             return
+        # Phase E4: manage edge range-orders (zero-slippage swap substitutes)
+        _check_edges()
         _tick_inner()
     finally:
         _release_lock()
