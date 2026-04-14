@@ -361,9 +361,41 @@ def load_edges() -> list[Edge]:
 
 
 def save_edges(edges: list[Edge]):
-    state = load_state()
-    state["edges"] = [e.to_dict() for e in edges]
-    save_state(state)
+    """Persist edges to state.edges, coordinating with cl_lp's flock.
+
+    Without coordination, a concurrent cl_lp tick (scheduler-triggered)
+    can read state, modify something, and write back — overwriting this
+    save. Verified race 2026-04-15: edge 4969910 registered in state.edges
+    was lost when a cron tick wrote back state ~60s later, then cleanup
+    on next tick didn't recognize it and redeemed it as an "orphan".
+
+    Behavior:
+      - If called inside a running tick (lock already held by this
+        process), write directly — parent caller guards the lock.
+      - If called externally (edge_manager CLI), acquire blocking
+        LOCK_EX and wait for any active tick to finish before writing.
+    """
+    import fcntl
+    import cl_lp
+    # Re-entrant: inside tick already holds the lock
+    if getattr(cl_lp, "_lock_fd", None) is not None:
+        state = load_state()
+        state["edges"] = [e.to_dict() for e in edges]
+        save_state(state)
+        return
+    # External call: block on lock
+    lock_fd = open(cl_lp.LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        state = load_state()
+        state["edges"] = [e.to_dict() for e in edges]
+        save_state(state)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lock_fd.close()
 
 
 # ── Cascading ──────────────────────────────────────────────────────────────
