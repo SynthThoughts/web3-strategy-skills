@@ -97,6 +97,28 @@ QUIET_INTERVAL = CFG["quiet_interval_seconds"]
 MAX_CONSECUTIVE_ERRORS = CFG["max_consecutive_errors"]
 COOLDOWN_AFTER_ERRORS = CFG["cooldown_after_errors_seconds"]
 
+# ── Dynamic Width Config ─────────────────────────────────────────────────
+# Overridable via config.json "dynamic_width" section
+
+_dw_cfg = CFG.get("dynamic_width", {})
+DW_ENABLED = _dw_cfg.get("enabled", True)
+# Candidate widths (half-width %) to evaluate; covers narrow→wide spectrum
+DW_CANDIDATE_WIDTHS = _dw_cfg.get("candidate_widths", [1.5, 2.0, 3.0, 5.0, 6.0, 8.0, 10.0, 12.0, 15.0])
+# Fee tier used for revenue estimation (defaults to pool fee_tier)
+DW_POOL_FEE = _dw_cfg.get("pool_fee", FEE_TIER)
+# Estimated daily volume for the pool in USD (for fee estimation)
+DW_DAILY_VOLUME_USD = _dw_cfg.get("daily_volume_usd", 5_000_000)
+# Rebalance cost estimate in USD (gas + slippage + realized IL)
+DW_REBALANCE_COST_USD = _dw_cfg.get("rebalance_cost_usd", 2.0)
+# Volatility shift threshold: trigger rebalance when σ changes by this fraction
+DW_VOL_SHIFT_THRESHOLD = _dw_cfg.get("vol_shift_threshold", 0.30)
+# Cost-to-fee safety: skip rebalance if cost > this fraction of 0.5-day fee income
+DW_COST_FEE_RATIO = _dw_cfg.get("cost_fee_ratio", 0.5)
+# Daily rebalance cap (separate from MAX_REBALANCES_24H which is the hard limit)
+DW_MAX_DAILY_REBALANCES = _dw_cfg.get("max_daily_rebalances", 5)
+# Consecutive rebalance failure alert threshold
+DW_FAILURE_ALERT_THRESHOLD = _dw_cfg.get("failure_alert_threshold", 3)
+
 
 # ── Notification credentials ───────────────────────────────────────────────
 
@@ -655,22 +677,45 @@ def find_latest_token_id(after_token_id: str = "") -> str:
     return positions[-1]["tokenId"]
 
 
-def cleanup_residual_positions(keep_token_id: str) -> int:
-    """Redeem all positions except keep_token_id. Returns count of cleaned positions."""
+def cleanup_residual_positions(keep_token_id: str, max_retries: int = 3) -> int:
+    """Redeem all positions except keep_token_id. Returns count of cleaned positions.
+    Retries failed redemptions up to max_retries times."""
     positions = _query_all_positions()
     cleaned = 0
+    failed_tids = []
     for pos in positions:
         tid = pos["tokenId"]
         if tid == keep_token_id or not tid:
             continue
         val = pos["value"]
+        if val < 0.01:
+            # Skip dust positions (< $0.01)
+            continue
         log(f"  Cleaning residual position #{tid} (${val:.2f})")
         ok = defi_redeem(tid)
         if ok:
             cleaned += 1
             log(f"  Redeemed #{tid}")
         else:
+            failed_tids.append(tid)
             log(f"  WARN: failed to redeem #{tid}")
+    # Retry failed redemptions
+    for retry in range(1, max_retries):
+        if not failed_tids:
+            break
+        log(f"  Retry {retry}/{max_retries - 1} for {len(failed_tids)} failed redemption(s)")
+        time.sleep(5 * retry)
+        still_failed = []
+        for tid in failed_tids:
+            ok = defi_redeem(tid)
+            if ok:
+                cleaned += 1
+                log(f"  Retry redeemed #{tid}")
+            else:
+                still_failed.append(tid)
+        failed_tids = still_failed
+    if failed_tids:
+        log(f"  WARN: {len(failed_tids)} position(s) still not redeemed after retries: {failed_tids}")
     if cleaned:
         log(f"  Cleaned {cleaned} residual position(s)")
     return cleaned
@@ -725,6 +770,132 @@ def get_kline_data(bar: str = "1H", limit: int = 24) -> list[dict] | None:
                 continue
         return candles if candles else None
     return None
+
+
+
+
+def get_pair_kline_data(bar: str = "1H", limit: int = 24) -> list[dict] | None:
+    """Fetch klines for both tokens and compute pair ratio candles (token1/token0, e.g. USDC/WETH).
+    
+    Returns candles with OHLC representing the relative price of the pair,
+    which is what actually matters for V3 LP range calculations.
+    """
+    # Fetch token0 (WETH) kline
+    eth_candles = get_kline_data(bar=bar, limit=limit)
+    if not eth_candles:
+        log("get_pair_kline_data: ETH kline failed, falling back to single-token")
+        return None
+
+    # Fetch token1 (USDC) kline
+    usdc_data = onchainos_cmd(
+        [
+            "market", "kline",
+            "--address", USDC_ADDR,
+            "--chain", POOL_CHAIN,
+            "--bar", bar,
+            "--limit", str(limit),
+        ],
+        timeout=15,
+    )
+    usdc_candles = []
+    if usdc_data and usdc_data.get("ok") and usdc_data.get("data"):
+        for c in usdc_data["data"]:
+            try:
+                if isinstance(c, list) and len(c) >= 6:
+                    usdc_candles.append({
+                        "ts": int(c[0]),
+                        "open": float(c[1]), "high": float(c[2]),
+                        "low": float(c[3]), "close": float(c[4]),
+                    })
+                elif isinstance(c, dict):
+                    usdc_candles.append({
+                        "ts": int(c.get("ts", 0)),
+                        "open": float(c.get("o", 0) or c.get("open", 0)),
+                        "high": float(c.get("h", 0) or c.get("high", 0)),
+                        "low": float(c.get("l", 0) or c.get("low", 0)),
+                        "close": float(c.get("c", 0) or c.get("close", 0)),
+                    })
+            except (ValueError, TypeError, IndexError):
+                continue
+
+    if not usdc_candles or len(usdc_candles) < len(eth_candles) * 0.8:
+        log(f"get_pair_kline_data: USDC kline insufficient ({len(usdc_candles)} vs {len(eth_candles)} ETH), "
+            "falling back to single-token")
+        return eth_candles  # fallback: use ETH/USD (USDC ≈ $1)
+
+    # Align by timestamp and compute ratio candles
+    usdc_by_ts = {c["ts"]: c for c in usdc_candles}
+    ratio_candles = []
+    for eth_c in eth_candles:
+        usdc_c = usdc_by_ts.get(eth_c["ts"])
+        if not usdc_c:
+            # Try closest timestamp within 60s
+            for offset in range(-60000, 61000, 1000):
+                usdc_c = usdc_by_ts.get(eth_c["ts"] + offset)
+                if usdc_c:
+                    break
+        if not usdc_c or usdc_c["close"] <= 0:
+            continue
+        # Ratio = ETH_price / USDC_price = how many USDC per ETH
+        # Use USDC close as normalizer for all OHLC — DEX high/low has MEV noise
+        usdc_px = usdc_c["close"]
+        ratio_candles.append({
+            "ts": eth_c["ts"],
+            "open": eth_c["open"] / usdc_px,
+            "high": eth_c["high"] / usdc_px,
+            "low": eth_c["low"] / usdc_px,
+            "close": eth_c["close"] / usdc_px,
+            "volume": eth_c.get("volume", 0),
+        })
+
+    if len(ratio_candles) < len(eth_candles) * 0.5:
+        log(f"get_pair_kline_data: only {len(ratio_candles)} ratio candles aligned, falling back")
+        return eth_candles
+
+    log(f"get_pair_kline_data: {len(ratio_candles)} pair ratio candles (ETH/USDC)")
+    return ratio_candles
+
+
+def get_defi_pool_price() -> float | None:
+    """Get current pool relative price from onchainos defi detail.
+    Returns price as token1/token0 (USDC per WETH), or None on failure."""
+    data = onchainos_cmd(
+        ["defi", "detail", "--investment-id", INVESTMENT_ID, "--chain", POOL_CHAIN],
+        timeout=15,
+    )
+    if not data or not data.get("ok") or not data.get("data"):
+        return None
+    try:
+        detail = data["data"]
+        # Look for currentPrice field — format: "1 USDC ≈ 0.00044 ETH" or similar
+        current_price_str = None
+        if isinstance(detail, dict):
+            current_price_str = detail.get("currentPrice", "")
+        elif isinstance(detail, list) and detail:
+            current_price_str = detail[0].get("currentPrice", "")
+        
+        if not current_price_str:
+            return None
+        
+        # Parse "1 USDC ≈ 0.00044 WETH" → invert to get USDC/WETH
+        # Or "1 WETH ≈ 2225.5 USDC" → use directly
+        import re as _re
+        # Try pattern: "1 <TOKEN> ≈ <PRICE> <TOKEN>"
+        m = _re.search(r"1\s+(\w+)\s*[≈=~]\s*([\d.,]+)\s+(\w+)", current_price_str)
+        if m:
+            base_token = m.group(1).upper()
+            price_val = float(m.group(2).replace(",", ""))
+            quote_token = m.group(3).upper()
+            if base_token in ("USDC", "USD") and quote_token in ("WETH", "ETH"):
+                # "1 USDC ≈ 0.00044 WETH" → USDC/WETH price, invert for WETH/USDC
+                return 1.0 / price_val if price_val > 0 else None
+            elif base_token in ("WETH", "ETH") and quote_token in ("USDC", "USD"):
+                # "1 WETH ≈ 2225 USDC" → already WETH/USDC
+                return price_val
+        return None
+    except (KeyError, ValueError, TypeError, IndexError):
+        return None
+
 
 
 def calc_kline_volatility(candles: list[dict]) -> float:
@@ -857,12 +1028,119 @@ def classify_volatility(atr_pct: float) -> str:
         return "extreme"
 
 
+def _estimate_daily_sigma(atr_pct_1h: float) -> float:
+    """Convert 1H ATR% to approximate daily σ%.
+
+    ATR captures intra-bar range; daily σ ≈ ATR_1h * sqrt(24) * 0.6 (empirical
+    scaling: ATR overstates realized vol due to mean-reversion within bars).
+    Calibrated against ETH/USDC: ATR_1H=1.5% ↔ σ_daily ≈ 4.4%.
+    """
+    return atr_pct_1h * math.sqrt(24) * 0.6
+
+
+# LVR (Loss vs Rebalancing) fraction — empirically constant ~74% for ETH/USDC.
+_LVR_PCT = 0.74
+
+
+def calc_optimal_width(
+    sigma_daily: float,
+    position_usd: float = 400.0,
+    daily_volume_usd: float = DW_DAILY_VOLUME_USD,
+    rebalance_cost_usd: float = DW_REBALANCE_COST_USD,
+) -> dict:
+    """Select optimal half-width% by maximizing net_revenue = net_fee - rebalance_costs.
+
+    Model (calibrated against empirical ETH/USDC data, $400 position):
+      - gross_fee ∝ 1/w (V3 concentration: narrower → proportionally more fee)
+        Anchor: w=2%, $400 pos ≈ $10/day gross fee.
+      - net_fee = gross_fee * (1 - LVR_pct); LVR ≈ 74% constant across widths.
+      - rebalance_freq = (σ/w)^2 per day (random walk exit time from band).
+      - cost_per_rebalance = gas ($0.15 Base L2) + realized_IL.
+        Realized IL scales aggressively with concentration: (ref_w/w)^1.2.
+      - net_revenue = net_fee - freq * cost_per_rebalance.
+
+    Empirical fit:
+      - σ < 2%/day → w=1.5-2% (narrow, ~150% APY)
+      - σ 3-5%/day → w=5-8% (balanced, 40-70% APY)
+      - σ > 8%/day → w=12-15% (wide, 20-30% APY, few rebalances)
+
+    Returns {half_width_pct, sigma_daily, net_revenue_daily, details[]}.
+    """
+    candidates = DW_CANDIDATE_WIDTHS
+    pool_fee = DW_POOL_FEE
+
+    # Protect against zero/negative σ
+    sigma_daily = max(sigma_daily, 0.1)
+
+    best_width = 5.0  # fallback
+    best_net = -1e9
+    details = []
+
+    # Fee anchor: at w=2%, $400 position earns ~$10/day gross
+    # Scale linearly with position size and inversely with width
+    fee_anchor = 10.0 * (position_usd / 400.0)
+
+    for w in candidates:
+        # Gross fee: proportional to 1/w
+        gross_fee = fee_anchor * (2.0 / w)
+
+        # Cap at pool volume capacity
+        max_fee = daily_volume_usd * pool_fee * (position_usd / 500_000)
+        gross_fee = min(gross_fee, max_fee)
+
+        # Net fee after LVR (constant 74%)
+        net_fee = gross_fee * (1 - _LVR_PCT)
+
+        # Rebalance frequency: (σ/w)^2 per day
+        rebalances_per_day = (sigma_daily / w) ** 2
+
+        # Cost per rebalance: Base L2 gas + realized IL from V3 concentration
+        gas_cost = 0.15
+        realized_il = rebalance_cost_usd * (5.0 / w) ** 1.2
+        cost_per_rebalance = gas_cost + realized_il
+        cost_daily = rebalances_per_day * cost_per_rebalance
+
+        net = net_fee - cost_daily
+
+        details.append({
+            "width": w,
+            "fee_daily": round(net_fee, 4),
+            "rebal_per_day": round(rebalances_per_day, 3),
+            "cost_daily": round(cost_daily, 4),
+            "net_daily": round(net, 4),
+        })
+
+        if net > best_net:
+            best_net = net
+            best_width = w
+
+
+    return {
+        "half_width_pct": best_width,
+        "sigma_daily": round(sigma_daily, 3),
+        "net_revenue_daily": round(best_net, 4),
+        "details": details,
+    }
+
+
 def calc_optimal_range(price: float, atr_pct: float, mtf: dict | None = None) -> dict:
     """Calculate optimal tick range based on volatility and trend.
     Returns {lower_price, upper_price, tick_lower, tick_upper, regime, half_width_pct}."""
     regime = classify_volatility(atr_pct)
-    mult = RANGE_MULT.get(regime, 3.0)
-    half_width_pct = atr_pct * mult
+
+    if DW_ENABLED:
+        # Dynamic width: compute optimal half-width from volatility model
+        sigma_daily = _estimate_daily_sigma(atr_pct)
+        dw_result = calc_optimal_width(sigma_daily)
+        half_width_pct = dw_result["half_width_pct"]
+        log(
+            f"  Dynamic width: σ_daily={sigma_daily:.2f}% → w={half_width_pct:.1f}% "
+            f"(net=${dw_result['net_revenue_daily']:.3f}/day, regime={regime})"
+        )
+    else:
+        # Legacy: ATR * regime multiplier
+        mult = RANGE_MULT.get(regime, 3.0)
+        half_width_pct = atr_pct * mult
 
     # Clamp to min/max
     half_width_pct = max(MIN_RANGE_PCT, min(MAX_RANGE_PCT, half_width_pct))
@@ -926,12 +1204,38 @@ def check_rebalance_triggers(
     lower_price = tick_to_price(tick_lower)
     upper_price = tick_to_price(tick_upper)
 
-    # [1] Out of range — mandatory
+    # [1] Out of range — mandatory (the only active trigger; no preventive rebalancing)
     if price < lower_price or price > upper_price:
         side = "below" if price < lower_price else "above"
         return {"trigger": "out_of_range", "priority": "mandatory", "detail": side}
 
-    # [2] Higher yield pool detected — TODO: requires hourly yield API
+    # [2] Volatility shift — recalculate optimal width and compare to current
+    if DW_ENABLED:
+        created_atr = position.get("created_atr_pct", 0)
+        if created_atr > 0 and atr_pct > 0:
+            vol_change_ratio = abs(atr_pct - created_atr) / created_atr
+            if vol_change_ratio > DW_VOL_SHIFT_THRESHOLD:
+                # σ changed significantly — check if optimal width differs enough
+                sigma_now = _estimate_daily_sigma(atr_pct)
+                sigma_created = _estimate_daily_sigma(created_atr)
+                optimal_now = calc_optimal_width(sigma_now)
+                optimal_created = calc_optimal_width(sigma_created)
+                new_w = optimal_now["half_width_pct"]
+                old_w = optimal_created["half_width_pct"]
+                width_change = abs(new_w - old_w) / old_w if old_w > 0 else 0
+                if width_change > 0.20:  # optimal width shifted >20%
+                    log(
+                        f"  Vol shift detected: ATR {created_atr:.2f}%→{atr_pct:.2f}% "
+                        f"(Δ{vol_change_ratio:.0%}), width {old_w:.1f}%→{new_w:.1f}% "
+                        f"(Δ{width_change:.0%})"
+                    )
+                    return {
+                        "trigger": "volatility_shift",
+                        "priority": "advisory",
+                        "detail": f"σ Δ{vol_change_ratio:.0%} w:{old_w:.1f}→{new_w:.1f}",
+                    }
+
+    # [3] Higher yield pool detected — TODO: requires hourly yield API
     # Trigger when another pool consistently outperforms for 1+ hour.
     # Data source not yet available; placeholder for future implementation.
 
@@ -1009,7 +1313,7 @@ def run_risk_checks(
         state["stop_triggered"] = f"il_limit ({il_pct:.1f}% > {MAX_IL_TOLERANCE_PCT}%)"
         return state["stop_triggered"]
 
-    # [5] Rebalance frequency
+    # [5] Rebalance frequency — dual limit: hard cap + dynamic width daily cap
     rebalance_history = state.get("rebalance_history", [])
     now = datetime.now()
     recent_24h = []
@@ -1019,6 +1323,9 @@ def run_risk_checks(
             recent_24h.append(r)
     if len(recent_24h) >= MAX_REBALANCES_24H:
         return f"max_rebalances ({len(recent_24h)}/{MAX_REBALANCES_24H} in 24h)"
+    # Dynamic width daily cap (stricter: default 5/day)
+    if DW_ENABLED and len(recent_24h) >= DW_MAX_DAILY_REBALANCES:
+        return f"dw_daily_cap ({len(recent_24h)}/{DW_MAX_DAILY_REBALANCES} in 24h)"
 
     # [6] Position age
     position = state.get("position")
@@ -1029,7 +1336,7 @@ def run_risk_checks(
             remaining = int(MIN_POSITION_AGE - age)
             return f"position_too_young ({remaining}s remaining)"
 
-    # [7] Gas cost check (skip for mandatory/maintenance triggers)
+    # [7] Cost-to-fee safety gate (skip for mandatory triggers like out_of_range)
     if trigger and trigger.get("priority") not in ("mandatory", "maintenance"):
         # Estimate: Base L2 gas ~$0.01-0.05 per tx, rebalance = ~4 txs
         estimated_gas_usd = 0.15
@@ -1044,10 +1351,28 @@ def run_risk_checks(
         ):
             return f"gas_too_high (gas ${estimated_gas_usd:.2f} > {GAS_TO_FEE_RATIO:.0%} of fee ${expected_fee_until_next:.2f})"
 
+        # Dynamic width cost check: rebalance_cost > 0.5 day fee income → skip
+        if DW_ENABLED:
+            half_day_fee = daily_fee_estimate * DW_COST_FEE_RATIO
+            if half_day_fee > 0 and DW_REBALANCE_COST_USD > half_day_fee:
+                return (
+                    f"dw_cost_too_high (rebalance ${DW_REBALANCE_COST_USD:.2f} > "
+                    f"{DW_COST_FEE_RATIO:.0%} of daily fee ${daily_fee_estimate:.2f})"
+                )
+
     # [8] Minimum range change
     if trigger and trigger.get("trigger") == "volatility_shift":
         # Only rebalance if the new range would differ by >5%
         pass  # Checked after new range calculation in tick()
+
+    # [9] Consecutive rebalance failure alert
+    if DW_ENABLED:
+        consec_fail = state.get("_consecutive_rebalance_failures", 0)
+        if consec_fail >= DW_FAILURE_ALERT_THRESHOLD:
+            return (
+                f"dw_failure_pause ({consec_fail} consecutive rebalance failures "
+                f">= {DW_FAILURE_ALERT_THRESHOLD})"
+            )
 
     return None
 
@@ -1584,14 +1909,19 @@ def _calc_balanced_deposit(
     # ── Step 4: Wait for swap and get fresh balances ─────────────────────────
     if swap_needed:
         new_eth, new_usdc, bal_failed = 0.0, usdc_bal, True
-        for wait in [12, 10, 10]:
+        swap_reflected = False
+        for wait in [10, 10, 10, 10, 10, 10]:  # 最多等 60 秒
             time.sleep(wait)
             new_eth, new_usdc, bal_failed = get_balances(force=True)
-            if not bal_failed and (new_usdc != usdc_bal or new_eth != available_eth + GAS_RESERVE_ETH):
+            if bal_failed:
+                log(f"  Waiting for swap to reflect (query failed)...")
+                continue
+            if new_usdc != usdc_bal or new_eth != available_eth + GAS_RESERVE_ETH:
+                swap_reflected = True
                 break
-            log(f"  Waiting for swap to reflect (ETH={new_eth:.6f} USDC={new_usdc:.2f})")
-        if bal_failed:
-            log("  Balance check failed after swap")
+            log(f"  Waiting for swap to reflect (ETH={new_eth:.6f} USDC={new_usdc:.2f})...")
+        if not swap_reflected:
+            log("  ⚠ Swap not reflected after 60s — aborting to prevent stale-data errors")
             return None
         available_eth = max(new_eth - GAS_RESERVE_ETH, 0)
         usdc_bal = new_usdc
@@ -1679,19 +2009,24 @@ def _calc_entry_usdc_base(
             tx_hash, fail = execute_swap(NATIVE_TOKEN, USDC_ADDR, swap_eth_wei, price)
             if tx_hash:
                 # Wait for swap to settle
-                for wait in [10, 10, 10]:
+                swap_ok = False
+                for wait in [10, 10, 10, 10, 10, 10]:  # 最多等 60 秒
                     time.sleep(wait)
                     _, new_usdc, bal_fail = get_balances(force=True)
                     if not bal_fail and new_usdc > usdc_bal + 1:
                         usdc_bal = new_usdc
                         log(f"  USDC-base: swap settled, total USDC={usdc_bal:.2f}")
+                        swap_ok = True
                         break
-                    log(f"  USDC-base: waiting for swap (USDC={new_usdc:.2f})")
-                else:
-                    log("  USDC-base: swap may not have settled, proceeding with current balance")
+                    log(f"  USDC-base: waiting for swap (USDC={new_usdc:.2f})...")
+                if not swap_ok:
+                    log("  ⚠ ETH→USDC swap not reflected after 60s — using last known balance")
                     _, new_usdc, _ = get_balances(force=True)
                     if new_usdc > usdc_bal:
                         usdc_bal = new_usdc
+                    else:
+                        log("  ⚠ Balance unchanged — aborting entry to prevent stale-data deposit")
+                        return None
             else:
                 log(f"  USDC-base: ETH swap failed ({fail}), proceeding with USDC only")
 
@@ -1784,7 +2119,8 @@ def execute_rebalance(
         # Wait for redeem funds to arrive — poll until balance increases or timeout
         pre_eth, pre_usdc, _ = get_balances(force=True)
         log(f"  Pre-redeem balances: ETH={pre_eth:.6f} USDC={pre_usdc:.2f}")
-        for poll_i, poll_wait in enumerate([5, 8, 10, 12, 15, 15], 1):
+        redeem_detected = False
+        for poll_i, poll_wait in enumerate([5, 8, 10, 12, 15, 15, 15, 10], 1):  # 最多 90 秒
             time.sleep(poll_wait)
             post_eth, post_usdc, post_fail = get_balances(force=True)
             if post_fail:
@@ -1793,10 +2129,14 @@ def execute_rebalance(
             gained = (post_eth - pre_eth) * price + (post_usdc - pre_usdc)
             if gained > MIN_TRADE_USD:
                 log(f"  Redeem funds arrived (poll {poll_i}): ETH={post_eth:.6f} USDC={post_usdc:.2f} (+${gained:.2f})")
+                redeem_detected = True
                 break
             log(f"  Redeem poll {poll_i}: ETH={post_eth:.6f} USDC={post_usdc:.2f} (gained ${gained:.2f}, waiting...)")
-        else:
-            log("  Redeem funds not detected after 65s — proceeding with current balances")
+        if not redeem_detected:
+            log("  ⚠ Redeem funds not reflected after 90s — aborting rebalance (funds safe in wallet, will retry next tick)")
+            state["_rebalance_in_progress"] = False
+            save_state(state)
+            return False
 
     # Step 3: Get current balances after redeem (force refresh to bypass cache)
     eth_bal, usdc_bal, bal_failed = get_balances(force=True)
@@ -1911,7 +2251,7 @@ def execute_rebalance(
 
     # Update state
     now_iso = datetime.now().isoformat()
-    candles = get_kline_data("1H", 24)
+    candles = get_pair_kline_data("1H", 24)
     current_atr = calc_kline_volatility(candles) if candles else 0
 
     state.pop("_rebalance_in_progress", None)
@@ -2569,12 +2909,92 @@ def _tick_inner():
 
     # Check for in-progress rebalance from crashed previous tick
     if state.get("_rebalance_in_progress"):
-        log(
-            "Previous rebalance was interrupted — clearing position, next tick will re-deposit"
-        )
-        state.pop("_rebalance_in_progress", None)
-        state["position"] = None
-        save_state(state)
+        log("Previous rebalance was interrupted — checking on-chain positions before clearing")
+        old_position = state.get("position") or {}
+        old_token_id = old_position.get("token_id", "")
+        redeemed_from = old_position.get("_redeemed_from", "")
+        # Use _redeemed_from as threshold: any token_id > this was created by the deposit
+        after_tid = redeemed_from or old_token_id
+        onchain_positions = _query_all_positions()
+        new_position_found = None
+        if after_tid and onchain_positions:
+            try:
+                threshold = int(after_tid)
+                candidates = [p for p in onchain_positions if int(p["tokenId"]) > threshold]
+                if candidates:
+                    # Pick the one with highest token_id (most recently created)
+                    new_position_found = max(candidates, key=lambda p: int(p["tokenId"]))
+            except (ValueError, TypeError):
+                pass
+        if not new_position_found and onchain_positions:
+            # Fallback: if we have exactly one position on-chain, adopt it
+            active = [p for p in onchain_positions if p.get("value", 0) > 1.0]
+            if len(active) == 1:
+                new_position_found = active[0]
+                log(f"  Fallback: single active on-chain position found: #{active[0]['tokenId']}")
+        if new_position_found:
+            adopted_tid = new_position_found["tokenId"]
+            adopted_val = new_position_found.get("value", 0)
+            log(
+                f"  Interrupted rebalance created position #{adopted_tid} "
+                f"(value=${adopted_val:.2f}) — adopting instead of clearing"
+            )
+            state.pop("_rebalance_in_progress", None)
+            # Preserve tick range from old position if available
+            state["position"] = {
+                "token_id": adopted_tid,
+                "tick_lower": old_position.get("tick_lower"),
+                "tick_upper": old_position.get("tick_upper"),
+                "lower_price": old_position.get("lower_price"),
+                "upper_price": old_position.get("upper_price"),
+                "created_at": old_position.get("created_at"),
+                "created_atr_pct": old_position.get("created_atr_pct", 0),
+                "_adopted_from_interrupted_rebalance": True,
+            }
+            save_state(state)
+            # Clean up any other residual positions
+            cleanup_residual_positions(adopted_tid)
+        else:
+            log("  No new on-chain position found — clearing state, next tick will re-deposit")
+            state.pop("_rebalance_in_progress", None)
+            state["position"] = None
+            save_state(state)
+
+    # Periodic orphan position check — detect untracked positions on-chain
+    position = state.get("position")
+    tracked_tid = position.get("token_id", "") if position else ""
+    try:
+        all_onchain = _query_all_positions()
+        active_onchain = [p for p in all_onchain if p.get("value", 0) > 1.0]
+        tracked_count = 1 if tracked_tid else 0
+        if len(active_onchain) > tracked_count:
+            orphan_tids = [
+                p["tokenId"] for p in active_onchain
+                if p["tokenId"] != tracked_tid
+            ]
+            log(
+                f"ORPHAN CHECK: {len(active_onchain)} on-chain positions "
+                f"but only {tracked_count} tracked. Orphans: {orphan_tids}"
+            )
+            if tracked_tid:
+                cleanup_residual_positions(tracked_tid)
+            elif len(active_onchain) == 1:
+                # No tracked position but one exists on-chain — adopt it
+                adopt = active_onchain[0]
+                log(f"  Adopting orphan position #{adopt['tokenId']} (${adopt['value']:.2f})")
+                state["position"] = {
+                    "token_id": adopt["tokenId"],
+                    "tick_lower": None,
+                    "tick_upper": None,
+                    "lower_price": None,
+                    "upper_price": None,
+                    "created_at": datetime.now().isoformat(),
+                    "created_atr_pct": 0,
+                    "_adopted_from_orphan_check": True,
+                }
+                save_state(state)
+    except Exception as e:
+        log(f"Orphan position check failed (non-fatal): {e}")
 
     # Circuit breaker
     errors = state.get("errors", {})
@@ -2725,7 +3145,7 @@ def _tick_inner():
             elapsed = (datetime.now() - fetched_dt).total_seconds()
             kline_stale = elapsed > 3600
     if kline_stale:
-        candles = get_kline_data("1H", 24)
+        candles = get_pair_kline_data("1H", 24)
         if candles:
             kline_vol = calc_kline_volatility(candles)
             state["kline_cache"] = {
@@ -2939,10 +3359,34 @@ def _tick_inner():
             if rebalanced:
                 tick_status = "rebalanced"
                 errors["consecutive"] = 0
+                # Reset consecutive rebalance failure counter on success
+                state["_consecutive_rebalance_failures"] = 0
             else:
                 tick_status = "rebalance_failed"
                 errors["consecutive"] = errors.get("consecutive", 0) + 1
                 n = errors["consecutive"]
+                # Track consecutive rebalance failures for DW safety
+                consec_rebal_fail = state.get("_consecutive_rebalance_failures", 0) + 1
+                state["_consecutive_rebalance_failures"] = consec_rebal_fail
+                if (
+                    DW_ENABLED
+                    and consec_rebal_fail >= DW_FAILURE_ALERT_THRESHOLD
+                    and consec_rebal_fail == DW_FAILURE_ALERT_THRESHOLD  # notify once
+                ):
+                    log(
+                        f"DW SAFETY: {consec_rebal_fail} consecutive rebalance failures "
+                        f"— pausing until manual resume or next success"
+                    )
+                    emit(
+                        "dw_failure_pause",
+                        {
+                            "status": "dw_failure_pause",
+                            "consecutive_failures": consec_rebal_fail,
+                            "price": round(price, 2),
+                        },
+                        notify=True,
+                        tier="risk_alert",
+                    )
                 # Exponential backoff: 10min, 20min, 40min, ... capped at COOLDOWN_AFTER_ERRORS
                 backoff = min(600 * (2 ** (n - 1)), COOLDOWN_AFTER_ERRORS)
                 errors["cooldown_until"] = (
@@ -3582,7 +4026,7 @@ def analyze():
     total_usd = eth_bal * price + usdc_bal
     mtf = analyze_multi_timeframe(history, price)
 
-    candles = get_kline_data("1H", 24)
+    candles = get_pair_kline_data("1H", 24)
     kline_vol = calc_kline_volatility(candles) if candles else None
     atr_pct = kline_vol if kline_vol else 2.0
 
