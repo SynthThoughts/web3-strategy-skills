@@ -2193,6 +2193,157 @@ def _calc_entry_usdc_base(
 # ── Rebalance Execution ────────────────────────────────────────────────────
 
 
+OOR_EDGE_OFFSET_SPACINGS = CFG.get("oor_edge_offset_spacings", 1)
+OOR_EDGE_WIDTH_SPACINGS = CFG.get("oor_edge_width_spacings", 3)
+OOR_EDGE_SPLIT = CFG.get("oor_edge_split", 0.5)
+OOR_EDGE_TIMEOUT_HOURS = CFG.get("oor_edge_timeout_hours", 6)
+
+
+def _execute_oor_split(state: dict, price: float, trigger: dict,
+                        eth_bal: float, usdc_bal: float,
+                        available_eth: float) -> bool:
+    """Post-OOR close: split the 100%-single-sided wallet into:
+      - OOR_EDGE_SPLIT (default 50%) → minted as single-sided range order
+        that V3 will auto-swap to the opposite token when price reverses
+      - remainder → stays in wallet for future main mint once edge fills
+
+    Side detection uses trigger["detail"]: "below" or "above".
+    """
+    side_dir = trigger.get("detail", "")
+    current_tick = price_to_tick(price)
+    spacing = TICK_SPACING
+    offset = OOR_EDGE_OFFSET_SPACINGS * spacing
+    width = OOR_EDGE_WIDTH_SPACINGS * spacing
+
+    if side_dir == "below":
+        # Price fell below main.lower → wallet is ~100% WETH
+        # Edge: sell_weth range ABOVE current (limit sell WETH as price rebounds)
+        edge_side = "sell_weth"
+        tick_lower = ((current_tick + offset + spacing - 1) // spacing) * spacing
+        tick_upper = tick_lower + width
+        edge_amount = int(available_eth * OOR_EDGE_SPLIT * 10 ** int(TOKEN0["decimals"]))
+        min_amount = int(MIN_TRADE_USD / price * 10 ** int(TOKEN0["decimals"]))
+        if edge_amount < min_amount:
+            log(f"  OOR split: edge size too small ({edge_amount} wei < min {min_amount})")
+            return False
+    elif side_dir == "above":
+        # Price rose above main.upper → wallet is ~100% USDC
+        edge_side = "buy_weth"
+        tick_upper = ((current_tick - offset) // spacing) * spacing
+        tick_lower = tick_upper - width
+        edge_amount = int(usdc_bal * OOR_EDGE_SPLIT * 10 ** int(TOKEN1["decimals"]))
+        min_amount = int(MIN_TRADE_USD * 10 ** int(TOKEN1["decimals"]))
+        if edge_amount < min_amount:
+            log(f"  OOR split: edge size too small ({edge_amount} μunits < min {min_amount})")
+            return False
+    else:
+        log(f"  OOR split: unknown trigger.detail {side_dir!r} — skip split")
+        return False
+
+    p_lo = tick_to_price(tick_lower)
+    p_hi = tick_to_price(tick_upper)
+    log(
+        f"  OOR split [{side_dir}]: {edge_side} edge amount={edge_amount} "
+        f"range tick[{tick_lower},{tick_upper}] = ${p_lo:.0f}-${p_hi:.0f} "
+        f"(current ${price:.2f})"
+    )
+
+    try:
+        from range_order_direct import mint_range_order
+        from edge_manager import _extract_new_token_id, Edge, save_edges
+    except Exception as e:
+        log(f"  OOR split: module import failed: {e}")
+        return False
+
+    ok, info = mint_range_order(edge_side, edge_amount, tick_lower, tick_upper)
+    if not ok:
+        log(f"  OOR split: mint failed: {info}")
+        return False
+
+    tx_hash = info if info.startswith("0x") else ""
+    new_tid = _extract_new_token_id(tx_hash) if tx_hash else None
+    if not new_tid:
+        log(f"  OOR split: edge minted (tx={tx_hash}) but token_id unresolved")
+        # Don't fail hard — tx went through, token_id just not parsed yet
+        return True
+
+    edge = Edge(
+        token_id=str(new_tid),
+        side=edge_side,
+        tick_lower=tick_lower,
+        tick_upper=tick_upper,
+        amount_raw=edge_amount,
+        token=TOKEN0["address"] if edge_side == "sell_weth" else TOKEN1["address"],
+        created_at=datetime.now().isoformat(),
+        created_tick=current_tick,
+        liquidity=0,
+    )
+    edges_now = []
+    for e in state.get("edges", []) or []:
+        try:
+            edges_now.append(Edge.from_dict(e))
+        except Exception:
+            pass
+    edges_now.append(edge)
+    save_edges(edges_now)
+
+    log(f"  ✓ OOR split complete: edge #{new_tid} + ~half wallet held for next main")
+    emit("oor_split", {
+        "token_id": str(new_tid),
+        "side": edge_side,
+        "tick_range": [tick_lower, tick_upper],
+        "price_range": [p_lo, p_hi],
+        "edge_amount": edge_amount,
+        "tx": tx_hash,
+    }, notify=True)
+    return True
+
+
+def _try_resolve_pending_edges(state: dict, price: float) -> bool:
+    """Before mounting a new main, close any edges that have fully filled
+    (price has fully traversed them). Returns True if any edge closed.
+    Also force-closes edges that exceeded OOR_EDGE_TIMEOUT_HOURS.
+    """
+    try:
+        from edge_manager import Edge, load_edges, save_edges, close_edge, fill_pct
+    except Exception:
+        return False
+    edges = load_edges()
+    if not edges:
+        return False
+    current_tick = price_to_tick(price)
+    keep = []
+    closed_any = False
+    now = datetime.now()
+    for e in edges:
+        f = fill_pct(e, current_tick)
+        age_h = 0.0
+        try:
+            created = _safe_isoparse(e.created_at)
+            age_h = (now - created).total_seconds() / 3600 if created else 0
+        except Exception:
+            pass
+        if f >= 95.0:
+            log(f"  Edge {e.token_id} filled {f:.1f}% — closing")
+            if close_edge(e):
+                closed_any = True
+            else:
+                keep.append(e)
+        elif age_h > OOR_EDGE_TIMEOUT_HOURS:
+            log(f"  Edge {e.token_id} timed out ({age_h:.1f}h > {OOR_EDGE_TIMEOUT_HOURS}h) — force close")
+            if close_edge(e):
+                closed_any = True
+                emit("edge_timeout", {"token_id": e.token_id, "age_h": round(age_h, 1)},
+                     notify=True)
+            else:
+                keep.append(e)
+        else:
+            keep.append(e)
+    if closed_any:
+        save_edges(keep)
+    return closed_any
+
+
 def execute_rebalance(
     state: dict,
     price: float,
@@ -2300,6 +2451,19 @@ def execute_rebalance(
     if total_usd < MIN_TRADE_USD:
         log(f"  Balance too low after redeem: ${total_usd:.2f}")
         return False
+
+    # OOR-split branch: post-OOR close, don't do balanced mint. Instead
+    # split single-sided wallet 50/50 — half mints a range-order "edge"
+    # acting as zero-slippage swap; half stays in wallet awaiting edge
+    # fill, then a later tick rebuilds main with balanced funds.
+    if trigger.get("trigger") == "out_of_range":
+        oor_result = _execute_oor_split(
+            state, price, trigger, eth_bal, usdc_bal, available_eth,
+        )
+        if oor_result:
+            state["_rebalance_in_progress"] = False
+            save_state(state)
+        return bool(oor_result)
 
     # Step 4: Calculate dual-token deposit — swap to balance if needed
     log(f"  Balances: ETH={eth_bal:.6f} USDC={usdc_bal:.2f}")
@@ -3604,32 +3768,61 @@ def _tick_inner():
     rebalanced = False
 
     if not position or not position.get("tick_lower"):
-        # No position — clean up any orphaned positions before creating new one
-        residual_cleaned = cleanup_residual_positions("")
-        if residual_cleaned:
-            log(f"Cleaned {residual_cleaned} orphaned position(s) before initial deposit")
-            eth_bal, usdc_bal, balance_failed = get_balances(force=True)
-            total_usd = eth_bal * price + usdc_bal
-        log("No active position — creating initial LP position")
-        new_range = calc_optimal_range(price, atr_pct, mtf)
-        log(
-            f"Initial range: ${new_range['lower_price']:.2f}-${new_range['upper_price']:.2f} "
-            f"({new_range['regime']}, width {new_range['half_width_pct']:.1f}%)"
-        )
-
-        # For initial deposit, skip risk checks except data validation
-        initial_trigger = {
-            "trigger": "initial_deposit",
-            "priority": "mandatory",
-            "detail": "first position",
-        }
-
-        if total_usd < MIN_TRADE_USD:
-            log(f"Balance too low for initial deposit: ${total_usd:.2f}")
-            tick_status = "insufficient_balance"
+        # Pending edges take priority: resolve them first (close filled /
+        # timeout); if any still pending after this, defer main mint until
+        # wallet rebalances naturally via edge fills.
+        edges_now = state.get("edges") or []
+        if edges_now:
+            closed_any = _try_resolve_pending_edges(state, price)
+            remaining = (load_state().get("edges") or [])
+            if remaining:
+                log(
+                    f"No main position but {len(remaining)} edge(s) active — "
+                    f"deferring new main until edges fill/close "
+                    f"(closed this tick: {len(edges_now) - len(remaining)})"
+                )
+                tick_status = "awaiting_edge_fill"
+                # Refresh balances for snapshot; don't call execute_rebalance
+                eth_bal, usdc_bal, balance_failed = get_balances(force=True)
+                total_usd = eth_bal * price + usdc_bal
+                # Fall through to snapshot/emit logic below (skip mint)
+                rebalanced = False
+                new_range = None  # prevent initial_deposit path below
+                goto_skip_mint = True
+            else:
+                log(f"All {len(edges_now)} edge(s) resolved; proceeding to mint new main")
+                eth_bal, usdc_bal, balance_failed = get_balances(force=True)
+                total_usd = eth_bal * price + usdc_bal
+                goto_skip_mint = False
         else:
-            rebalanced = execute_rebalance(state, price, new_range, initial_trigger)
-            tick_status = "initial_deposit" if rebalanced else "initial_deposit_failed"
+            goto_skip_mint = False
+
+        if not goto_skip_mint:
+            # No position — clean up any orphaned positions before creating new one
+            residual_cleaned = cleanup_residual_positions("")
+            if residual_cleaned:
+                log(f"Cleaned {residual_cleaned} orphaned position(s) before initial deposit")
+                eth_bal, usdc_bal, balance_failed = get_balances(force=True)
+                total_usd = eth_bal * price + usdc_bal
+            log("No active position — creating initial LP position")
+            new_range = calc_optimal_range(price, atr_pct, mtf)
+            log(
+                f"Initial range: ${new_range['lower_price']:.2f}-${new_range['upper_price']:.2f} "
+                f"({new_range['regime']}, width {new_range['half_width_pct']:.1f}%)"
+            )
+
+            initial_trigger = {
+                "trigger": "initial_deposit",
+                "priority": "mandatory",
+                "detail": "first position",
+            }
+
+            if total_usd < MIN_TRADE_USD:
+                log(f"Balance too low for initial deposit: ${total_usd:.2f}")
+                tick_status = "insufficient_balance"
+            else:
+                rebalanced = execute_rebalance(state, price, new_range, initial_trigger)
+                tick_status = "initial_deposit" if rebalanced else "initial_deposit_failed"
 
     elif risk_reject:
         log(f"Risk check: {risk_reject}")

@@ -42,13 +42,35 @@ _load_env()
 # ── Load Config ─────────────────────────────────────────────────────────────
 
 SCRIPT_DIR = Path(__file__).parent
-CONFIG_FILE = SCRIPT_DIR / "config.json"
+
+# lp-auto multi-instance support: if LP_AUTO_INSTANCE_DIR is set, load config
+# and state from there instead of next to the script. Allows one codebase to
+# serve many pool instances, each in ~/.lp-auto/instances/<name>/.
+INSTANCE_DIR = Path(os.environ.get("LP_AUTO_INSTANCE_DIR", str(SCRIPT_DIR)))
+
+CONFIG_FILE = INSTANCE_DIR / "config.json"
+DEFAULTS_FILE = SCRIPT_DIR / "config.default.json"
 
 if CONFIG_FILE.exists():
     CFG = json.loads(CONFIG_FILE.read_text())
+elif (SCRIPT_DIR / "config.json").exists():
+    # Fallback: legacy single-instance layout (cl-lp-rebalancer v1)
+    CFG = json.loads((SCRIPT_DIR / "config.json").read_text())
+    INSTANCE_DIR = SCRIPT_DIR
 else:
-    print("ERROR: config.json not found", file=sys.stderr)
+    print(
+        f"ERROR: no config.json at {CONFIG_FILE}.\n"
+        f"  If using lp-auto: run `lp-auto init --chain <c> --risk <r> --capital <n>` first.\n"
+        f"  If using cl-lp-rebalancer v1: place config.json at {SCRIPT_DIR}.",
+        file=sys.stderr,
+    )
     sys.exit(1)
+
+# Merge with defaults (lp-auto configs may omit fields that defaults provide)
+if DEFAULTS_FILE.exists():
+    _defaults = json.loads(DEFAULTS_FILE.read_text())
+    for k, v in _defaults.items():
+        CFG.setdefault(k, v)
 
 # ── API Keys ────────────────────────────────────────────────────────────────
 
@@ -56,17 +78,47 @@ OKX_API_KEY = os.environ.get("OKX_API_KEY", "")
 OKX_SECRET = os.environ.get("OKX_SECRET_KEY", "")
 OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
 
-# ── Config values ───────────────────────────────────────────────────────────
+# ── Pool parameters (dual-source: new pool_config dict OR legacy top-level) ──
+#
+# Precedence:
+#   1) CFG["pool_config"]  — populated by `lp-auto init` from onchainos detail.
+#      Format: {investment_id, chain, chain_index, token0_symbol,
+#               token0_address, token0_decimals, token1_symbol,
+#               token1_address, token1_decimals, fee_tier, tick_spacing}
+#   2) Legacy flat fields (investment_id, pool_chain, token0{...}, ...)
+#      — kept for v1 (cl-lp-rebalancer) back-compat.
+#
+# The rest of cl_lp.py continues to reference INVESTMENT_ID / TOKEN0 / TOKEN1
+# etc. — we populate those constants here from whichever source applies.
 
-INVESTMENT_ID = CFG["investment_id"]
-POOL_CHAIN = CFG["pool_chain"]
-FEE_TIER = CFG["fee_tier"]
-TICK_SPACING = CFG["tick_spacing"]
-TOKEN0 = CFG["token0"]
-TOKEN1 = CFG["token1"]
+_pc = CFG.get("pool_config") or None
+if _pc:
+    INVESTMENT_ID = str(_pc["investment_id"])
+    POOL_CHAIN = _pc["chain"]
+    CHAIN_ID = str(_pc.get("chain_index") or {"base": "8453", "ethereum": "1",
+                                                "arbitrum": "42161", "optimism": "10",
+                                                "polygon": "137", "bsc": "56"}.get(POOL_CHAIN, "8453"))
+    FEE_TIER = float(_pc["fee_tier"])
+    TICK_SPACING = int(_pc.get("tick_spacing")
+                       or {0.0001: 1, 0.0005: 10, 0.003: 60, 0.01: 200}.get(FEE_TIER, 60))
+    TOKEN0 = {"symbol": _pc["token0_symbol"],
+              "address": _pc["token0_address"],
+              "decimals": int(_pc["token0_decimals"])}
+    TOKEN1 = {"symbol": _pc["token1_symbol"],
+              "address": _pc["token1_address"],
+              "decimals": int(_pc["token1_decimals"])}
+else:
+    # Legacy flat layout
+    INVESTMENT_ID = CFG["investment_id"]
+    POOL_CHAIN = CFG["pool_chain"]
+    FEE_TIER = CFG["fee_tier"]
+    TICK_SPACING = CFG["tick_spacing"]
+    TOKEN0 = CFG["token0"]
+    TOKEN1 = CFG["token1"]
+    CHAIN_ID = CFG.get("chain_id", "8453")
+
 ETH_ADDR = TOKEN0["address"]
 USDC_ADDR = TOKEN1["address"]
-CHAIN_ID = CFG.get("chain_id", "8453")
 PLATFORM_ID = CFG.get("platform_id", "68")  # onchainos defi platform ID
 NATIVE_TOKEN = CFG.get("native_token", "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
 PAIR_NAME = f"{TOKEN0['symbol']}/{TOKEN1['symbol']}"
@@ -288,8 +340,19 @@ EMA_PERIOD = 20
 
 # ── Paths ───────────────────────────────────────────────────────────────────
 
-STATE_FILE = SCRIPT_DIR / "cl_lp_state.json"
-LOG_FILE = SCRIPT_DIR / "cl_lp.log"
+# Per-instance state — lives in ~/.lp-auto/instances/<name>/ when launched via
+# lp-auto CLI, or next to the script (legacy single-instance layout) otherwise.
+# Prefer "state.json" in instance mode, keep "cl_lp_state.json" for legacy.
+
+if (INSTANCE_DIR / "state.json").exists():
+    STATE_FILE = INSTANCE_DIR / "state.json"
+elif (INSTANCE_DIR / "cl_lp_state.json").exists():
+    STATE_FILE = INSTANCE_DIR / "cl_lp_state.json"
+else:
+    # New instance: choose layout by presence of pool_config (new style)
+    STATE_FILE = INSTANCE_DIR / ("state.json" if _pc else "cl_lp_state.json")
+
+LOG_FILE = INSTANCE_DIR / "cl_lp.log"
 MAX_LOG_BYTES = 1_000_000
 
 
@@ -337,7 +400,7 @@ def _safe_isoparse(s: str, default: datetime | None = None) -> datetime | None:
 
 # ── Process lock ───────────────────────────────────────────────────────────
 
-LOCK_FILE = SCRIPT_DIR / ".cl_lp.lock"
+LOCK_FILE = INSTANCE_DIR / ".cl_lp.lock"
 _lock_fd = None
 
 
@@ -687,12 +750,11 @@ def find_latest_token_id(after_token_id: str = "") -> str:
 
 def cleanup_residual_positions(keep_token_id: str, max_retries: int = 3,
                                  extra_keep_ids: set[str] | None = None) -> int:
-    """Redeem all positions except keep_token_id and any edge NFTs tracked
-    in state.edges (populated by edge_manager). Returns count of cleaned
-    positions. Retries failed redemptions up to max_retries times.
+    """Redeem all positions except keep_token_id and any edge NFTs tracked in
+    state.edges (populated by edge_manager). Returns count of cleaned positions.
 
-    extra_keep_ids overrides the state.edges lookup — pass explicitly to
-    skip the default behavior.
+    extra_keep_ids overrides the state.edges lookup — pass explicitly if you
+    don't want the default behavior.
     """
     positions = _query_all_positions()
     # Build full keep set: main position + all edges from state
@@ -2131,6 +2193,157 @@ def _calc_entry_usdc_base(
 # ── Rebalance Execution ────────────────────────────────────────────────────
 
 
+OOR_EDGE_OFFSET_SPACINGS = CFG.get("oor_edge_offset_spacings", 1)
+OOR_EDGE_WIDTH_SPACINGS = CFG.get("oor_edge_width_spacings", 3)
+OOR_EDGE_SPLIT = CFG.get("oor_edge_split", 0.5)
+OOR_EDGE_TIMEOUT_HOURS = CFG.get("oor_edge_timeout_hours", 6)
+
+
+def _execute_oor_split(state: dict, price: float, trigger: dict,
+                        eth_bal: float, usdc_bal: float,
+                        available_eth: float) -> bool:
+    """Post-OOR close: split the 100%-single-sided wallet into:
+      - OOR_EDGE_SPLIT (default 50%) → minted as single-sided range order
+        that V3 will auto-swap to the opposite token when price reverses
+      - remainder → stays in wallet for future main mint once edge fills
+
+    Side detection uses trigger["detail"]: "below" or "above".
+    """
+    side_dir = trigger.get("detail", "")
+    current_tick = price_to_tick(price)
+    spacing = TICK_SPACING
+    offset = OOR_EDGE_OFFSET_SPACINGS * spacing
+    width = OOR_EDGE_WIDTH_SPACINGS * spacing
+
+    if side_dir == "below":
+        # Price fell below main.lower → wallet is ~100% WETH
+        # Edge: sell_weth range ABOVE current (limit sell WETH as price rebounds)
+        edge_side = "sell_weth"
+        tick_lower = ((current_tick + offset + spacing - 1) // spacing) * spacing
+        tick_upper = tick_lower + width
+        edge_amount = int(available_eth * OOR_EDGE_SPLIT * 10 ** int(TOKEN0["decimals"]))
+        min_amount = int(MIN_TRADE_USD / price * 10 ** int(TOKEN0["decimals"]))
+        if edge_amount < min_amount:
+            log(f"  OOR split: edge size too small ({edge_amount} wei < min {min_amount})")
+            return False
+    elif side_dir == "above":
+        # Price rose above main.upper → wallet is ~100% USDC
+        edge_side = "buy_weth"
+        tick_upper = ((current_tick - offset) // spacing) * spacing
+        tick_lower = tick_upper - width
+        edge_amount = int(usdc_bal * OOR_EDGE_SPLIT * 10 ** int(TOKEN1["decimals"]))
+        min_amount = int(MIN_TRADE_USD * 10 ** int(TOKEN1["decimals"]))
+        if edge_amount < min_amount:
+            log(f"  OOR split: edge size too small ({edge_amount} μunits < min {min_amount})")
+            return False
+    else:
+        log(f"  OOR split: unknown trigger.detail {side_dir!r} — skip split")
+        return False
+
+    p_lo = tick_to_price(tick_lower)
+    p_hi = tick_to_price(tick_upper)
+    log(
+        f"  OOR split [{side_dir}]: {edge_side} edge amount={edge_amount} "
+        f"range tick[{tick_lower},{tick_upper}] = ${p_lo:.0f}-${p_hi:.0f} "
+        f"(current ${price:.2f})"
+    )
+
+    try:
+        from range_order_direct import mint_range_order
+        from edge_manager import _extract_new_token_id, Edge, save_edges
+    except Exception as e:
+        log(f"  OOR split: module import failed: {e}")
+        return False
+
+    ok, info = mint_range_order(edge_side, edge_amount, tick_lower, tick_upper)
+    if not ok:
+        log(f"  OOR split: mint failed: {info}")
+        return False
+
+    tx_hash = info if info.startswith("0x") else ""
+    new_tid = _extract_new_token_id(tx_hash) if tx_hash else None
+    if not new_tid:
+        log(f"  OOR split: edge minted (tx={tx_hash}) but token_id unresolved")
+        # Don't fail hard — tx went through, token_id just not parsed yet
+        return True
+
+    edge = Edge(
+        token_id=str(new_tid),
+        side=edge_side,
+        tick_lower=tick_lower,
+        tick_upper=tick_upper,
+        amount_raw=edge_amount,
+        token=TOKEN0["address"] if edge_side == "sell_weth" else TOKEN1["address"],
+        created_at=datetime.now().isoformat(),
+        created_tick=current_tick,
+        liquidity=0,
+    )
+    edges_now = []
+    for e in state.get("edges", []) or []:
+        try:
+            edges_now.append(Edge.from_dict(e))
+        except Exception:
+            pass
+    edges_now.append(edge)
+    save_edges(edges_now)
+
+    log(f"  ✓ OOR split complete: edge #{new_tid} + ~half wallet held for next main")
+    emit("oor_split", {
+        "token_id": str(new_tid),
+        "side": edge_side,
+        "tick_range": [tick_lower, tick_upper],
+        "price_range": [p_lo, p_hi],
+        "edge_amount": edge_amount,
+        "tx": tx_hash,
+    }, notify=True)
+    return True
+
+
+def _try_resolve_pending_edges(state: dict, price: float) -> bool:
+    """Before mounting a new main, close any edges that have fully filled
+    (price has fully traversed them). Returns True if any edge closed.
+    Also force-closes edges that exceeded OOR_EDGE_TIMEOUT_HOURS.
+    """
+    try:
+        from edge_manager import Edge, load_edges, save_edges, close_edge, fill_pct
+    except Exception:
+        return False
+    edges = load_edges()
+    if not edges:
+        return False
+    current_tick = price_to_tick(price)
+    keep = []
+    closed_any = False
+    now = datetime.now()
+    for e in edges:
+        f = fill_pct(e, current_tick)
+        age_h = 0.0
+        try:
+            created = _safe_isoparse(e.created_at)
+            age_h = (now - created).total_seconds() / 3600 if created else 0
+        except Exception:
+            pass
+        if f >= 95.0:
+            log(f"  Edge {e.token_id} filled {f:.1f}% — closing")
+            if close_edge(e):
+                closed_any = True
+            else:
+                keep.append(e)
+        elif age_h > OOR_EDGE_TIMEOUT_HOURS:
+            log(f"  Edge {e.token_id} timed out ({age_h:.1f}h > {OOR_EDGE_TIMEOUT_HOURS}h) — force close")
+            if close_edge(e):
+                closed_any = True
+                emit("edge_timeout", {"token_id": e.token_id, "age_h": round(age_h, 1)},
+                     notify=True)
+            else:
+                keep.append(e)
+        else:
+            keep.append(e)
+    if closed_any:
+        save_edges(keep)
+    return closed_any
+
+
 def execute_rebalance(
     state: dict,
     price: float,
@@ -2238,6 +2451,19 @@ def execute_rebalance(
     if total_usd < MIN_TRADE_USD:
         log(f"  Balance too low after redeem: ${total_usd:.2f}")
         return False
+
+    # OOR-split branch: post-OOR close, don't do balanced mint. Instead
+    # split single-sided wallet 50/50 — half mints a range-order "edge"
+    # acting as zero-slippage swap; half stays in wallet awaiting edge
+    # fill, then a later tick rebuilds main with balanced funds.
+    if trigger.get("trigger") == "out_of_range":
+        oor_result = _execute_oor_split(
+            state, price, trigger, eth_bal, usdc_bal, available_eth,
+        )
+        if oor_result:
+            state["_rebalance_in_progress"] = False
+            save_state(state)
+        return bool(oor_result)
 
     # Step 4: Calculate dual-token deposit — swap to balance if needed
     log(f"  Balances: ETH={eth_bal:.6f} USDC={usdc_bal:.2f}")
@@ -2975,6 +3201,156 @@ MAX_DEPOSIT_FAILURES = CFG.get("max_deposit_failures", 3)  # pause after N conse
 MAX_BALANCE_FAILURES = CFG.get("max_balance_failures", 5)
 
 
+def _check_auto_switch_pool() -> bool:
+    """Phase C: if auto_switch enabled, evaluate pool_selector and execute
+    cross-pool migration when its streak-gated recommendation is ready.
+
+    Returns True if a switch was executed — the caller should exit the tick
+    so the next cron invocation re-imports cl_lp with fresh pool constants.
+    """
+    if not CFG.get("auto_switch", False):
+        return False
+
+    selector_state_file = INSTANCE_DIR / "pool_selector_state.json"
+    now_ts = time.time()
+    should_evaluate = True
+
+    # Throttle: only re-run selector if last run was > 55 min ago
+    if selector_state_file.exists():
+        try:
+            sel = json.loads(selector_state_file.read_text())
+            runs = sel.get("runs", [])
+            if runs:
+                last_ts_iso = runs[-1].get("ts", "")
+                last_ts = datetime.fromisoformat(last_ts_iso).timestamp() \
+                    if last_ts_iso else 0
+                if now_ts - last_ts < 55 * 60:
+                    should_evaluate = False
+        except Exception:
+            pass
+
+    if should_evaluate:
+        log("auto_switch: running pool_selector...")
+        env = dict(os.environ)
+        env["LP_AUTO_INSTANCE_DIR"] = str(INSTANCE_DIR)
+        try:
+            subprocess.run([
+                sys.executable, str(SCRIPT_DIR / "pool_selector.py"),
+                "--capital", str(CFG.get("capital_usd", 500)),
+                "--max-risk", CFG.get("max_risk", "medium"),
+                "--chain", POOL_CHAIN,
+                "--threshold", str(CFG.get("switch_uplift_threshold", 0.30)),
+                "--current-pool", INVESTMENT_ID,
+            ], env=env, timeout=180, capture_output=True)
+        except Exception as e:
+            log(f"auto_switch: selector run failed: {e}")
+
+    # Check for pending recommendation (streak-gated)
+    if not selector_state_file.exists():
+        return False
+    try:
+        sel = json.loads(selector_state_file.read_text())
+    except Exception:
+        return False
+    rec = sel.get("recommend")
+    if not rec:
+        return False
+
+    # Extra safety: ensure recommendation targets a *different* pool
+    target_id = str(rec.get("pool_id", ""))
+    if not target_id or target_id == INVESTMENT_ID:
+        sel.pop("recommend", None)
+        selector_state_file.write_text(json.dumps(sel, indent=2))
+        return False
+
+    tick_lo = int(rec["tick_lo"])
+    tick_hi = int(rec["tick_hi"])
+    log(f"auto_switch: triggering pool_switch → {target_id} "
+        f"tick [{tick_lo}, {tick_hi}]  uplift={rec['uplift']*100:.1f}%")
+
+    env = dict(os.environ)
+    env["LP_AUTO_INSTANCE_DIR"] = str(INSTANCE_DIR)
+    result = subprocess.run([
+        sys.executable, str(SCRIPT_DIR / "pool_switch.py"),
+        target_id, str(tick_lo), str(tick_hi),
+    ], env=env, timeout=600)
+    if result.returncode != 0:
+        log(f"auto_switch: pool_switch failed (rc={result.returncode})")
+        return False
+
+    # Update config.json with new pool_config so next tick picks it up
+    try:
+        from pool_config import fetch_pool_config
+        new_pc = fetch_pool_config(target_id, POOL_CHAIN)
+        if new_pc:
+            CFG["pool_config"] = {
+                "investment_id": new_pc.investment_id,
+                "chain": new_pc.chain,
+                "chain_index": new_pc.chain_index,
+                "token0_symbol": new_pc.token0_symbol,
+                "token0_address": new_pc.token0_address,
+                "token0_decimals": new_pc.token0_decimals,
+                "token1_symbol": new_pc.token1_symbol,
+                "token1_address": new_pc.token1_address,
+                "token1_decimals": new_pc.token1_decimals,
+                "fee_tier": new_pc.fee_tier,
+                "tick_spacing": new_pc.tick_spacing,
+            }
+            CONFIG_FILE.write_text(json.dumps(CFG, indent=2))
+            log(f"auto_switch: config.pool_config updated to {target_id}")
+    except Exception as e:
+        log(f"auto_switch: config rewrite failed: {e}")
+
+    # Clear the recommendation
+    sel.pop("recommend", None)
+    selector_state_file.write_text(json.dumps(sel, indent=2))
+
+    emit("pool_switched", {
+        "from_pool": INVESTMENT_ID,
+        "to_pool": target_id,
+        "uplift": rec.get("uplift", 0),
+    }, notify=True)
+    return True
+
+
+def _check_edges():
+    """Phase E4: if auto_edges enabled and main position exists, run the
+    edge_manager cascade — close filled edges, mint missing ones.
+
+    Runs BEFORE main rebalance logic so edges stay in sync with the current
+    main range. Safe to fail: logs and continues.
+    """
+    if not CFG.get("auto_edges", False):
+        return
+    state = load_state()
+    pos = state.get("position") or {}
+    if not pos.get("token_id"):
+        return  # no main position yet
+    try:
+        import edge_manager
+        import capital_efficiency as ce_mod
+        prices = ce_mod.fetch_hourly_prices(INVESTMENT_ID, POOL_CHAIN)
+        eth_price = prices[-1][1] if prices else 0
+        if eth_price <= 0:
+            return
+        edge_capital = float(CFG.get("edge_capital_usd", 20.0))
+        sides_cfg = CFG.get("edge_sides", "buy_weth")  # sell_weth needs WETH wrap
+        sides = [s.strip() for s in sides_cfg.split(",") if s.strip()]
+        summary = edge_manager.check_and_cascade(
+            main_tick_lower=int(pos["tick_lower"]),
+            main_tick_upper=int(pos["tick_upper"]),
+            capital_usd_per_edge=edge_capital,
+            eth_price=eth_price,
+            sides=sides,
+        )
+        if summary.get("closed") or summary.get("minted"):
+            log(f"  auto_edges: closed={summary.get('closed')} minted={summary.get('minted')}")
+        if summary.get("errors"):
+            log(f"  auto_edges errors: {summary.get('errors')}")
+    except Exception as e:
+        log(f"  auto_edges failed: {e}")
+
+
 def tick():
     """Main loop: check position, decide rebalance, execute."""
     # Process lock — prevent concurrent ticks
@@ -2983,6 +3359,13 @@ def tick():
         emit("tick", {"status": "locked", "retriable": False})
         return
     try:
+        # Phase C: auto-switch to a better pool if conditions met.
+        # Exits tick on successful switch; next cron run re-imports with new pool.
+        if _check_auto_switch_pool():
+            log("auto_switch completed — exiting tick; next run will use new pool")
+            return
+        # Phase E4: manage edge range-orders (zero-slippage swap substitutes)
+        _check_edges()
         _tick_inner()
     finally:
         _release_lock()
@@ -3052,18 +3435,20 @@ def _tick_inner():
     # Periodic orphan position check — detect untracked positions on-chain
     position = state.get("position")
     tracked_tid = position.get("token_id", "") if position else ""
+    edge_tids = {str(e.get("token_id")) for e in (state.get("edges") or []) if e.get("token_id")}
+    tracked_ids = ({str(tracked_tid)} if tracked_tid else set()) | edge_tids
     try:
         all_onchain = _query_all_positions()
         active_onchain = [p for p in all_onchain if p.get("value", 0) > 1.0]
-        tracked_count = 1 if tracked_tid else 0
-        if len(active_onchain) > tracked_count:
+        if len(active_onchain) > len(tracked_ids):
             orphan_tids = [
                 p["tokenId"] for p in active_onchain
-                if p["tokenId"] != tracked_tid
+                if str(p["tokenId"]) not in tracked_ids
             ]
             log(
-                f"ORPHAN CHECK: {len(active_onchain)} on-chain positions "
-                f"but only {tracked_count} tracked. Orphans: {orphan_tids}"
+                f"ORPHAN CHECK: {len(active_onchain)} on-chain positions, "
+                f"{len(tracked_ids)} tracked (main={tracked_tid!r}, "
+                f"{len(edge_tids)} edge(s)). True orphans: {orphan_tids}"
             )
             if tracked_tid:
                 cleanup_residual_positions(tracked_tid)
@@ -3383,32 +3768,61 @@ def _tick_inner():
     rebalanced = False
 
     if not position or not position.get("tick_lower"):
-        # No position — clean up any orphaned positions before creating new one
-        residual_cleaned = cleanup_residual_positions("")
-        if residual_cleaned:
-            log(f"Cleaned {residual_cleaned} orphaned position(s) before initial deposit")
-            eth_bal, usdc_bal, balance_failed = get_balances(force=True)
-            total_usd = eth_bal * price + usdc_bal
-        log("No active position — creating initial LP position")
-        new_range = calc_optimal_range(price, atr_pct, mtf)
-        log(
-            f"Initial range: ${new_range['lower_price']:.2f}-${new_range['upper_price']:.2f} "
-            f"({new_range['regime']}, width {new_range['half_width_pct']:.1f}%)"
-        )
-
-        # For initial deposit, skip risk checks except data validation
-        initial_trigger = {
-            "trigger": "initial_deposit",
-            "priority": "mandatory",
-            "detail": "first position",
-        }
-
-        if total_usd < MIN_TRADE_USD:
-            log(f"Balance too low for initial deposit: ${total_usd:.2f}")
-            tick_status = "insufficient_balance"
+        # Pending edges take priority: resolve them first (close filled /
+        # timeout); if any still pending after this, defer main mint until
+        # wallet rebalances naturally via edge fills.
+        edges_now = state.get("edges") or []
+        if edges_now:
+            closed_any = _try_resolve_pending_edges(state, price)
+            remaining = (load_state().get("edges") or [])
+            if remaining:
+                log(
+                    f"No main position but {len(remaining)} edge(s) active — "
+                    f"deferring new main until edges fill/close "
+                    f"(closed this tick: {len(edges_now) - len(remaining)})"
+                )
+                tick_status = "awaiting_edge_fill"
+                # Refresh balances for snapshot; don't call execute_rebalance
+                eth_bal, usdc_bal, balance_failed = get_balances(force=True)
+                total_usd = eth_bal * price + usdc_bal
+                # Fall through to snapshot/emit logic below (skip mint)
+                rebalanced = False
+                new_range = None  # prevent initial_deposit path below
+                goto_skip_mint = True
+            else:
+                log(f"All {len(edges_now)} edge(s) resolved; proceeding to mint new main")
+                eth_bal, usdc_bal, balance_failed = get_balances(force=True)
+                total_usd = eth_bal * price + usdc_bal
+                goto_skip_mint = False
         else:
-            rebalanced = execute_rebalance(state, price, new_range, initial_trigger)
-            tick_status = "initial_deposit" if rebalanced else "initial_deposit_failed"
+            goto_skip_mint = False
+
+        if not goto_skip_mint:
+            # No position — clean up any orphaned positions before creating new one
+            residual_cleaned = cleanup_residual_positions("")
+            if residual_cleaned:
+                log(f"Cleaned {residual_cleaned} orphaned position(s) before initial deposit")
+                eth_bal, usdc_bal, balance_failed = get_balances(force=True)
+                total_usd = eth_bal * price + usdc_bal
+            log("No active position — creating initial LP position")
+            new_range = calc_optimal_range(price, atr_pct, mtf)
+            log(
+                f"Initial range: ${new_range['lower_price']:.2f}-${new_range['upper_price']:.2f} "
+                f"({new_range['regime']}, width {new_range['half_width_pct']:.1f}%)"
+            )
+
+            initial_trigger = {
+                "trigger": "initial_deposit",
+                "priority": "mandatory",
+                "detail": "first position",
+            }
+
+            if total_usd < MIN_TRADE_USD:
+                log(f"Balance too low for initial deposit: ${total_usd:.2f}")
+                tick_status = "insufficient_balance"
+            else:
+                rebalanced = execute_rebalance(state, price, new_range, initial_trigger)
+                tick_status = "initial_deposit" if rebalanced else "initial_deposit_failed"
 
     elif risk_reject:
         log(f"Risk check: {risk_reject}")
