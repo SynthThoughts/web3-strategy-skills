@@ -58,7 +58,7 @@ def compute_fill(side: str, tl: int, tu: int, cur: int) -> float:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("token_id")
-    ap.add_argument("--interval", type=int, default=60)
+    ap.add_argument("--interval", type=int, default=10)
     ap.add_argument("--duration", type=int, default=3600)
     args = ap.parse_args()
 
