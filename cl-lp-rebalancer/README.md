@@ -1,3 +1,13 @@
+> [!WARNING]
+> **已弃用 (2026-04-15)** — 请使用 [`lp-auto`](../lp-auto/) 作为后继方案。
+>
+> - 代码已迁移到 `~/AI/Agent/web3-strategy-skills/lp-auto/`（支持多池、多实例、参数化）
+> - 原硬编码 WETH-USDC Base 0.3% 场景保留在 VPS `~/scripts/cl-lp/` 的 v2 代码（`cl_lp.py` + `edge_*`），state 路径改用 `~/.lp-auto/instances/prod/`
+> - 2026-04-15 已归档 v1 文件至 VPS `~/archive/cl-lp-v1-20260415/`，删除 `~/.zeroclaw` 下指向 `run.sh` 的 cron
+> - 本目录仅保留历史文档（README + SKILL.md + references），不再接受更新
+
+---
+
 # CL LP Auto-Rebalancer
 
 Uniswap V3 集中流动性自动调仓策略，运行在 EVM L2 链上，通过 OKX OnchainOS 执行 DeFi 操作。

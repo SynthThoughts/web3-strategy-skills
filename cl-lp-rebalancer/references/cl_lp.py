@@ -111,8 +111,10 @@ else:
     # Legacy flat layout
     INVESTMENT_ID = CFG["investment_id"]
     POOL_CHAIN = CFG["pool_chain"]
-    FEE_TIER = CFG["fee_tier"]
-    TICK_SPACING = CFG["tick_spacing"]
+    FEE_TIER = float(CFG["fee_tier"])
+    # tick_spacing derives from fee_tier (V3 invariant); explicit override optional
+    TICK_SPACING = int(CFG.get("tick_spacing")
+                       or {0.0001: 1, 0.0005: 10, 0.003: 60, 0.01: 200}.get(FEE_TIER, 60))
     TOKEN0 = CFG["token0"]
     TOKEN1 = CFG["token1"]
     CHAIN_ID = CFG.get("chain_id", "8453")
@@ -587,12 +589,17 @@ def get_balances(force: bool = False) -> tuple[float, float, bool]:
     usdc_matches = 0  # sanity: count how many tokenAssets matched USDC_ADDR
     usdc_addr_lc = USDC_ADDR.lower()
 
+    # ETH_ADDR is TOKEN0 address; on Base this is WETH (0x4200...0006).
+    # Wallet may hold both native ETH and WETH — sum them so strategy sees total ETH value.
+    weth_addr_lc = ETH_ADDR.lower()
     def _scan_tokens(token_list):
         nonlocal eth, usdc, usdc_matches
         for token in token_list:
             addr_lc = (token.get("tokenAddress") or "").lower()
             if token.get("tokenAddress") == "" and token.get("symbol") == "ETH":
-                eth = float(token.get("balance", "0"))
+                eth += float(token.get("balance", "0"))  # native ETH
+            elif addr_lc == weth_addr_lc:
+                eth += float(token.get("balance", "0"))  # WETH, 1:1 with ETH
             elif addr_lc == usdc_addr_lc:
                 # Strict address match; multi-variant USDC/USDC.e have different addresses
                 usdc = float(token.get("balance", "0"))
@@ -613,10 +620,11 @@ def get_balances(force: bool = False) -> tuple[float, float, bool]:
     if usdc_matches > 1:
         log(f"⚠ get_balances: {usdc_matches} entries matched USDC_ADDR — using last, but API may be unstable")
 
-    # `wallet balance` on Base does not return native ETH (only ERC20s).
-    # Fall back to `portfolio token-balances` for the native asset so the
-    # strategy doesn't undercount its own gas balance.
-    if eth == 0.0 and WALLET_ADDR:
+    # `wallet balance` on Base does not return native ETH (only ERC20s like WETH, USDC).
+    # Always query native ETH via `portfolio token-balances` and ADD to eth total —
+    # wallet may hold both native ETH (for gas) and WETH (for LP). Missing either
+    # undercounts portfolio and risks false stop-loss (bug fix 2026-04-15).
+    if WALLET_ADDR:
         nat = onchainos_cmd(
             [
                 "portfolio",
@@ -632,10 +640,10 @@ def get_balances(force: bool = False) -> tuple[float, float, bool]:
             for entry in (nat or {}).get("data", []):
                 for token in entry.get("tokenAssets", []):
                     if token.get("symbol") == "ETH" and not token.get("tokenContractAddress"):
-                        eth = float(token.get("balance", "0"))
+                        eth += float(token.get("balance", "0"))
                         break
         except (TypeError, ValueError) as e:
-            log(f"Native ETH fallback parse failed: {e}")
+            log(f"Native ETH add-on parse failed: {e}")
     return eth, usdc, False
 
 
@@ -1947,6 +1955,131 @@ def _enforce_gas_reserve(user_input_json: str) -> str | None:
     return json.dumps(scaled)
 
 
+def _get_eth_weth_split() -> tuple[float, float, bool]:
+    """Return (native_eth, weth_balance, failed) via portfolio token-balances.
+
+    `get_balances` sums native+WETH because strategy cares about total ETH value.
+    But OKX deposit broadcast uses estimateGas which only counts native ETH
+    (not WETH) against tx.value. Use this helper to get the split when it matters.
+    """
+    if not WALLET_ADDR:
+        return 0.0, 0.0, True
+    tokens_spec = f"{CHAIN_ID}:,{CHAIN_ID}:{ETH_ADDR}"
+    data = onchainos_cmd(
+        ["portfolio", "token-balances",
+         "--address", WALLET_ADDR,
+         "--tokens", tokens_spec],
+        timeout=10,
+    )
+    if not data or not data.get("ok"):
+        return 0.0, 0.0, True
+    native, weth = 0.0, 0.0
+    weth_addr_lc = ETH_ADDR.lower()
+    try:
+        for entry in data.get("data", []) or []:
+            for token in entry.get("tokenAssets", []) or []:
+                addr_lc = (token.get("tokenContractAddress") or "").lower()
+                if addr_lc == "" and token.get("symbol") == "ETH":
+                    native = float(token.get("balance", "0"))
+                elif addr_lc == weth_addr_lc:
+                    weth = float(token.get("balance", "0"))
+    except Exception as e:
+        log(f"  _get_eth_weth_split parse failed: {e}")
+        return 0.0, 0.0, True
+    return native, weth, False
+
+
+def _ensure_native_eth_for_deposit(user_input_json: str) -> bool:
+    """Ensure wallet has enough native ETH for the deposit value.
+
+    OKX `defi deposit` with tokenAddress=0xeee...eee passes native ETH as
+    tx.value during broadcast. estimateGas then fails with "insufficient funds
+    for gas * price + value" if the signer's native ETH balance is short —
+    even if the wallet holds enough WETH.
+
+    Fix: query native/WETH split; if native < deposit_value + GAS_RESERVE,
+    unwrap the shortfall from WETH via WETH.withdraw (plain ERC20 call,
+    routed through `onchainos wallet contract-call` — not NPM).
+    """
+    try:
+        items = json.loads(user_input_json)
+    except Exception:
+        return True  # can't parse — trust upstream
+
+    eth_in_deposit = 0.0
+    for it in items:
+        addr = (it.get("tokenAddress") or "").lower()
+        if addr in (NATIVE_TOKEN.lower(), ETH_ADDR.lower()):
+            eth_in_deposit = float(it.get("coinAmount", 0)) / (10 ** TOKEN0["decimals"])
+            break
+    if eth_in_deposit <= 0:
+        return True  # USDC-only deposit
+
+    native_eth, weth_bal, failed = _get_eth_weth_split()
+    if failed:
+        log("  _ensure_native_eth: split query failed — trusting upstream")
+        return True
+
+    needed = eth_in_deposit + GAS_RESERVE_ETH
+    if native_eth >= needed:
+        log(
+            f"  Native ETH check ✓ native={native_eth:.6f} "
+            f"needed={needed:.6f} (deposit {eth_in_deposit:.6f} + reserve {GAS_RESERVE_ETH})"
+        )
+        return True
+
+    shortfall = needed - native_eth
+    buffer = 0.0001  # cover unwrap gas + settlement rounding
+    unwrap_eth = shortfall + buffer
+    if unwrap_eth > weth_bal:
+        log(
+            f"  ⚠ Native ETH short by {shortfall:.6f}, WETH={weth_bal:.6f} "
+            f"— cannot cover shortfall via unwrap"
+        )
+        return False
+
+    log(
+        f"  Native ETH short: native={native_eth:.6f} needed={needed:.6f} "
+        f"— unwrapping {unwrap_eth:.6f} WETH (wallet WETH={weth_bal:.6f})"
+    )
+    try:
+        from range_order_direct import unwrap_weth
+    except Exception as e:
+        log(f"  unwrap import failed: {e}")
+        return False
+
+    amount_wei = int(unwrap_eth * (10 ** TOKEN0["decimals"]))
+    ok, info = unwrap_weth(amount_wei)
+    if not ok:
+        log(f"  unwrap_weth failed: {info}")
+        return False
+    log(f"  unwrap OK: tx={info}")
+
+    # OKX gateway's internal balance indexer lags ~5-15s behind the chain.
+    # If we deposit immediately after unwrap confirms, estimateGas may still
+    # see pre-unwrap native ETH and reject with "insufficient funds". Poll
+    # OKX portfolio API until native ETH catches up, up to UNWRAP_SETTLE_TIMEOUT.
+    # Fix 2026-04-16: 17:55 run failed with 1s gap; 18:00 ran with 6s gap worked.
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        time.sleep(5)
+        after_native, after_weth, after_failed = _get_eth_weth_split()
+        if after_failed:
+            continue
+        if after_native >= needed:
+            log(
+                f"  Post-unwrap settle ✓ native={after_native:.6f} "
+                f"WETH={after_weth:.6f} (needed ≥ {needed:.6f})"
+            )
+            return True
+        log(
+            f"  Post-unwrap indexer lag: native={after_native:.6f} "
+            f"< needed {needed:.6f}, waiting..."
+        )
+    log("  ⚠ Unwrap indexer lag exceeded 30s — proceeding anyway")
+    return True
+
+
 def _calc_balanced_deposit(
     available_eth: float,
     usdc_bal: float,
@@ -1954,12 +2087,17 @@ def _calc_balanced_deposit(
     tick_lower: int,
     tick_upper: int,
 ) -> str | None:
-    """Calculate deposit amounts, pre-swapping ETH↔USDC to maximize utilization.
+    """Calculate deposit amounts WITHOUT swap (no-swap design 2026-04-15).
 
     Strategy:
-      1. Probe ratio with a small ETH amount to discover the target ETH:USDC split.
-      2. Compute how much to swap so that total funds match the target ratio.
-      3. Execute swap, then call calculate-entry with the larger side as input.
+      1. Probe ratio with a small ETH amount → discover the ETH:USDC ratio
+         the new range demands at current price.
+      2. Compute max main-mint achievable WITHOUT swap, limited by the smaller
+         side: main_total = min(eth_usd / eth_ratio, usdc_usd / usdc_ratio).
+      3. Mint with the limiting side as input; the larger side is consumed
+         only up to the matching share. Single-side excess stays in the wallet
+         to be picked up by `_mint_idle_edge` post-mint (range order, fills
+         naturally as price moves).
 
     Returns JSON string for defi_deposit --user-input, or None on failure.
     """
@@ -1969,7 +2107,6 @@ def _calc_balanced_deposit(
         return None
 
     # ── Step 1: Probe ratio with a small amount ──────────────────────────────
-    # Use $20 worth of ETH (or all available if less) just to discover the ratio.
     probe_eth = min(available_eth * 0.95, max(20.0 / price, 0.001))
     probe_eth_wei = int(probe_eth * (10 ** TOKEN0["decimals"]))
 
@@ -1984,7 +2121,6 @@ def _calc_balanced_deposit(
         log("  Ratio probe failed — falling back to USDC-base")
         return _calc_entry_usdc_base(usdc_bal, tick_lower, tick_upper)
 
-    # Parse the returned amounts to determine ratio
     probe_eth_amt, probe_usdc_amt = 0.0, 0.0
     for item in calculated:
         addr = item.get("tokenAddress", "").lower()
@@ -1999,194 +2135,189 @@ def _calc_balanced_deposit(
         log("  Probe returned zero amounts — falling back to USDC-base")
         return _calc_entry_usdc_base(usdc_bal, tick_lower, tick_upper)
 
-    # Target ratio: what fraction of total value should be in ETH
-    eth_ratio = probe_eth_usd / probe_total  # e.g. 0.3 means 30% ETH, 70% USDC
+    eth_ratio = probe_eth_usd / probe_total          # 0..1, share of value as ETH
     usdc_ratio = 1.0 - eth_ratio
-    log(f"  Ratio probe: ETH={eth_ratio:.1%} USDC={usdc_ratio:.1%} (from {probe_eth:.6f} ETH → need {probe_usdc_amt:.2f} USDC)")
+    log(f"  Ratio probe: ETH={eth_ratio:.1%} USDC={usdc_ratio:.1%}")
 
-    # ── Step 2: Calculate target allocation ──────────────────────────────────
-    # Use 95% of total to leave room for slippage and gas
-    usable_usd = total_usd * 0.95
-    target_eth_usd = usable_usd * eth_ratio
-    target_usdc = usable_usd * usdc_ratio
+    # ── Step 2: Compute max no-swap mint, limited by the smaller side ────────
+    eth_usd_avail = available_eth * price
+    max_via_eth_usd  = (eth_usd_avail / eth_ratio)  if eth_ratio  > 0.001 else float("inf")
+    max_via_usdc_usd = (usdc_bal      / usdc_ratio) if usdc_ratio > 0.001 else float("inf")
+    main_total_usd = min(max_via_eth_usd, max_via_usdc_usd) * 0.95  # 5% buffer for slippage/dust
+    eth_limited = max_via_eth_usd <= max_via_usdc_usd
 
-    current_eth_usd = available_eth * price
-    current_usdc = usdc_bal
+    # Decision: only mint main if the single-side leftover is small enough.
+    # Total wallet value minus main mint value = how much idle capital remains.
+    # If > MAIN_MAX_LEFTOVER_USD, it's more efficient to park the excess in an
+    # edge (fills via price crossing, self-rebalances wallet) than to lock it
+    # beside a suboptimal main. (design iteration 2026-04-15)
+    total_avail_usd = eth_usd_avail + usdc_bal
+    leftover_usd = total_avail_usd - main_total_usd
+    if leftover_usd > MAIN_MAX_LEFTOVER_USD or main_total_usd < MIN_TRADE_USD:
+        log(f"  No-swap main leftover ${leftover_usd:.2f} > ${MAIN_MAX_LEFTOVER_USD} "
+            f"(or main ${main_total_usd:.2f} < min trade ${MIN_TRADE_USD}) "
+            f"— eth_max=${max_via_eth_usd:.2f} usdc_max=${max_via_usdc_usd:.2f}; "
+            f"caller should mint dual edges instead")
+        return None
+    # Also apply legacy min-deposit guard if explicitly set (> 0)
+    if MAIN_MIN_DEPOSIT_USD > 0 and main_total_usd < MAIN_MIN_DEPOSIT_USD:
+        log(f"  Main ${main_total_usd:.2f} < explicit MAIN_MIN_DEPOSIT_USD ${MAIN_MIN_DEPOSIT_USD} — skip")
+        return None
 
-    log(f"  Target: ETH=${target_eth_usd:.2f} USDC=${target_usdc:.2f} | Current: ETH=${current_eth_usd:.2f} USDC=${current_usdc:.2f}")
+    main_eth_usd  = main_total_usd * eth_ratio
+    main_usdc_usd = main_total_usd * usdc_ratio
+    excess_eth_usd  = max(eth_usd_avail - main_eth_usd, 0)
+    excess_usdc_usd = max(usdc_bal      - main_usdc_usd, 0)
+    log(
+        f"  No-swap target: main=${main_total_usd:.2f} "
+        f"(ETH=${main_eth_usd:.2f} USDC=${main_usdc_usd:.2f}) "
+        f"| excess: ETH=${excess_eth_usd:.2f} USDC=${excess_usdc_usd:.2f} "
+        f"(limiting={'ETH' if eth_limited else 'USDC'})"
+    )
 
-    # ── Step 3: Swap to reach target ratio ───────────────────────────────────
-    swap_needed = False
-    if target_usdc > current_usdc + 1:
-        # Need more USDC — sell ETH
-        swap_usd = target_usdc - current_usdc
-        swap_eth = swap_usd / price * 1.02  # 2% buffer for slippage
-        # Safety: never swap more than what's available minus gas reserve
-        max_swap = available_eth * 0.92
-        if swap_eth > max_swap:
-            swap_eth = max_swap
-        if swap_eth * price >= MIN_TRADE_USD:
-            swap_needed = True
-            swap_eth_wei = int(swap_eth * (10 ** TOKEN0["decimals"]))
-            log(f"  Swap: {swap_eth:.6f} ETH → USDC (${swap_eth * price:.2f})")
-            tx_hash, fail = execute_swap(NATIVE_TOKEN, USDC_ADDR, swap_eth_wei, price)
-            if not tx_hash:
-                log(f"  Swap failed: {fail} — falling back to USDC-base")
-                return _calc_entry_usdc_base(usdc_bal, tick_lower, tick_upper)
-            log(f"  Swap OK: {tx_hash}")
-    elif target_eth_usd > current_eth_usd + 1:
-        # Need more ETH — sell USDC
-        swap_usdc = target_eth_usd - current_eth_usd
-        swap_usdc *= 1.02  # 2% buffer
-        max_swap_usdc = current_usdc * 0.92
-        if swap_usdc > max_swap_usdc:
-            swap_usdc = max_swap_usdc
-        if swap_usdc >= MIN_TRADE_USD:
-            swap_needed = True
-            swap_usdc_raw = int(swap_usdc * (10 ** TOKEN1["decimals"]))
-            log(f"  Swap: {swap_usdc:.2f} USDC → ETH")
-            tx_hash, fail = execute_swap(USDC_ADDR, NATIVE_TOKEN, swap_usdc_raw, price)
-            if not tx_hash:
-                log(f"  Swap failed: {fail} — falling back to USDC-base")
-                return _calc_entry_usdc_base(usdc_bal, tick_lower, tick_upper)
-            log(f"  Swap OK: {tx_hash}")
-
-    # ── Step 4: Wait for swap and get fresh balances ─────────────────────────
-    if swap_needed:
-        new_eth, new_usdc, bal_failed = 0.0, usdc_bal, True
-        swap_reflected = False
-        for wait in [10, 10, 10, 10, 10, 10]:  # 最多等 60 秒
-            time.sleep(wait)
-            new_eth, new_usdc, bal_failed = get_balances(force=True)
-            if bal_failed:
-                log(f"  Waiting for swap to reflect (query failed)...")
-                continue
-            if new_usdc != usdc_bal or new_eth != available_eth + GAS_RESERVE_ETH:
-                swap_reflected = True
-                break
-            log(f"  Waiting for swap to reflect (ETH={new_eth:.6f} USDC={new_usdc:.2f})...")
-        if not swap_reflected:
-            log("  ⚠ Swap not reflected after 60s — aborting to prevent stale-data errors")
-            return None
-        available_eth = max(new_eth - GAS_RESERVE_ETH, 0)
-        usdc_bal = new_usdc
-        log(f"  Post-swap: ETH={available_eth:.6f} USDC={usdc_bal:.2f}")
-    else:
-        log("  No swap needed — ratio already balanced")
-
-    # ── Step 5: Final calculate-entry using the larger-value side as input ───
-    eth_usd_val = available_eth * price
-    if eth_usd_val >= usdc_bal:
-        # Use ETH as input
-        final_eth_wei = int(available_eth * 0.95 * (10 ** TOKEN0["decimals"]))
+    # ── Step 3: Final calculate-entry using the limiting side as input ───────
+    if eth_limited:
+        eth_input_amt = main_eth_usd / price
+        eth_input_wei = int(eth_input_amt * (10 ** TOKEN0["decimals"]))
         final = defi_calculate_entry(
             input_token=NATIVE_TOKEN,
-            input_amount=str(final_eth_wei),
+            input_amount=str(eth_input_wei),
             token_decimal=TOKEN0["decimals"],
             tick_lower=tick_lower,
             tick_upper=tick_upper,
         )
         if final and isinstance(final, list):
-            # Verify USDC side fits
-            for item in final:
-                addr = item.get("tokenAddress", "").lower()
-                if addr == USDC_ADDR.lower():
-                    needed = float(item.get("coinAmount", 0)) / (10 ** TOKEN1["decimals"])
-                    if needed <= usdc_bal:
-                        log(f"  Final deposit (ETH-base): ETH-input={available_eth * 0.95:.6f}, USDC-needed={needed:.2f}")
-                        return json.dumps(final)
-                    log(f"  USDC short after swap ({needed:.2f} > {usdc_bal:.2f}) — trying USDC-base")
-                    break
-    # Use USDC as input (either larger or ETH-base didn't fit)
-    usdc_amount = int(usdc_bal * 0.95 * (10 ** TOKEN1["decimals"]))
-    final = defi_calculate_entry(
-        input_token=USDC_ADDR,
-        input_amount=str(usdc_amount),
-        token_decimal=TOKEN1["decimals"],
-        tick_lower=tick_lower,
-        tick_upper=tick_upper,
-    )
-    if final and isinstance(final, list):
-        # Verify ETH side fits
-        for item in final:
-            addr = item.get("tokenAddress", "").lower()
-            if addr in (NATIVE_TOKEN.lower(), ETH_ADDR.lower()):
-                needed_eth = float(item.get("coinAmount", 0)) / (10 ** TOKEN0["decimals"])
-                if needed_eth <= available_eth:
-                    log(f"  Final deposit (USDC-base): USDC-input={usdc_bal * 0.95:.2f}, ETH-needed={needed_eth:.6f}")
-                    return json.dumps(final)
-                log(f"  ETH short ({needed_eth:.6f} > {available_eth:.6f}) — reducing USDC input")
-                break
-        # ETH doesn't fit — reduce USDC input proportionally
-        if available_eth > 0 and needed_eth > 0:
-            scale = available_eth / needed_eth * 0.95
-            reduced_usdc = int(usdc_bal * 0.95 * scale * (10 ** TOKEN1["decimals"]))
-            final = defi_calculate_entry(
-                input_token=USDC_ADDR,
-                input_amount=str(reduced_usdc),
-                token_decimal=TOKEN1["decimals"],
-                tick_lower=tick_lower,
-                tick_upper=tick_upper,
-            )
-            if final and isinstance(final, list):
-                log(f"  Final deposit (reduced USDC-base): scale={scale:.2f}")
-                return json.dumps(final)
+            log(f"  Final deposit (no-swap, ETH-base): ETH-input={eth_input_amt:.6f}")
+            return json.dumps(final)
+    else:
+        usdc_input_amt = main_usdc_usd
+        usdc_input_raw = int(usdc_input_amt * (10 ** TOKEN1["decimals"]))
+        final = defi_calculate_entry(
+            input_token=USDC_ADDR,
+            input_amount=str(usdc_input_raw),
+            token_decimal=TOKEN1["decimals"],
+            tick_lower=tick_lower,
+            tick_upper=tick_upper,
+        )
+        if final and isinstance(final, list):
+            log(f"  Final deposit (no-swap, USDC-base): USDC-input={usdc_input_amt:.2f}")
+            return json.dumps(final)
 
-    log("  All deposit calculation attempts failed")
+    log("  No-swap deposit calc failed")
     return None
 
 
 def _calc_entry_usdc_base(
     usdc_bal: float, tick_lower: int, tick_upper: int,
 ) -> str | None:
-    """Fallback: swap remaining ETH → USDC, then use total USDC as input."""
-    # Check if there's ETH worth swapping
+    """Minimal-swap fallback (design 2026-04-16).
+
+    Only swap the EXCESS overweight side (not all ETH) based on probed ratio.
+    Then mint using the limiting side as input. Minimizes swap slippage by
+    only converting what's needed to reach balance.
+
+    Example: wallet $281 ETH + $170 USDC, range demands 32/68:
+      target: $144 ETH + $307 USDC
+      excess ETH = $137 (only swap this, not the full $281)
+    """
     eth_bal, _, _ = get_balances(force=True)
     available_eth = eth_bal - GAS_RESERVE_ETH
     price = get_eth_price()
+    if not price or price <= 0:
+        log("  USDC-base: no price — aborting")
+        return None
 
-    if available_eth > 0 and price > 0:
-        eth_usd_value = available_eth * price
-        if eth_usd_value >= MIN_TRADE_USD:
-            # Swap all available ETH to USDC (keep gas reserve)
-            swap_eth_wei = int(available_eth * 0.95 * (10 ** TOKEN0["decimals"]))
-            log(f"  USDC-base: swapping {available_eth * 0.95:.6f} ETH (~${eth_usd_value * 0.95:.2f}) → USDC")
-            tx_hash, fail = execute_swap(NATIVE_TOKEN, USDC_ADDR, swap_eth_wei, price)
-            if tx_hash:
-                # Wait for swap to settle
-                swap_ok = False
-                for wait in [10, 10, 10, 10, 10, 10]:  # 最多等 60 秒
-                    time.sleep(wait)
-                    _, new_usdc, bal_fail = get_balances(force=True)
-                    if not bal_fail and new_usdc > usdc_bal + 1:
-                        usdc_bal = new_usdc
-                        log(f"  USDC-base: swap settled, total USDC={usdc_bal:.2f}")
-                        swap_ok = True
-                        break
-                    log(f"  USDC-base: waiting for swap (USDC={new_usdc:.2f})...")
-                if not swap_ok:
-                    log("  ⚠ ETH→USDC swap not reflected after 60s — using last known balance")
-                    _, new_usdc, _ = get_balances(force=True)
-                    if new_usdc > usdc_bal:
-                        usdc_bal = new_usdc
-                    else:
-                        log("  ⚠ Balance unchanged — aborting entry to prevent stale-data deposit")
-                        return None
-            else:
-                log(f"  USDC-base: ETH swap failed ({fail}), proceeding with USDC only")
+    # Probe ratio for target range
+    probe_eth = min(available_eth * 0.5, max(20.0 / price, 0.001))
+    probe_eth_wei = int(probe_eth * 10 ** TOKEN0["decimals"])
+    calc = defi_calculate_entry(
+        input_token=NATIVE_TOKEN, input_amount=str(probe_eth_wei),
+        token_decimal=TOKEN0["decimals"],
+        tick_lower=tick_lower, tick_upper=tick_upper,
+    )
+    eth_ratio = 0.5  # fallback
+    if calc and isinstance(calc, list):
+        pe, pu = 0.0, 0.0
+        for item in calc:
+            addr = (item.get("tokenAddress") or "").lower()
+            if addr == USDC_ADDR.lower():
+                pu = float(item.get("coinAmount", 0)) / 10 ** TOKEN1["decimals"]
+            elif addr in (NATIVE_TOKEN.lower(), ETH_ADDR.lower()):
+                pe = float(item.get("coinAmount", 0)) / 10 ** TOKEN0["decimals"]
+        probe_total_usd = pe * price + pu
+        if probe_total_usd > 0.01:
+            eth_ratio = (pe * price) / probe_total_usd
+    usdc_ratio = 1.0 - eth_ratio
 
-    usdc_amount = int(usdc_bal * 0.95 * (10 ** TOKEN1["decimals"]))
+    # Compute MINIMAL swap: only the excess
+    eth_usd = max(available_eth * price, 0)
+    total_usd = eth_usd + usdc_bal
+    target_eth_usd = total_usd * eth_ratio
+    target_usdc = total_usd * usdc_ratio
+    excess_eth_usd = eth_usd - target_eth_usd  # positive = too much ETH
+    excess_usdc = usdc_bal - target_usdc       # positive = too much USDC
+
+    if excess_eth_usd > MIN_TRADE_USD and excess_eth_usd >= excess_usdc:
+        # Swap MINIMAL ETH → USDC (just enough to reach balance)
+        swap_eth = excess_eth_usd / price
+        swap_wei = int(swap_eth * 10 ** TOKEN0["decimals"])
+        log(f"  USDC-base: minimal swap {swap_eth:.6f} ETH (~${excess_eth_usd:.2f}) → USDC  "
+            f"(range demands ETH {eth_ratio:.1%}/USDC {usdc_ratio:.1%})")
+        tx_hash, fail = execute_swap(NATIVE_TOKEN, USDC_ADDR, swap_wei, price)
+        if tx_hash:
+            for wait in [10, 10, 10, 10, 10, 10]:
+                time.sleep(wait)
+                _, new_usdc, bal_fail = get_balances(force=True)
+                if not bal_fail and new_usdc > usdc_bal + 1:
+                    usdc_bal = new_usdc
+                    log(f"  USDC-base: swap settled, total USDC={usdc_bal:.2f}")
+                    break
+        else:
+            log(f"  USDC-base: swap failed ({fail}) — proceeding with existing USDC")
+    elif excess_usdc > MIN_TRADE_USD and excess_usdc > excess_eth_usd:
+        # Swap USDC → ETH minimal
+        swap_usdc_wei = int(excess_usdc * 10 ** TOKEN1["decimals"])
+        log(f"  USDC-base: minimal swap {excess_usdc:.2f} USDC → ETH  "
+            f"(range demands ETH {eth_ratio:.1%}/USDC {usdc_ratio:.1%})")
+        tx_hash, fail = execute_swap(USDC_ADDR, NATIVE_TOKEN, swap_usdc_wei, price)
+        if tx_hash:
+            for wait in [10, 10, 10, 10, 10, 10]:
+                time.sleep(wait)
+                new_eth, _, bal_fail = get_balances(force=True)
+                if not bal_fail and new_eth > available_eth + 0.0001:
+                    break
+        else:
+            log(f"  USDC-base: swap failed ({fail})")
+    else:
+        log(f"  USDC-base: wallet already balanced (ETH excess=${excess_eth_usd:.2f}, USDC excess=${excess_usdc:.2f}), skip swap")
+
+    # Post-swap balance check — verify we're now close enough to target ratio.
+    # If swap failed / was insufficient, wallet still has > MAIN_MAX_LEFTOVER_USD
+    # of excess on one side. In that case DON'T mint a tiny unbalanced main —
+    # signal caller to fall back to edge path instead.
+    new_eth, new_usdc, _ = get_balances(force=True)
+    new_eth_usd = max(new_eth - GAS_RESERVE_ETH, 0) * price
+    new_total = new_eth_usd + new_usdc
+    new_target_eth = new_total * eth_ratio
+    new_target_usdc = new_total * usdc_ratio
+    new_excess = max(abs(new_eth_usd - new_target_eth),
+                     abs(new_usdc - new_target_usdc))
+    if new_excess > MAIN_MAX_LEFTOVER_USD:
+        log(f"  USDC-base: wallet still unbalanced post-swap (excess ${new_excess:.2f} "
+            f"> ${MAIN_MAX_LEFTOVER_USD}) — returning None so caller re-edges")
+        return None
+
+    usdc_bal = new_usdc
+    usdc_amount = int(usdc_bal * 0.95 * 10 ** TOKEN1["decimals"])
     calculated = defi_calculate_entry(
-        input_token=USDC_ADDR,
-        input_amount=str(usdc_amount),
+        input_token=USDC_ADDR, input_amount=str(usdc_amount),
         token_decimal=TOKEN1["decimals"],
-        tick_lower=tick_lower,
-        tick_upper=tick_upper,
+        tick_lower=tick_lower, tick_upper=tick_upper,
     )
     if calculated and isinstance(calculated, list):
-        log(f"  Using USDC-base fallback: {usdc_bal * 0.90:.2f} USDC")
+        log(f"  USDC-base entry: {usdc_bal * 0.95:.2f} USDC")
         return json.dumps(calculated)
-    log("  USDC-base calculate-entry also failed")
+    log("  USDC-base calculate-entry failed")
     return None
 
 
@@ -2195,8 +2326,24 @@ def _calc_entry_usdc_base(
 
 OOR_EDGE_OFFSET_SPACINGS = CFG.get("oor_edge_offset_spacings", 1)
 OOR_EDGE_WIDTH_SPACINGS = CFG.get("oor_edge_width_spacings", 3)
-OOR_EDGE_SPLIT = CFG.get("oor_edge_split", 0.5)
+# OOR_EDGE_SPLIT default raised to 1.0 (no-swap design 2026-04-15): on OOR,
+# put 100% of the single-side wallet into the edge — no reserve held back.
+# Set < 1.0 to keep some wallet for an immediate small main mint.
+OOR_EDGE_SPLIT = CFG.get("oor_edge_split", 1.0)
 OOR_EDGE_TIMEOUT_HOURS = CFG.get("oor_edge_timeout_hours", 6)
+# Leftover threshold: mint main only if the single-side leftover (after
+# consuming the limiting side at 95%) is ≤ this amount. If leftover exceeds
+# this, skip main and park the excess in an edge — the edge will fill over
+# time, re-balancing the wallet for a future real main mint. Rationale:
+# a main mint that leaves large idle capital is inefficient; better to hold
+# the whole wallet as edge+idle and wait for alignment.
+MAIN_MAX_LEFTOVER_USD = CFG.get("main_max_leftover_usd", 50.0)
+# Legacy name kept for backward-compat reads in downstream code.
+MAIN_MIN_DEPOSIT_USD = CFG.get("main_min_deposit_usd", 0.0)
+# Path-1 fallback (no-swap design 2026-04-15): if pure-edge mode lasts
+# longer than this without successfully minting a main, fall back to a
+# swap-based mint to ensure the strategy doesn't sit idle indefinitely.
+MAX_PURE_EDGE_HOURS = CFG.get("max_pure_edge_hours", 12)
 
 
 def _execute_oor_split(state: dict, price: float, trigger: dict,
@@ -2248,55 +2395,351 @@ def _execute_oor_split(state: dict, price: float, trigger: dict,
         f"(current ${price:.2f})"
     )
 
+    # Delegate mint + token_id resolution + state save to _mint_one_edge, which
+    # has the robust on-chain NFT-diff resolver. (refactor 2026-04-15)
+    ok_mint = _mint_one_edge(
+        state, edge_side, edge_amount, price,
+        tick_lower, tick_upper, current_tick, tag="oor-split",
+    )
+    if not ok_mint:
+        return False
+
+    log(f"  ✓ OOR split complete")
+    return True
+
+
+def _mint_idle_edge(state: dict, price: float,
+                    main_tick_lower: int, main_tick_upper: int) -> bool:
+    """Post-main-mint: put any single-side wallet excess into an edge range order.
+
+    After a no-swap main mint, the limiting side is consumed but the other side
+    has leftover. Mint that leftover as a single-sided range order so the wallet
+    isn't sitting idle:
+      - Excess WETH/ETH → sell_weth edge ABOVE main upper (V3 fills as price rises)
+      - Excess USDC     → buy_weth  edge BELOW main lower (V3 fills as price drops)
+
+    Skips if excess < 2 × MIN_TRADE_USD or both sides are similar.
+    Honors GAS_RESERVE_ETH (always leaves 0.02 ETH for gas).
+    """
+    eth_bal, usdc_bal, failed = get_balances(force=True)
+    if failed:
+        log("  idle-edge: balance query failed — skip")
+        return False
+
+    available_eth = max(eth_bal - GAS_RESERVE_ETH, 0)
+    eth_usd = available_eth * price
+
+    spacing = TICK_SPACING
+    offset = OOR_EDGE_OFFSET_SPACINGS * spacing
+    width = OOR_EDGE_WIDTH_SPACINGS * spacing
+    current_tick = price_to_tick(price)
+    threshold = MIN_TRADE_USD * 2  # require meaningful excess to bother
+
+    # Decide which side has excess
+    if eth_usd > usdc_bal + threshold:
+        side = "sell_weth"
+        # Edge ABOVE current (and above main_upper if known) — fills when price rises
+        floor_tick = max(current_tick + offset, main_tick_upper + offset)
+        tick_lower_e = ((floor_tick + spacing - 1) // spacing) * spacing
+        tick_upper_e = tick_lower_e + width
+        edge_amount = int(available_eth * 0.95 * 10 ** int(TOKEN0["decimals"]))
+        min_amount = int(MIN_TRADE_USD / price * 10 ** int(TOKEN0["decimals"]))
+    elif usdc_bal > eth_usd + threshold:
+        side = "buy_weth"
+        # Edge BELOW current (and below main_lower if known) — fills when price drops
+        ceil_tick = min(current_tick - offset, main_tick_lower - offset)
+        tick_upper_e = (ceil_tick // spacing) * spacing
+        tick_lower_e = tick_upper_e - width
+        edge_amount = int(usdc_bal * 0.95 * 10 ** int(TOKEN1["decimals"]))
+        min_amount = int(MIN_TRADE_USD * 10 ** int(TOKEN1["decimals"]))
+    else:
+        log(f"  idle-edge: no significant excess (ETH=${eth_usd:.2f} USDC=${usdc_bal:.2f}) — skip")
+        return False
+
+    if edge_amount < min_amount:
+        log(f"  idle-edge: amount {edge_amount} < min {min_amount} — skip")
+        return False
+
+    # Delegate mint + token_id resolution + state save to _mint_one_edge.
+    # (refactor 2026-04-15: single source of truth for edge minting)
+    return _mint_one_edge(
+        state, side, edge_amount, price,
+        tick_lower_e, tick_upper_e, current_tick, tag="idle-edge",
+    )
+
+
+def _mint_one_edge(state: dict, side: str, amount_raw: int, price: float,
+                   tick_lower_e: int, tick_upper_e: int, current_tick: int,
+                   tag: str = "edge") -> bool:
+    """Low-level helper: mint a single range-order edge and append to state.edges.
+    Returns True on success (or partial: tx broadcast but token_id unresolved)."""
+    p_lo = tick_to_price(tick_lower_e)
+    p_hi = tick_to_price(tick_upper_e)
+    log(
+        f"  {tag}: {side} amount={amount_raw} "
+        f"range tick[{tick_lower_e},{tick_upper_e}] = ${p_lo:.0f}-${p_hi:.0f} "
+        f"(current ${price:.2f})"
+    )
     try:
-        from range_order_direct import mint_range_order
-        from edge_manager import _extract_new_token_id, Edge, save_edges
+        from range_order_direct import (
+            mint_range_order,
+            get_last_receipt,
+            parse_new_token_id_from_receipt,
+            NPM,
+        )
+        from edge_manager import _extract_new_token_id, Edge, save_edges, load_edges
     except Exception as e:
-        log(f"  OOR split: module import failed: {e}")
+        log(f"  {tag}: import failed: {e}")
         return False
 
-    ok, info = mint_range_order(edge_side, edge_amount, tick_lower, tick_upper)
+    ok, info = mint_range_order(side, amount_raw, tick_lower_e, tick_upper_e)
     if not ok:
-        log(f"  OOR split: mint failed: {info}")
+        log(f"  {tag}: mint failed: {info}")
         return False
 
-    tx_hash = info if info.startswith("0x") else ""
-    new_tid = _extract_new_token_id(tx_hash) if tx_hash else None
+    tx_hash = info if isinstance(info, str) and info.startswith("0x") else ""
+
+    # Primary resolver: parse NPM Transfer event from the mint receipt we already
+    # have in memory (no extra RPC call, no rate limits). `contract_call` stashes
+    # the receipt in _LAST_RECEIPT on success.
+    # (fix 2026-04-15: replaces unreliable _extract_new_token_id + chain iteration)
+    new_tid = None
+    receipt = get_last_receipt()
+    if receipt and WALLET_ADDR:
+        new_tid = parse_new_token_id_from_receipt(receipt, WALLET_ADDR, NPM)
+        if new_tid:
+            log(f"  {tag}: token_id resolved from mint receipt: #{new_tid}")
+
+    # Fallback 1: re-fetch tx receipt via edge_manager's RPC parser
+    if not new_tid and tx_hash:
+        new_tid = _extract_new_token_id(tx_hash)
+        if new_tid:
+            log(f"  {tag}: token_id resolved via log re-fetch: #{new_tid}")
+
+    # Fallback 2: OKX API (may lag 1-5 min after mint)
     if not new_tid:
-        log(f"  OOR split: edge minted (tx={tx_hash}) but token_id unresolved")
-        # Don't fail hard — tx went through, token_id just not parsed yet
+        try:
+            time.sleep(5)
+            post_positions = _query_all_positions()
+            # Heuristic: pick the largest token_id we now own that isn't in state
+            existing_tids = set()
+            st = load_state()
+            if (st.get("position") or {}).get("token_id"):
+                existing_tids.add(str(st["position"]["token_id"]))
+            for e in st.get("edges", []) or []:
+                if e.get("token_id"):
+                    existing_tids.add(str(e["token_id"]))
+            candidates = [int(p["tokenId"]) for p in post_positions
+                          if str(p["tokenId"]) not in existing_tids]
+            if candidates:
+                new_tid = max(candidates)
+                log(f"  {tag}: token_id resolved via OKX API (late): #{new_tid}")
+        except Exception:
+            pass
+
+    if not new_tid:
+        log(f"  {tag}: minted (tx={tx_hash}) but token_id UNRESOLVED — "
+            f"NFT will orphan. Pre-tids={sorted(pre_tids)[-3:] if pre_tids else []}")
         return True
 
     edge = Edge(
         token_id=str(new_tid),
-        side=edge_side,
-        tick_lower=tick_lower,
-        tick_upper=tick_upper,
-        amount_raw=edge_amount,
-        token=TOKEN0["address"] if edge_side == "sell_weth" else TOKEN1["address"],
+        side=side,
+        tick_lower=tick_lower_e,
+        tick_upper=tick_upper_e,
+        amount_raw=amount_raw,
+        token=TOKEN0["address"] if side == "sell_weth" else TOKEN1["address"],
         created_at=datetime.now().isoformat(),
         created_tick=current_tick,
         liquidity=0,
     )
-    edges_now = []
-    for e in state.get("edges", []) or []:
-        try:
-            edges_now.append(Edge.from_dict(e))
-        except Exception:
-            pass
+    # Reload from disk to avoid clobbering edges minted in earlier calls within
+    # the same tick. (fix 2026-04-15)
+    edges_now = load_edges()
     edges_now.append(edge)
     save_edges(edges_now)
+    state["edges"] = [e.to_dict() for e in edges_now]
 
-    log(f"  ✓ OOR split complete: edge #{new_tid} + ~half wallet held for next main")
-    emit("oor_split", {
+    log(f"  ✓ {tag} created: #{new_tid} {side} ${p_lo:.0f}-${p_hi:.0f}")
+    emit(tag, {
         "token_id": str(new_tid),
-        "side": edge_side,
-        "tick_range": [tick_lower, tick_upper],
+        "side": side,
+        "tick_range": [tick_lower_e, tick_upper_e],
         "price_range": [p_lo, p_hi],
-        "edge_amount": edge_amount,
+        "edge_amount": amount_raw,
         "tx": tx_hash,
     }, notify=True)
     return True
+
+
+def _mint_excess_edge(state: dict, price: float,
+                      main_tick_lower: int, main_tick_upper: int) -> bool:
+    """Mint a SINGLE edge for the excess side (design 2026-04-15).
+
+    Wallet has one side over-weighted relative to the range's demanded ratio.
+    Put ONLY the excess-above-target amount into an edge, so when the edge
+    fully fills, the wallet converges to the exact ratio a main mint needs:
+
+        excess_eth_usd  = eth_usd_avail - (total_usd × eth_ratio)
+        excess_usdc     = usdc_bal      - (total_usd × usdc_ratio)
+
+        if excess_eth_usd ≥ excess_usdc:  mint sell_weth size=excess_eth_usd
+        else:                             mint buy_weth  size=excess_usdc
+
+    Only ever mints ONE side. The other side (limiting) stays as wallet
+    reserve, waiting for the edge fill to naturally complete the pair.
+    """
+    eth_bal, usdc_bal, failed = get_balances(force=True)
+    if failed:
+        log("  excess-edge: balance query failed — skip")
+        return False
+
+    available_eth = max(eth_bal - GAS_RESERVE_ETH, 0)
+    eth_usd = available_eth * price
+    total_usd = eth_usd + usdc_bal
+    if total_usd < MIN_TRADE_USD:
+        log(f"  excess-edge: total ${total_usd:.2f} < min ${MIN_TRADE_USD}")
+        return False
+
+    # Probe range ratio
+    probe_eth = min(available_eth * 0.5, max(20 / price, 0.001))
+    probe_wei = int(probe_eth * 10 ** TOKEN0["decimals"])
+    calc = defi_calculate_entry(
+        input_token=NATIVE_TOKEN, input_amount=str(probe_wei),
+        token_decimal=TOKEN0["decimals"],
+        tick_lower=main_tick_lower, tick_upper=main_tick_upper,
+    )
+    if not calc or not isinstance(calc, list):
+        log("  excess-edge: ratio probe failed")
+        return False
+    probe_eth_amt, probe_usdc_amt = 0.0, 0.0
+    for item in calc:
+        addr = (item.get("tokenAddress") or "").lower()
+        if addr == USDC_ADDR.lower():
+            probe_usdc_amt = float(item.get("coinAmount", 0)) / 10 ** TOKEN1["decimals"]
+        elif addr in (NATIVE_TOKEN.lower(), ETH_ADDR.lower()):
+            probe_eth_amt = float(item.get("coinAmount", 0)) / 10 ** TOKEN0["decimals"]
+    probe_eth_usd = probe_eth_amt * price
+    probe_total = probe_eth_usd + probe_usdc_amt
+    if probe_total < 0.01:
+        log("  excess-edge: probe returned zero")
+        return False
+    eth_ratio = probe_eth_usd / probe_total
+    usdc_ratio = 1.0 - eth_ratio
+
+    # Compute target and excess
+    target_eth_usd = total_usd * eth_ratio
+    target_usdc = total_usd * usdc_ratio
+    excess_eth_usd = eth_usd - target_eth_usd
+    excess_usdc = usdc_bal - target_usdc
+    log(
+        f"  excess-edge: range demands ETH {eth_ratio:.1%}/USDC {usdc_ratio:.1%} | "
+        f"wallet ETH=${eth_usd:.2f} USDC=${usdc_bal:.2f} | "
+        f"excess ETH=${excess_eth_usd:.2f} USDC=${excess_usdc:.2f}"
+    )
+
+    spacing = TICK_SPACING
+    offset = OOR_EDGE_OFFSET_SPACINGS * spacing
+    width = OOR_EDGE_WIDTH_SPACINGS * spacing
+    current_tick = price_to_tick(price)
+
+    # Mint edge for the side with the LARGER excess (it's always the single
+    # over-weighted side; the other will be negative or small positive).
+    if excess_eth_usd > MIN_TRADE_USD and excess_eth_usd >= excess_usdc:
+        # Sell_weth: put excess ETH above main upper, fills as price rises
+        floor_tick = max(current_tick + offset, main_tick_upper + offset)
+        tick_lower_e = ((floor_tick + spacing - 1) // spacing) * spacing
+        tick_upper_e = tick_lower_e + width
+        edge_eth_amount = excess_eth_usd / price
+        edge_amount = int(edge_eth_amount * 10 ** TOKEN0["decimals"])
+        min_amount = int(MIN_TRADE_USD / price * 10 ** TOKEN0["decimals"])
+        if edge_amount < min_amount:
+            log(f"  excess-edge ETH: amount {edge_amount} < min {min_amount} — skip")
+            return False
+        return _mint_one_edge(state, "sell_weth", edge_amount, price,
+                              tick_lower_e, tick_upper_e, current_tick,
+                              tag="excess-edge")
+    elif excess_usdc > MIN_TRADE_USD:
+        # Buy_weth: put excess USDC below main lower, fills as price drops
+        ceil_tick = min(current_tick - offset, main_tick_lower - offset)
+        tick_upper_e = (ceil_tick // spacing) * spacing
+        tick_lower_e = tick_upper_e - width
+        edge_amount = int(excess_usdc * 10 ** TOKEN1["decimals"])
+        min_amount = int(MIN_TRADE_USD * 10 ** TOKEN1["decimals"])
+        if edge_amount < min_amount:
+            log(f"  excess-edge USDC: amount {edge_amount} < min {min_amount} — skip")
+            return False
+        return _mint_one_edge(state, "buy_weth", edge_amount, price,
+                              tick_lower_e, tick_upper_e, current_tick,
+                              tag="excess-edge")
+    else:
+        log(f"  excess-edge: no meaningful excess (max ${max(excess_eth_usd, excess_usdc):.2f} < min ${MIN_TRADE_USD})")
+        return False
+
+
+def _mint_dual_edges(state: dict, price: float,
+                     main_tick_lower: int, main_tick_upper: int) -> bool:
+    """Pure-edge mode: mint BOTH sides of the wallet as range orders, no main.
+
+    Used when wallet is too unbalanced to form a meaningful no-swap main mint
+    (i.e. _calc_balanced_deposit returned None). Both ETH and USDC sides above
+    MIN_TRADE_USD become edges. Honors GAS_RESERVE_ETH.
+
+    Returns True if at least one edge was minted.
+    """
+    eth_bal, usdc_bal, failed = get_balances(force=True)
+    if failed:
+        log("  dual-edge: balance query failed — skip")
+        return False
+
+    available_eth = max(eth_bal - GAS_RESERVE_ETH, 0)
+    eth_usd = available_eth * price
+
+    spacing = TICK_SPACING
+    offset = OOR_EDGE_OFFSET_SPACINGS * spacing
+    width = OOR_EDGE_WIDTH_SPACINGS * spacing
+    current_tick = price_to_tick(price)
+    success = 0
+
+    # ── ETH side → sell_weth edge ABOVE main upper ──
+    if eth_usd >= MIN_TRADE_USD:
+        floor_tick = max(current_tick + offset, main_tick_upper + offset)
+        tick_lower_e = ((floor_tick + spacing - 1) // spacing) * spacing
+        tick_upper_e = tick_lower_e + width
+        edge_amount = int(available_eth * 0.95 * 10 ** int(TOKEN0["decimals"]))
+        min_amount = int(MIN_TRADE_USD / price * 10 ** int(TOKEN0["decimals"]))
+        if edge_amount >= min_amount:
+            if _mint_one_edge(state, "sell_weth", edge_amount, price,
+                              tick_lower_e, tick_upper_e, current_tick,
+                              tag="dual-edge"):
+                success += 1
+        else:
+            log(f"  dual-edge ETH: amount {edge_amount} < min {min_amount} — skip ETH side")
+    else:
+        log(f"  dual-edge: ETH side ${eth_usd:.2f} < min ${MIN_TRADE_USD} — skip")
+
+    # ── USDC side → buy_weth edge BELOW main lower ──
+    if usdc_bal >= MIN_TRADE_USD:
+        ceil_tick = min(current_tick - offset, main_tick_lower - offset)
+        tick_upper_e = (ceil_tick // spacing) * spacing
+        tick_lower_e = tick_upper_e - width
+        edge_amount = int(usdc_bal * 0.95 * 10 ** int(TOKEN1["decimals"]))
+        min_amount = int(MIN_TRADE_USD * 10 ** int(TOKEN1["decimals"]))
+        if edge_amount >= min_amount:
+            if _mint_one_edge(state, "buy_weth", edge_amount, price,
+                              tick_lower_e, tick_upper_e, current_tick,
+                              tag="dual-edge"):
+                success += 1
+        else:
+            log(f"  dual-edge USDC: amount {edge_amount} < min {min_amount} — skip USDC side")
+    else:
+        log(f"  dual-edge: USDC side ${usdc_bal:.2f} < min ${MIN_TRADE_USD} — skip")
+
+    if success > 0:
+        log(f"  ✓ dual-edge complete: {success} edge(s) minted, no main this rebalance")
+    else:
+        log(f"  dual-edge: no edges minted (both sides too small)")
+    return success > 0
 
 
 def _try_resolve_pending_edges(state: dict, price: float) -> bool:
@@ -2465,20 +2908,43 @@ def execute_rebalance(
             save_state(state)
         return bool(oor_result)
 
-    # Step 4: Calculate dual-token deposit — swap to balance if needed
+    # Step 4: Calculate no-swap dual-token deposit (no-swap design 2026-04-15)
     log(f"  Balances: ETH={eth_bal:.6f} USDC={usdc_bal:.2f}")
     user_input_json = _calc_balanced_deposit(
         available_eth, usdc_bal, price,
         new_tick_lower, new_tick_upper,
     )
     if not user_input_json:
-        log("  Deposit calculation failed — aborting")
-        return False
+        # Path-1 timeout fallback: if we've been in pure-edge mode > MAX hours
+        # without minting a main, swap to balance and force a main mint now.
+        # No-swap main too small → immediate minimal swap to balance + mint.
+        # Edge system removed (2026-04-16): edges earn $0 fee (out-of-range),
+        # cost gas to mint/close, and delay main opening. For $451 portfolio
+        # the $0.14 slippage is cheaper than hours without main.
+        log(f"  No-swap main unbalanced (leftover > ${MAIN_MAX_LEFTOVER_USD}) "
+            f"— immediate minimal swap to balance")
+        user_input_json = _calc_entry_usdc_base(usdc_bal, new_tick_lower, new_tick_upper)
+        if not user_input_json:
+            log("  Minimal swap fallback also failed — aborting this rebalance")
+            return False
 
     # Final gas-reserve safety gate (scales down if deposit ETH would breach 0.02)
     user_input_json = _enforce_gas_reserve(user_input_json)
     if not user_input_json:
         log("  Deposit aborted by gas reserve guard — funds remain in wallet")
+        return False
+
+    # Ensure wallet has enough NATIVE ETH for the deposit (unwraps WETH if not).
+    # OKX estimateGas checks native ETH only; WETH holdings don't count toward
+    # tx.value even though strategy's get_balances sums both.
+    # Fix 2026-04-16: prior close_position left $100+ stranded as WETH, deposit
+    # then failed with "insufficient funds for gas * price + value".
+    if not _ensure_native_eth_for_deposit(user_input_json):
+        dep_fails = state.get("_consecutive_deposit_failures", 0) + 1
+        state["_consecutive_deposit_failures"] = dep_fails
+        save_state(state)
+        log(f"  Deposit aborted: native ETH insufficient — will retry next tick "
+            f"(consecutive: {dep_fails}/{MAX_DEPOSIT_FAILURES})")
         return False
 
     # Step 5: Deposit at new range
@@ -2583,6 +3049,8 @@ def execute_rebalance(
         "created_atr_pct": round(current_atr, 3),
         "entry_price": round(rebal_price, 2),
     }
+    # Main minted — clear pure-edge timer
+    state.pop("_pure_edge_started_at", None)
 
     # Record rebalance
     rebalance_record = {
@@ -2600,19 +3068,25 @@ def execute_rebalance(
     state["rebalance_history"] = rebalances
     state["stats"]["total_rebalances"] = state["stats"].get("total_rebalances", 0) + 1
 
-    # Reset trailing-stop baseline after rebalance: the old peak belongs to the
-    # previous position (different cost basis after swap+slippage). Carrying it
-    # forward causes false trailing-stop triggers when the new position is fine.
+    # Reset trailing-stop baseline after rebalance. We explicitly DO NOT read
+    # get_balances here — OKX indexer lags 5-15s post-deposit and returns
+    # pre-deposit ETH balance, double-counting the deposited funds and
+    # inflating the peak. Instead: clear peak + history to 0 so the next
+    # regular tick (which includes its own settle time + recompute) sets a
+    # clean baseline. Trailing-stop won't fire until peak is re-established.
+    # Fix 2026-04-16: $679 false peak at 18:00:54 triggered 33% false stop.
+    state.setdefault("stats", {})["portfolio_peak_usd"] = 0
+    state["_value_history"] = []
+    state["stop_triggered"] = None
+    log("  Peak reset: cleared (next tick repopulates from real portfolio value)")
+
+    # No-swap design: consume single-side wallet excess as an edge range order.
+    # The new main mint is balanced by the limiting side; the other side may
+    # have meaningful leftover sitting idle. Park it in an edge.
     try:
-        post_eth, post_usdc, _ = get_balances(force=True)
-        post_lp = get_position_detail(new_token_id).get("value", 0.0) if new_token_id else 0.0
-        post_total = post_eth * rebal_price + post_usdc + post_lp
-        if post_total > 0:
-            state["stats"]["portfolio_peak_usd"] = round(post_total, 2)
-            state["_value_history"] = [round(post_total, 2)]
-            log(f"  Peak reset after rebalance: ${post_total:.2f}")
+        _mint_idle_edge(state, rebal_price or price, new_tick_lower, new_tick_upper)
     except Exception as e:
-        log(f"  Peak reset skipped: {e}")
+        log(f"  idle-edge skipped: {e}")
 
     log(
         f"  Rebalance complete: [{new_tick_lower},{new_tick_upper}] "
@@ -3580,7 +4054,34 @@ def _tick_inner():
             # Position exists in state but API returned 0 — treat as query failure
             balance_failed = True
             log("LP position query returned 0 value — treating as query failure")
-    total_usd = wallet_usd + lp_value
+    # Edges are separate V3 NFTs that hold real capital — must be included in
+    # portfolio_usd or PnL/stop-loss math underestimates total value (fix 2026-04-15).
+    # Each edge's value is cached on the edge dict (`last_value`) so transient
+    # OKX index lag right after a mint doesn't cause spurious portfolio dips.
+    edge_lp_value = 0.0
+    for e in state.get("edges", []) or []:
+        if not isinstance(e, dict):
+            continue
+        tid = e.get("token_id")
+        if not tid:
+            continue
+        try:
+            v = float(get_position_detail(tid).get("value", 0) or 0)
+        except Exception as ex:
+            log(f"  edge #{tid} value query failed: {ex}")
+            v = 0
+        if v > 0:
+            e["last_value"] = round(v, 2)
+            e["last_value_at"] = datetime.now().isoformat()
+            edge_lp_value += v
+        else:
+            cached = float(e.get("last_value", 0) or 0)
+            if cached > 0:
+                edge_lp_value += cached
+                log(f"  edge #{tid}: API returned 0 (likely indexer lag) — using cached ${cached:.2f}")
+            else:
+                log(f"  edge #{tid}: API returned 0 and no cached value — under-counted")
+    total_usd = wallet_usd + lp_value + edge_lp_value
     # Track unclaimed fees in stats
     state.setdefault("stats", {})["unclaimed_fee_usd"] = round(unclaimed_fee, 2)
 
@@ -3782,9 +4283,21 @@ def _tick_inner():
                     f"(closed this tick: {len(edges_now) - len(remaining)})"
                 )
                 tick_status = "awaiting_edge_fill"
-                # Refresh balances for snapshot; don't call execute_rebalance
+                # Refresh balances for snapshot; don't call execute_rebalance.
+                # CRUCIAL: include edge LP values in total_usd (fix 2026-04-16)
+                # so dashboard shows correct portfolio when deferring main mint.
                 eth_bal, usdc_bal, balance_failed = get_balances(force=True)
-                total_usd = eth_bal * price + usdc_bal
+                edge_lp_total = 0.0
+                for e in remaining or []:
+                    tid = e.get("token_id") if isinstance(e, dict) else None
+                    if not tid:
+                        continue
+                    try:
+                        v = float(get_position_detail(tid).get("value", 0) or 0)
+                        edge_lp_total += v if v > 0 else float(e.get("last_value", 0) or 0)
+                    except Exception:
+                        edge_lp_total += float(e.get("last_value", 0) or 0)
+                total_usd = eth_bal * price + usdc_bal + edge_lp_total
                 # Fall through to snapshot/emit logic below (skip mint)
                 rebalanced = False
                 new_range = None  # prevent initial_deposit path below
@@ -3980,7 +4493,8 @@ def _tick_inner():
         "balances": {
             "eth": round(eth_bal, 6),
             "usdc": round(usdc_bal, 2),
-            "lp_usd": round(lp_value, 2),
+            "lp_usd": round(lp_value, 2),         # main LP only
+            "edge_lp_usd": round(edge_lp_value, 2), # all edge LPs combined
             "lp_assets": [
                 {
                     "symbol": a.get("tokenSymbol", ""),

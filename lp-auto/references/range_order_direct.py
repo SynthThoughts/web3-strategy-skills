@@ -32,6 +32,8 @@ import os
 import subprocess
 import sys
 import time
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -153,9 +155,187 @@ def allowance(token: str, owner: str, spender: str) -> int:
 
 # ── Contract-call wrapper ──────────────────────────────────────────────────
 
+# JSON-RPC endpoint for receipt verification (Base mainnet by default).
+# Override via env CL_LP_RPC_URL when running on other chains or private nodes.
+_RPC_URLS = {
+    "base":     "https://mainnet.base.org",
+    "ethereum": "https://eth.llamarpc.com",
+}
+RPC_URL = os.environ.get("CL_LP_RPC_URL") or _RPC_URLS.get(POOL_CHAIN, "")
+
+
+def _rpc_get_receipt(tx_hash: str, timeout: float = 8) -> dict | None:
+    """Fetch eth_getTransactionReceipt via JSON-RPC. Returns receipt dict or None."""
+    if not RPC_URL or not tx_hash or not tx_hash.startswith("0x"):
+        return None
+    payload = {
+        "jsonrpc": "2.0", "id": 1,
+        "method": "eth_getTransactionReceipt",
+        "params": [tx_hash],
+    }
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        RPC_URL, data=body,
+        headers={
+            "Content-Type": "application/json",
+            # Public RPCs like mainnet.base.org reject default Python User-Agent
+            # with HTTP 403; mimic curl/browser to get around this.
+            "User-Agent": "Mozilla/5.0 cl_lp/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+            return data.get("result")
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return None
+
+
+def _wait_for_receipt(tx_hash: str, timeout: int = 60,
+                      poll_every: int = 3) -> tuple[int | None, dict | None]:
+    """Poll RPC for receipt up to `timeout` seconds.
+    Returns (status, receipt) where status: 1=success, 0=revert, None=not found.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        receipt = _rpc_get_receipt(tx_hash)
+        if receipt:
+            try:
+                status = int(receipt.get("status", "0x0"), 16)
+            except (TypeError, ValueError):
+                status = 0
+            return status, receipt
+        time.sleep(poll_every)
+    return None, None
+
+
+def _rpc_eth_call(to: str, data: str, timeout: float = 8) -> str | None:
+    """Read-only eth_call. Returns hex result string or None on failure."""
+    if not RPC_URL:
+        return None
+    payload = {
+        "jsonrpc": "2.0", "id": 1,
+        "method": "eth_call",
+        "params": [{"to": to, "data": data}, "latest"],
+    }
+    req = urllib.request.Request(
+        RPC_URL, data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 cl_lp/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode()).get("result")
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return None
+
+
+def _chain_owned_nft_tokenids(wallet: str, npm: str) -> set[int]:
+    """Query NPM on-chain for all ERC-721 token IDs owned by `wallet`.
+    Uses balanceOf + tokenOfOwnerByIndex, both standard read methods.
+    Returns a set of int token ids, or empty set on failure.
+    """
+    # balanceOf(address): 0x70a08231
+    wallet_padded = wallet.lower().replace("0x", "").rjust(64, "0")
+    bal_data = "0x70a08231" + wallet_padded
+    raw = _rpc_eth_call(npm, bal_data)
+    if not raw or raw == "0x":
+        return set()
+    try:
+        count = int(raw, 16)
+    except ValueError:
+        return set()
+    if count == 0 or count > 1000:  # sanity
+        return set() if count > 1000 else set()
+
+    # tokenOfOwnerByIndex(address, uint256): 0x2f745c59
+    tids: set[int] = set()
+    for i in range(count):
+        idx_padded = format(i, "064x")
+        data = "0x2f745c59" + wallet_padded + idx_padded
+        raw = _rpc_eth_call(npm, data)
+        if not raw or raw == "0x":
+            continue
+        try:
+            tids.add(int(raw, 16))
+        except ValueError:
+            continue
+    return tids
+
+
+def resolve_new_nft_token_id(pre_set: set[int], wallet: str, npm: str,
+                             timeout: int = 45,
+                             poll_every: int = 3) -> int | None:
+    """After mint: poll chain until a new NFT appears (diff from pre_set).
+    Returns the new token_id, or None on timeout. Reliable — queries NPM
+    contract directly, no API-index dependency.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        now = _chain_owned_nft_tokenids(wallet, npm)
+        new = now - pre_set
+        if new:
+            return max(new)  # newest
+        time.sleep(poll_every)
+    return None
+
+
+# Last successful mint receipt — populated by contract_call on success so callers
+# can parse Transfer/IncreaseLiquidity logs without re-querying RPC. Reset on each
+# new call. Not thread-safe but strategy is single-writer.
+_LAST_RECEIPT: dict | None = None
+
+
+def get_last_receipt() -> dict | None:
+    """Return the receipt from the most recent successful contract_call."""
+    return _LAST_RECEIPT
+
+
+def parse_new_token_id_from_receipt(receipt: dict, wallet: str, npm: str) -> int | None:
+    """Parse NPM Transfer(from=0x0, to=wallet, tokenId) event from receipt logs.
+    Returns token_id or None if not found."""
+    if not receipt:
+        return None
+    wallet_padded = wallet.lower().replace("0x", "").rjust(64, "0")
+    ZERO = "0x" + "0" * 64
+    XFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+    for lg in receipt.get("logs", []):
+        if (lg.get("address") or "").lower() != npm.lower():
+            continue
+        topics = lg.get("topics") or []
+        if len(topics) < 4:
+            continue
+        if topics[0] != XFER:
+            continue
+        if topics[1] != ZERO:
+            continue
+        if topics[2].lower()[-64:] != wallet_padded:
+            continue
+        try:
+            return int(topics[3], 16)
+        except ValueError:
+            return None
+    return None
+
+
 def contract_call(to: str, input_data: str, amt: int = 0,
-                  gas_limit: int | None = None) -> tuple[bool, str]:
-    """Send a signed tx via onchainos. Returns (ok, tx_hash_or_error)."""
+                  gas_limit: int | None = None,
+                  confirm_timeout: int = 60) -> tuple[bool, str]:
+    """Send a signed tx via onchainos AND verify on-chain receipt.
+
+    Returns (ok, tx_hash_or_error). On success, the full receipt is stashed in
+    _LAST_RECEIPT for callers to parse (e.g. for new NFT token_id).
+
+    Failure modes:
+      - subprocess returncode != 0 → exit error
+      - response.ok != true → "not ok: ..."
+      - no txHash in response → "no_tx_hash"
+      - tx not on chain within timeout → "unbroadcast"
+      - tx on chain but reverted (status=0) → "reverted"
+    """
+    global _LAST_RECEIPT
     args = [
         "onchainos", "wallet", "contract-call",
         "--to", to,
@@ -174,9 +354,28 @@ def contract_call(to: str, input_data: str, amt: int = 0,
         data = json.loads(out)
         if not data.get("ok"):
             return False, f"not ok: {json.dumps(data)[:200]}"
-        # Parse tx hash from response
-        tx_hash = (data.get("data") or {}).get("txHash") or (data.get("data") or {}).get("orderId")
-        return True, tx_hash or json.dumps(data)[:200]
+        # Parse hash. Prefer txHash; fall back to orderId only as a candidate to
+        # verify (orderId may turn out not to be on-chain).
+        result_data = data.get("data") or {}
+        tx_hash = result_data.get("txHash") or result_data.get("orderId")
+        if not tx_hash or not isinstance(tx_hash, str) or not tx_hash.startswith("0x"):
+            return False, f"no_tx_hash: {json.dumps(data)[:200]}"
+
+        # Verify on-chain — broadcast confirmation, not just submission ack.
+        # Fixes 2026-04-15 incident where onchainos returned a hash that never
+        # actually broadcast (tx unfindable by RPC), causing strategy to think
+        # mints succeeded when they didn't.
+        _LAST_RECEIPT = None
+        if not RPC_URL:
+            log(f"  WARN: RPC_URL unset — skipping receipt verify for {tx_hash}")
+            return True, tx_hash
+        status, receipt = _wait_for_receipt(tx_hash, timeout=confirm_timeout)
+        if status is None:
+            return False, f"unbroadcast: {tx_hash} not on-chain after {confirm_timeout}s"
+        if status != 1:
+            return False, f"reverted: {tx_hash} status={status}"
+        _LAST_RECEIPT = receipt
+        return True, tx_hash
     except Exception as e:
         return False, f"exception: {e}"
 
@@ -216,16 +415,53 @@ def wrap_eth(amount_wei: int) -> tuple[bool, str]:
     return contract_call(weth, calldata, amt=amount_wei, gas_limit=100_000)
 
 
-def ensure_weth_balance(amount_wei: int) -> bool:
-    """Wrap native ETH to WETH if current WETH balance < amount_wei."""
+def ensure_weth_balance(amount_wei: int) -> tuple[bool, int]:
+    """Wrap native ETH to WETH if current WETH balance < amount_wei.
+
+    Returns (ok, wrapped_amount). wrapped_amount is how many wei were wrapped
+    this call — caller should unwrap this amount on subsequent failure to
+    avoid stranding WETH (see feedback_v3_weth_stranded_false_stoploss).
+    """
     current = weth_balance()
     if current >= amount_wei:
-        return True
+        return True, 0
     need = amount_wei - current
     ok, info = wrap_eth(need)
     if not ok:
         log(f"wrap_eth failed: {info}")
-    return ok
+        return False, 0
+    return True, need
+
+
+def unwrap_weth(amount_wei: int) -> tuple[bool, str]:
+    """Call WETH.withdraw(amount) to unwrap WETH → native ETH."""
+    weth = TOKEN0["address"]
+    calldata = encode_weth_withdraw(amount_wei)
+    log(f"unwrap {amount_wei} WETH wei → ETH via {weth}")
+    return contract_call(weth, calldata, gas_limit=100_000)
+
+
+def _rollback_wrap(wrapped_amount: int, stage: str) -> None:
+    """Unwrap the wei previously wrapped by ensure_weth_balance on failure path.
+
+    Clamped to current WETH balance in case later steps consumed some (e.g.
+    partial mint). Never raises — logs and returns.
+    """
+    if wrapped_amount <= 0:
+        return
+    current = weth_balance()
+    amount = min(wrapped_amount, current)
+    if amount <= 0:
+        log(
+            f"unwrap rollback skipped (stage={stage}): "
+            f"WETH balance {current} < wrapped {wrapped_amount}"
+        )
+        return
+    ok, info = unwrap_weth(amount)
+    if ok:
+        log(f"  unwrap rollback OK (stage={stage}): {info}")
+    else:
+        log(f"  unwrap rollback FAILED (stage={stage}): {info} — WETH stranded")
 
 
 def ensure_approval(token: str, amount_min: int) -> bool:
@@ -252,12 +488,15 @@ def mint_range_order(
     t0 = TOKEN0["address"]
     t1 = TOKEN1["address"]
     fee = int(float(CFG_FEE) * 1_000_000) if False else 3000  # Base pool 0.3%
+    wrapped_amount = 0  # track wrap so we can unwrap on later-stage failure
     # Figure out which side
     if side == "sell_weth":
         # All WETH: ensure WETH balance (wrap native ETH if needed) + approve
-        if not ensure_weth_balance(amount_raw):
+        ok_wrap, wrapped_amount = ensure_weth_balance(amount_raw)
+        if not ok_wrap:
             return False, "WETH wrap failed — check native ETH balance minus gas reserve"
         if not ensure_approval(TOKEN0["address"], amount_raw):
+            _rollback_wrap(wrapped_amount, "approval")
             return False, "WETH approval failed"
         amt0_des = amount_raw
         amt1_des = 0
@@ -285,6 +524,8 @@ def mint_range_order(
     )
     log(f"NPM.mint direct: side={side} amt={amount_raw} range=[{tick_lower},{tick_upper}]")
     ok, info = contract_call(NPM, calldata, gas_limit=600_000)
+    if not ok:
+        _rollback_wrap(wrapped_amount, "mint")
     return ok, info
 
 

@@ -78,13 +78,18 @@ class Edge:
     created_at: str
     created_tick: int
     liquidity: int = 0
+    # Cached edge value (USD) for fast dashboard reads; populated by tick
+    last_value: float = 0.0
+    last_value_at: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "Edge":
-        return cls(**d)
+        # Tolerate unknown keys from older state snapshots
+        known = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        return cls(**known)
 
 
 # ── Chain state reads ──────────────────────────────────────────────────────

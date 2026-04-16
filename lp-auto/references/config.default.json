@@ -6,7 +6,7 @@
   "pool_config": null,
   "gas_reserve_eth": 0.02,
   "min_trade_usd": 5.0,
-  "slippage_pct": 1,
+  "slippage_pct": 0.1,
   "auto_switch": false,
   "switch_uplift_threshold": 0.3,
   "switch_streak_required": 2,
@@ -25,7 +25,7 @@
   "max_il_tolerance_pct": 5.0,
   "edge_proximity_threshold": 0.15,
   "range_mult": {
-    "low": 0.5,
+    "low": 0.4,
     "medium": 0.8,
     "high": 1.2,
     "extreme": 1.5
@@ -74,7 +74,9 @@
   "platform_id": "68",
   "native_token": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
   "oor_edge_offset_spacings": 1,
-  "oor_edge_width_spacings": 3,
-  "oor_edge_split": 0.5,
-  "oor_edge_timeout_hours": 6
+  "oor_edge_width_spacings": 1,
+  "oor_edge_split": 1.0,
+  "oor_edge_timeout_hours": 6,
+  "max_pure_edge_hours": 1,
+  "main_max_leftover_usd": 50.0
 }
