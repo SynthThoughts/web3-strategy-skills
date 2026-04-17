@@ -44,30 +44,27 @@ class TestCleanupRespectsEdges:
         import cl_lp
         return cl_lp, tmp
 
-    def test_keeps_main_and_edges(self):
+    def test_keeps_only_main(self):
+        """Cleanup redeems everything except main position (edges removed)."""
         state_data = {
             "position": {"token_id": "MAIN_ID"},
-            "edges": [
-                {"token_id": "EDGE_A", "side": "buy_weth"},
-                {"token_id": "EDGE_B", "side": "sell_weth"},
-            ],
+            "edges": [],
         }
         cl_lp, tmp = self._setup(state_data)
-        # Mock on-chain calls
         positions = [
             {"tokenId": "MAIN_ID", "value": 100.0},
-            {"tokenId": "EDGE_A",  "value":   5.0},
-            {"tokenId": "EDGE_B",  "value":   5.0},
+            {"tokenId": "OTHER_A", "value":   5.0},
+            {"tokenId": "OTHER_B", "value":   5.0},
             {"tokenId": "ORPHAN",  "value":   2.0},
             {"tokenId": "DUST",    "value":   0.001},
         ]
         with patch.object(cl_lp, "_query_all_positions", return_value=positions), \
              patch.object(cl_lp, "defi_redeem", return_value=True) as redeem:
             count = cl_lp.cleanup_residual_positions("MAIN_ID")
-        # Should only redeem ORPHAN (MAIN/EDGE_A/EDGE_B kept; DUST skipped)
-        assert count == 1, f"expected 1 orphan cleaned, got {count}"
-        redeemed_ids = [call.args[0] for call in redeem.call_args_list]
-        assert redeemed_ids == ["ORPHAN"], redeemed_ids
+        # Should redeem OTHER_A + OTHER_B + ORPHAN (MAIN kept; DUST skipped)
+        assert count == 3, f"expected 3 cleaned, got {count}"
+        redeemed_ids = {call.args[0] for call in redeem.call_args_list}
+        assert redeemed_ids == {"OTHER_A", "OTHER_B", "ORPHAN"}, redeemed_ids
 
     def test_no_edges_behaves_like_legacy(self):
         """When state.edges is missing or empty, behave identically to v1."""
@@ -109,7 +106,7 @@ class TestCleanupRespectsEdges:
         """token_id can be int or str; cleanup must compare as strings."""
         state_data = {
             "position": {"token_id": 12345},   # int
-            "edges": [{"token_id": "67890"}],  # str
+            "edges": [],
         }
         cl_lp, tmp = self._setup(state_data)
         positions = [
@@ -120,9 +117,9 @@ class TestCleanupRespectsEdges:
         with patch.object(cl_lp, "_query_all_positions", return_value=positions), \
              patch.object(cl_lp, "defi_redeem", return_value=True) as redeem:
             count = cl_lp.cleanup_residual_positions(12345)  # passed as int
-        # Only 99999 should be cleaned
-        assert count == 1
-        assert [c.args[0] for c in redeem.call_args_list] == ["99999"]
+        # Both 67890 and 99999 should be cleaned (only main 12345 kept)
+        assert count == 2
+        assert {c.args[0] for c in redeem.call_args_list} == {"67890", "99999"}
 
 
 if __name__ == "__main__":
