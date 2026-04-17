@@ -758,25 +758,13 @@ def find_latest_token_id(after_token_id: str = "") -> str:
 
 def cleanup_residual_positions(keep_token_id: str, max_retries: int = 3,
                                  extra_keep_ids: set[str] | None = None) -> int:
-    """Redeem all positions except keep_token_id and any edge NFTs tracked in
-    state.edges (populated by edge_manager). Returns count of cleaned positions.
+    """Redeem all positions except keep_token_id. Returns count of cleaned positions.
 
-    extra_keep_ids overrides the state.edges lookup — pass explicitly if you
-    don't want the default behavior.
+    extra_keep_ids: additional token IDs to keep (pass explicitly if needed).
     """
     positions = _query_all_positions()
-    # Build full keep set: main position + all edges from state
     keep_ids: set[str] = {str(keep_token_id)} if keep_token_id else set()
-    if extra_keep_ids is None:
-        try:
-            state = load_state()
-            for e in state.get("edges", []) or []:
-                tid = e.get("token_id")
-                if tid:
-                    keep_ids.add(str(tid))
-        except Exception as e:
-            log(f"  cleanup: failed to read state.edges, proceeding without: {e}")
-    else:
+    if extra_keep_ids is not None:
         keep_ids |= {str(t) for t in extra_keep_ids}
     cleaned = 0
     failed_tids = []
@@ -789,7 +777,7 @@ def cleanup_residual_positions(keep_token_id: str, max_retries: int = 3,
             # Skip dust positions (< $0.01)
             continue
         log(f"  Cleaning residual position #{tid} (${val:.2f}) "
-            f"[kept: main={keep_token_id!r}, {len(keep_ids)-1} edge(s)]")
+            f"[kept: main={keep_token_id!r}]")
         ok = defi_redeem(tid)
         if ok:
             cleaned += 1
@@ -1989,6 +1977,37 @@ def _get_eth_weth_split() -> tuple[float, float, bool]:
     return native, weth, False
 
 
+def _unwrap_weth(amount_wei: int) -> tuple[bool, str]:
+    """Unwrap WETH -> native ETH via WETH.withdraw(uint256).
+    Uses onchainos wallet contract-call (not NPM). Safe to call anytime."""
+    # WETH.withdraw(uint256) selector = 0x2e1a7d4d
+    amount_hex = hex(amount_wei)[2:].zfill(64)
+    calldata = "0x2e1a7d4d" + amount_hex
+    weth_addr = ETH_ADDR  # 0x4200...0006 on Base
+    log(f"  unwrap {amount_wei} WETH -> ETH via {weth_addr}")
+    args = [
+        "wallet", "contract-call",
+        "--to", weth_addr,
+        "--chain", CHAIN_ID,
+        "--input-data", calldata,
+        "--amt", "0",
+        "--force",
+    ]
+    try:
+        data = onchainos_cmd(args, timeout=45)
+        if data and data.get("ok") and data.get("data"):
+            result = data["data"] if isinstance(data["data"], dict) else (
+                data["data"][0] if isinstance(data["data"], list) else data["data"]
+            )
+            tx_hash = result.get("txHash") or result.get("hash") or result.get("orderId")
+            if tx_hash:
+                log(f"  unwrap broadcast OK: {tx_hash}")
+                return True, tx_hash
+        return False, f"unwrap failed: {json.dumps(data)[:200] if data else 'no response'}"
+    except Exception as e:
+        return False, f"unwrap exception: {e}"
+
+
 def _ensure_native_eth_for_deposit(user_input_json: str) -> bool:
     """Ensure wallet has enough native ETH for the deposit value.
 
@@ -2042,14 +2061,8 @@ def _ensure_native_eth_for_deposit(user_input_json: str) -> bool:
         f"  Native ETH short: native={native_eth:.6f} needed={needed:.6f} "
         f"— unwrapping {unwrap_eth:.6f} WETH (wallet WETH={weth_bal:.6f})"
     )
-    try:
-        from range_order_direct import unwrap_weth
-    except Exception as e:
-        log(f"  unwrap import failed: {e}")
-        return False
-
     amount_wei = int(unwrap_eth * (10 ** TOKEN0["decimals"]))
-    ok, info = unwrap_weth(amount_wei)
+    ok, info = _unwrap_weth(amount_wei)
     if not ok:
         log(f"  unwrap_weth failed: {info}")
         return False
@@ -2096,8 +2109,7 @@ def _calc_balanced_deposit(
          side: main_total = min(eth_usd / eth_ratio, usdc_usd / usdc_ratio).
       3. Mint with the limiting side as input; the larger side is consumed
          only up to the matching share. Single-side excess stays in the wallet
-         to be picked up by `_mint_idle_edge` post-mint (range order, fills
-         naturally as price moves).
+         (caller falls back to minimal swap if leftover exceeds threshold).
 
     Returns JSON string for defi_deposit --user-input, or None on failure.
     """
@@ -2148,16 +2160,15 @@ def _calc_balanced_deposit(
 
     # Decision: only mint main if the single-side leftover is small enough.
     # Total wallet value minus main mint value = how much idle capital remains.
-    # If > MAIN_MAX_LEFTOVER_USD, it's more efficient to park the excess in an
-    # edge (fills via price crossing, self-rebalances wallet) than to lock it
-    # beside a suboptimal main. (design iteration 2026-04-15)
+    # If > MAIN_MAX_LEFTOVER_USD, return None so caller falls back to a
+    # minimal swap to rebalance before minting. (design iteration 2026-04-15)
     total_avail_usd = eth_usd_avail + usdc_bal
     leftover_usd = total_avail_usd - main_total_usd
     if leftover_usd > MAIN_MAX_LEFTOVER_USD or main_total_usd < MIN_TRADE_USD:
         log(f"  No-swap main leftover ${leftover_usd:.2f} > ${MAIN_MAX_LEFTOVER_USD} "
             f"(or main ${main_total_usd:.2f} < min trade ${MIN_TRADE_USD}) "
             f"— eth_max=${max_via_eth_usd:.2f} usdc_max=${max_via_usdc_usd:.2f}; "
-            f"caller should mint dual edges instead")
+            f"caller will fall back to minimal swap")
         return None
     # Also apply legacy min-deposit guard if explicitly set (> 0)
     if MAIN_MIN_DEPOSIT_USD > 0 and main_total_usd < MAIN_MIN_DEPOSIT_USD:
@@ -2294,7 +2305,7 @@ def _calc_entry_usdc_base(
     # Post-swap balance check — verify we're now close enough to target ratio.
     # If swap failed / was insufficient, wallet still has > MAIN_MAX_LEFTOVER_USD
     # of excess on one side. In that case DON'T mint a tiny unbalanced main —
-    # signal caller to fall back to edge path instead.
+    # signal caller that wallet is still unbalanced.
     new_eth, new_usdc, _ = get_balances(force=True)
     new_eth_usd = max(new_eth - GAS_RESERVE_ETH, 0) * price
     new_total = new_eth_usd + new_usdc
@@ -2304,7 +2315,7 @@ def _calc_entry_usdc_base(
                      abs(new_usdc - new_target_usdc))
     if new_excess > MAIN_MAX_LEFTOVER_USD:
         log(f"  USDC-base: wallet still unbalanced post-swap (excess ${new_excess:.2f} "
-            f"> ${MAIN_MAX_LEFTOVER_USD}) — returning None so caller re-edges")
+            f"> ${MAIN_MAX_LEFTOVER_USD}) — returning None (still unbalanced)")
         return None
 
     usdc_bal = new_usdc
@@ -2324,467 +2335,15 @@ def _calc_entry_usdc_base(
 # ── Rebalance Execution ────────────────────────────────────────────────────
 
 
-OOR_EDGE_OFFSET_SPACINGS = CFG.get("oor_edge_offset_spacings", 1)
-OOR_EDGE_WIDTH_SPACINGS = CFG.get("oor_edge_width_spacings", 3)
-# OOR_EDGE_SPLIT default raised to 1.0 (no-swap design 2026-04-15): on OOR,
-# put 100% of the single-side wallet into the edge — no reserve held back.
-# Set < 1.0 to keep some wallet for an immediate small main mint.
-OOR_EDGE_SPLIT = CFG.get("oor_edge_split", 1.0)
-OOR_EDGE_TIMEOUT_HOURS = CFG.get("oor_edge_timeout_hours", 6)
-# Leftover threshold: mint main only if the single-side leftover (after
-# consuming the limiting side at 95%) is ≤ this amount. If leftover exceeds
-# this, skip main and park the excess in an edge — the edge will fill over
-# time, re-balancing the wallet for a future real main mint. Rationale:
-# a main mint that leaves large idle capital is inefficient; better to hold
-# the whole wallet as edge+idle and wait for alignment.
 MAIN_MAX_LEFTOVER_USD = CFG.get("main_max_leftover_usd", 50.0)
 # Legacy name kept for backward-compat reads in downstream code.
 MAIN_MIN_DEPOSIT_USD = CFG.get("main_min_deposit_usd", 0.0)
-# Path-1 fallback (no-swap design 2026-04-15): if pure-edge mode lasts
-# longer than this without successfully minting a main, fall back to a
-# swap-based mint to ensure the strategy doesn't sit idle indefinitely.
-MAX_PURE_EDGE_HOURS = CFG.get("max_pure_edge_hours", 12)
 
 
-def _execute_oor_split(state: dict, price: float, trigger: dict,
-                        eth_bal: float, usdc_bal: float,
-                        available_eth: float) -> bool:
-    """Post-OOR close: split the 100%-single-sided wallet into:
-      - OOR_EDGE_SPLIT (default 50%) → minted as single-sided range order
-        that V3 will auto-swap to the opposite token when price reverses
-      - remainder → stays in wallet for future main mint once edge fills
-
-    Side detection uses trigger["detail"]: "below" or "above".
-    """
-    side_dir = trigger.get("detail", "")
-    current_tick = price_to_tick(price)
-    spacing = TICK_SPACING
-    offset = OOR_EDGE_OFFSET_SPACINGS * spacing
-    width = OOR_EDGE_WIDTH_SPACINGS * spacing
-
-    if side_dir == "below":
-        # Price fell below main.lower → wallet is ~100% WETH
-        # Edge: sell_weth range ABOVE current (limit sell WETH as price rebounds)
-        edge_side = "sell_weth"
-        tick_lower = ((current_tick + offset + spacing - 1) // spacing) * spacing
-        tick_upper = tick_lower + width
-        edge_amount = int(available_eth * OOR_EDGE_SPLIT * 10 ** int(TOKEN0["decimals"]))
-        min_amount = int(MIN_TRADE_USD / price * 10 ** int(TOKEN0["decimals"]))
-        if edge_amount < min_amount:
-            log(f"  OOR split: edge size too small ({edge_amount} wei < min {min_amount})")
-            return False
-    elif side_dir == "above":
-        # Price rose above main.upper → wallet is ~100% USDC
-        edge_side = "buy_weth"
-        tick_upper = ((current_tick - offset) // spacing) * spacing
-        tick_lower = tick_upper - width
-        edge_amount = int(usdc_bal * OOR_EDGE_SPLIT * 10 ** int(TOKEN1["decimals"]))
-        min_amount = int(MIN_TRADE_USD * 10 ** int(TOKEN1["decimals"]))
-        if edge_amount < min_amount:
-            log(f"  OOR split: edge size too small ({edge_amount} μunits < min {min_amount})")
-            return False
-    else:
-        log(f"  OOR split: unknown trigger.detail {side_dir!r} — skip split")
-        return False
-
-    p_lo = tick_to_price(tick_lower)
-    p_hi = tick_to_price(tick_upper)
-    log(
-        f"  OOR split [{side_dir}]: {edge_side} edge amount={edge_amount} "
-        f"range tick[{tick_lower},{tick_upper}] = ${p_lo:.0f}-${p_hi:.0f} "
-        f"(current ${price:.2f})"
-    )
-
-    # Delegate mint + token_id resolution + state save to _mint_one_edge, which
-    # has the robust on-chain NFT-diff resolver. (refactor 2026-04-15)
-    ok_mint = _mint_one_edge(
-        state, edge_side, edge_amount, price,
-        tick_lower, tick_upper, current_tick, tag="oor-split",
-    )
-    if not ok_mint:
-        return False
-
-    log(f"  ✓ OOR split complete")
-    return True
 
 
-def _mint_idle_edge(state: dict, price: float,
-                    main_tick_lower: int, main_tick_upper: int) -> bool:
-    """Post-main-mint: put any single-side wallet excess into an edge range order.
-
-    After a no-swap main mint, the limiting side is consumed but the other side
-    has leftover. Mint that leftover as a single-sided range order so the wallet
-    isn't sitting idle:
-      - Excess WETH/ETH → sell_weth edge ABOVE main upper (V3 fills as price rises)
-      - Excess USDC     → buy_weth  edge BELOW main lower (V3 fills as price drops)
-
-    Skips if excess < 2 × MIN_TRADE_USD or both sides are similar.
-    Honors GAS_RESERVE_ETH (always leaves 0.02 ETH for gas).
-    """
-    eth_bal, usdc_bal, failed = get_balances(force=True)
-    if failed:
-        log("  idle-edge: balance query failed — skip")
-        return False
-
-    available_eth = max(eth_bal - GAS_RESERVE_ETH, 0)
-    eth_usd = available_eth * price
-
-    spacing = TICK_SPACING
-    offset = OOR_EDGE_OFFSET_SPACINGS * spacing
-    width = OOR_EDGE_WIDTH_SPACINGS * spacing
-    current_tick = price_to_tick(price)
-    threshold = MIN_TRADE_USD * 2  # require meaningful excess to bother
-
-    # Decide which side has excess
-    if eth_usd > usdc_bal + threshold:
-        side = "sell_weth"
-        # Edge ABOVE current (and above main_upper if known) — fills when price rises
-        floor_tick = max(current_tick + offset, main_tick_upper + offset)
-        tick_lower_e = ((floor_tick + spacing - 1) // spacing) * spacing
-        tick_upper_e = tick_lower_e + width
-        edge_amount = int(available_eth * 0.95 * 10 ** int(TOKEN0["decimals"]))
-        min_amount = int(MIN_TRADE_USD / price * 10 ** int(TOKEN0["decimals"]))
-    elif usdc_bal > eth_usd + threshold:
-        side = "buy_weth"
-        # Edge BELOW current (and below main_lower if known) — fills when price drops
-        ceil_tick = min(current_tick - offset, main_tick_lower - offset)
-        tick_upper_e = (ceil_tick // spacing) * spacing
-        tick_lower_e = tick_upper_e - width
-        edge_amount = int(usdc_bal * 0.95 * 10 ** int(TOKEN1["decimals"]))
-        min_amount = int(MIN_TRADE_USD * 10 ** int(TOKEN1["decimals"]))
-    else:
-        log(f"  idle-edge: no significant excess (ETH=${eth_usd:.2f} USDC=${usdc_bal:.2f}) — skip")
-        return False
-
-    if edge_amount < min_amount:
-        log(f"  idle-edge: amount {edge_amount} < min {min_amount} — skip")
-        return False
-
-    # Delegate mint + token_id resolution + state save to _mint_one_edge.
-    # (refactor 2026-04-15: single source of truth for edge minting)
-    return _mint_one_edge(
-        state, side, edge_amount, price,
-        tick_lower_e, tick_upper_e, current_tick, tag="idle-edge",
-    )
 
 
-def _mint_one_edge(state: dict, side: str, amount_raw: int, price: float,
-                   tick_lower_e: int, tick_upper_e: int, current_tick: int,
-                   tag: str = "edge") -> bool:
-    """Low-level helper: mint a single range-order edge and append to state.edges.
-    Returns True on success (or partial: tx broadcast but token_id unresolved)."""
-    p_lo = tick_to_price(tick_lower_e)
-    p_hi = tick_to_price(tick_upper_e)
-    log(
-        f"  {tag}: {side} amount={amount_raw} "
-        f"range tick[{tick_lower_e},{tick_upper_e}] = ${p_lo:.0f}-${p_hi:.0f} "
-        f"(current ${price:.2f})"
-    )
-    try:
-        from range_order_direct import (
-            mint_range_order,
-            get_last_receipt,
-            parse_new_token_id_from_receipt,
-            NPM,
-        )
-        from edge_manager import _extract_new_token_id, Edge, save_edges, load_edges
-    except Exception as e:
-        log(f"  {tag}: import failed: {e}")
-        return False
-
-    ok, info = mint_range_order(side, amount_raw, tick_lower_e, tick_upper_e)
-    if not ok:
-        log(f"  {tag}: mint failed: {info}")
-        return False
-
-    tx_hash = info if isinstance(info, str) and info.startswith("0x") else ""
-
-    # Primary resolver: parse NPM Transfer event from the mint receipt we already
-    # have in memory (no extra RPC call, no rate limits). `contract_call` stashes
-    # the receipt in _LAST_RECEIPT on success.
-    # (fix 2026-04-15: replaces unreliable _extract_new_token_id + chain iteration)
-    new_tid = None
-    receipt = get_last_receipt()
-    if receipt and WALLET_ADDR:
-        new_tid = parse_new_token_id_from_receipt(receipt, WALLET_ADDR, NPM)
-        if new_tid:
-            log(f"  {tag}: token_id resolved from mint receipt: #{new_tid}")
-
-    # Fallback 1: re-fetch tx receipt via edge_manager's RPC parser
-    if not new_tid and tx_hash:
-        new_tid = _extract_new_token_id(tx_hash)
-        if new_tid:
-            log(f"  {tag}: token_id resolved via log re-fetch: #{new_tid}")
-
-    # Fallback 2: OKX API (may lag 1-5 min after mint)
-    if not new_tid:
-        try:
-            time.sleep(5)
-            post_positions = _query_all_positions()
-            # Heuristic: pick the largest token_id we now own that isn't in state
-            existing_tids = set()
-            st = load_state()
-            if (st.get("position") or {}).get("token_id"):
-                existing_tids.add(str(st["position"]["token_id"]))
-            for e in st.get("edges", []) or []:
-                if e.get("token_id"):
-                    existing_tids.add(str(e["token_id"]))
-            candidates = [int(p["tokenId"]) for p in post_positions
-                          if str(p["tokenId"]) not in existing_tids]
-            if candidates:
-                new_tid = max(candidates)
-                log(f"  {tag}: token_id resolved via OKX API (late): #{new_tid}")
-        except Exception:
-            pass
-
-    if not new_tid:
-        log(f"  {tag}: minted (tx={tx_hash}) but token_id UNRESOLVED — "
-            f"NFT will orphan. Pre-tids={sorted(pre_tids)[-3:] if pre_tids else []}")
-        return True
-
-    edge = Edge(
-        token_id=str(new_tid),
-        side=side,
-        tick_lower=tick_lower_e,
-        tick_upper=tick_upper_e,
-        amount_raw=amount_raw,
-        token=TOKEN0["address"] if side == "sell_weth" else TOKEN1["address"],
-        created_at=datetime.now().isoformat(),
-        created_tick=current_tick,
-        liquidity=0,
-    )
-    # Reload from disk to avoid clobbering edges minted in earlier calls within
-    # the same tick. (fix 2026-04-15)
-    edges_now = load_edges()
-    edges_now.append(edge)
-    save_edges(edges_now)
-    state["edges"] = [e.to_dict() for e in edges_now]
-
-    log(f"  ✓ {tag} created: #{new_tid} {side} ${p_lo:.0f}-${p_hi:.0f}")
-    emit(tag, {
-        "token_id": str(new_tid),
-        "side": side,
-        "tick_range": [tick_lower_e, tick_upper_e],
-        "price_range": [p_lo, p_hi],
-        "edge_amount": amount_raw,
-        "tx": tx_hash,
-    }, notify=True)
-    return True
-
-
-def _mint_excess_edge(state: dict, price: float,
-                      main_tick_lower: int, main_tick_upper: int) -> bool:
-    """Mint a SINGLE edge for the excess side (design 2026-04-15).
-
-    Wallet has one side over-weighted relative to the range's demanded ratio.
-    Put ONLY the excess-above-target amount into an edge, so when the edge
-    fully fills, the wallet converges to the exact ratio a main mint needs:
-
-        excess_eth_usd  = eth_usd_avail - (total_usd × eth_ratio)
-        excess_usdc     = usdc_bal      - (total_usd × usdc_ratio)
-
-        if excess_eth_usd ≥ excess_usdc:  mint sell_weth size=excess_eth_usd
-        else:                             mint buy_weth  size=excess_usdc
-
-    Only ever mints ONE side. The other side (limiting) stays as wallet
-    reserve, waiting for the edge fill to naturally complete the pair.
-    """
-    eth_bal, usdc_bal, failed = get_balances(force=True)
-    if failed:
-        log("  excess-edge: balance query failed — skip")
-        return False
-
-    available_eth = max(eth_bal - GAS_RESERVE_ETH, 0)
-    eth_usd = available_eth * price
-    total_usd = eth_usd + usdc_bal
-    if total_usd < MIN_TRADE_USD:
-        log(f"  excess-edge: total ${total_usd:.2f} < min ${MIN_TRADE_USD}")
-        return False
-
-    # Probe range ratio
-    probe_eth = min(available_eth * 0.5, max(20 / price, 0.001))
-    probe_wei = int(probe_eth * 10 ** TOKEN0["decimals"])
-    calc = defi_calculate_entry(
-        input_token=NATIVE_TOKEN, input_amount=str(probe_wei),
-        token_decimal=TOKEN0["decimals"],
-        tick_lower=main_tick_lower, tick_upper=main_tick_upper,
-    )
-    if not calc or not isinstance(calc, list):
-        log("  excess-edge: ratio probe failed")
-        return False
-    probe_eth_amt, probe_usdc_amt = 0.0, 0.0
-    for item in calc:
-        addr = (item.get("tokenAddress") or "").lower()
-        if addr == USDC_ADDR.lower():
-            probe_usdc_amt = float(item.get("coinAmount", 0)) / 10 ** TOKEN1["decimals"]
-        elif addr in (NATIVE_TOKEN.lower(), ETH_ADDR.lower()):
-            probe_eth_amt = float(item.get("coinAmount", 0)) / 10 ** TOKEN0["decimals"]
-    probe_eth_usd = probe_eth_amt * price
-    probe_total = probe_eth_usd + probe_usdc_amt
-    if probe_total < 0.01:
-        log("  excess-edge: probe returned zero")
-        return False
-    eth_ratio = probe_eth_usd / probe_total
-    usdc_ratio = 1.0 - eth_ratio
-
-    # Compute target and excess
-    target_eth_usd = total_usd * eth_ratio
-    target_usdc = total_usd * usdc_ratio
-    excess_eth_usd = eth_usd - target_eth_usd
-    excess_usdc = usdc_bal - target_usdc
-    log(
-        f"  excess-edge: range demands ETH {eth_ratio:.1%}/USDC {usdc_ratio:.1%} | "
-        f"wallet ETH=${eth_usd:.2f} USDC=${usdc_bal:.2f} | "
-        f"excess ETH=${excess_eth_usd:.2f} USDC=${excess_usdc:.2f}"
-    )
-
-    spacing = TICK_SPACING
-    offset = OOR_EDGE_OFFSET_SPACINGS * spacing
-    width = OOR_EDGE_WIDTH_SPACINGS * spacing
-    current_tick = price_to_tick(price)
-
-    # Mint edge for the side with the LARGER excess (it's always the single
-    # over-weighted side; the other will be negative or small positive).
-    if excess_eth_usd > MIN_TRADE_USD and excess_eth_usd >= excess_usdc:
-        # Sell_weth: put excess ETH above main upper, fills as price rises
-        floor_tick = max(current_tick + offset, main_tick_upper + offset)
-        tick_lower_e = ((floor_tick + spacing - 1) // spacing) * spacing
-        tick_upper_e = tick_lower_e + width
-        edge_eth_amount = excess_eth_usd / price
-        edge_amount = int(edge_eth_amount * 10 ** TOKEN0["decimals"])
-        min_amount = int(MIN_TRADE_USD / price * 10 ** TOKEN0["decimals"])
-        if edge_amount < min_amount:
-            log(f"  excess-edge ETH: amount {edge_amount} < min {min_amount} — skip")
-            return False
-        return _mint_one_edge(state, "sell_weth", edge_amount, price,
-                              tick_lower_e, tick_upper_e, current_tick,
-                              tag="excess-edge")
-    elif excess_usdc > MIN_TRADE_USD:
-        # Buy_weth: put excess USDC below main lower, fills as price drops
-        ceil_tick = min(current_tick - offset, main_tick_lower - offset)
-        tick_upper_e = (ceil_tick // spacing) * spacing
-        tick_lower_e = tick_upper_e - width
-        edge_amount = int(excess_usdc * 10 ** TOKEN1["decimals"])
-        min_amount = int(MIN_TRADE_USD * 10 ** TOKEN1["decimals"])
-        if edge_amount < min_amount:
-            log(f"  excess-edge USDC: amount {edge_amount} < min {min_amount} — skip")
-            return False
-        return _mint_one_edge(state, "buy_weth", edge_amount, price,
-                              tick_lower_e, tick_upper_e, current_tick,
-                              tag="excess-edge")
-    else:
-        log(f"  excess-edge: no meaningful excess (max ${max(excess_eth_usd, excess_usdc):.2f} < min ${MIN_TRADE_USD})")
-        return False
-
-
-def _mint_dual_edges(state: dict, price: float,
-                     main_tick_lower: int, main_tick_upper: int) -> bool:
-    """Pure-edge mode: mint BOTH sides of the wallet as range orders, no main.
-
-    Used when wallet is too unbalanced to form a meaningful no-swap main mint
-    (i.e. _calc_balanced_deposit returned None). Both ETH and USDC sides above
-    MIN_TRADE_USD become edges. Honors GAS_RESERVE_ETH.
-
-    Returns True if at least one edge was minted.
-    """
-    eth_bal, usdc_bal, failed = get_balances(force=True)
-    if failed:
-        log("  dual-edge: balance query failed — skip")
-        return False
-
-    available_eth = max(eth_bal - GAS_RESERVE_ETH, 0)
-    eth_usd = available_eth * price
-
-    spacing = TICK_SPACING
-    offset = OOR_EDGE_OFFSET_SPACINGS * spacing
-    width = OOR_EDGE_WIDTH_SPACINGS * spacing
-    current_tick = price_to_tick(price)
-    success = 0
-
-    # ── ETH side → sell_weth edge ABOVE main upper ──
-    if eth_usd >= MIN_TRADE_USD:
-        floor_tick = max(current_tick + offset, main_tick_upper + offset)
-        tick_lower_e = ((floor_tick + spacing - 1) // spacing) * spacing
-        tick_upper_e = tick_lower_e + width
-        edge_amount = int(available_eth * 0.95 * 10 ** int(TOKEN0["decimals"]))
-        min_amount = int(MIN_TRADE_USD / price * 10 ** int(TOKEN0["decimals"]))
-        if edge_amount >= min_amount:
-            if _mint_one_edge(state, "sell_weth", edge_amount, price,
-                              tick_lower_e, tick_upper_e, current_tick,
-                              tag="dual-edge"):
-                success += 1
-        else:
-            log(f"  dual-edge ETH: amount {edge_amount} < min {min_amount} — skip ETH side")
-    else:
-        log(f"  dual-edge: ETH side ${eth_usd:.2f} < min ${MIN_TRADE_USD} — skip")
-
-    # ── USDC side → buy_weth edge BELOW main lower ──
-    if usdc_bal >= MIN_TRADE_USD:
-        ceil_tick = min(current_tick - offset, main_tick_lower - offset)
-        tick_upper_e = (ceil_tick // spacing) * spacing
-        tick_lower_e = tick_upper_e - width
-        edge_amount = int(usdc_bal * 0.95 * 10 ** int(TOKEN1["decimals"]))
-        min_amount = int(MIN_TRADE_USD * 10 ** int(TOKEN1["decimals"]))
-        if edge_amount >= min_amount:
-            if _mint_one_edge(state, "buy_weth", edge_amount, price,
-                              tick_lower_e, tick_upper_e, current_tick,
-                              tag="dual-edge"):
-                success += 1
-        else:
-            log(f"  dual-edge USDC: amount {edge_amount} < min {min_amount} — skip USDC side")
-    else:
-        log(f"  dual-edge: USDC side ${usdc_bal:.2f} < min ${MIN_TRADE_USD} — skip")
-
-    if success > 0:
-        log(f"  ✓ dual-edge complete: {success} edge(s) minted, no main this rebalance")
-    else:
-        log(f"  dual-edge: no edges minted (both sides too small)")
-    return success > 0
-
-
-def _try_resolve_pending_edges(state: dict, price: float) -> bool:
-    """Before mounting a new main, close any edges that have fully filled
-    (price has fully traversed them). Returns True if any edge closed.
-    Also force-closes edges that exceeded OOR_EDGE_TIMEOUT_HOURS.
-    """
-    try:
-        from edge_manager import Edge, load_edges, save_edges, close_edge, fill_pct
-    except Exception:
-        return False
-    edges = load_edges()
-    if not edges:
-        return False
-    current_tick = price_to_tick(price)
-    keep = []
-    closed_any = False
-    now = datetime.now()
-    for e in edges:
-        f = fill_pct(e, current_tick)
-        age_h = 0.0
-        try:
-            created = _safe_isoparse(e.created_at)
-            age_h = (now - created).total_seconds() / 3600 if created else 0
-        except Exception:
-            pass
-        if f >= 95.0:
-            log(f"  Edge {e.token_id} filled {f:.1f}% — closing")
-            if close_edge(e):
-                closed_any = True
-            else:
-                keep.append(e)
-        elif age_h > OOR_EDGE_TIMEOUT_HOURS:
-            log(f"  Edge {e.token_id} timed out ({age_h:.1f}h > {OOR_EDGE_TIMEOUT_HOURS}h) — force close")
-            if close_edge(e):
-                closed_any = True
-                emit("edge_timeout", {"token_id": e.token_id, "age_h": round(age_h, 1)},
-                     notify=True)
-            else:
-                keep.append(e)
-        else:
-            keep.append(e)
-    if closed_any:
-        save_edges(keep)
-    return closed_any
 
 
 def execute_rebalance(
@@ -2895,19 +2454,6 @@ def execute_rebalance(
         log(f"  Balance too low after redeem: ${total_usd:.2f}")
         return False
 
-    # OOR-split branch: post-OOR close, don't do balanced mint. Instead
-    # split single-sided wallet 50/50 — half mints a range-order "edge"
-    # acting as zero-slippage swap; half stays in wallet awaiting edge
-    # fill, then a later tick rebuilds main with balanced funds.
-    if trigger.get("trigger") == "out_of_range":
-        oor_result = _execute_oor_split(
-            state, price, trigger, eth_bal, usdc_bal, available_eth,
-        )
-        if oor_result:
-            state["_rebalance_in_progress"] = False
-            save_state(state)
-        return bool(oor_result)
-
     # Step 4: Calculate no-swap dual-token deposit (no-swap design 2026-04-15)
     log(f"  Balances: ETH={eth_bal:.6f} USDC={usdc_bal:.2f}")
     user_input_json = _calc_balanced_deposit(
@@ -2915,12 +2461,7 @@ def execute_rebalance(
         new_tick_lower, new_tick_upper,
     )
     if not user_input_json:
-        # Path-1 timeout fallback: if we've been in pure-edge mode > MAX hours
-        # without minting a main, swap to balance and force a main mint now.
-        # No-swap main too small → immediate minimal swap to balance + mint.
-        # Edge system removed (2026-04-16): edges earn $0 fee (out-of-range),
-        # cost gas to mint/close, and delay main opening. For $451 portfolio
-        # the $0.14 slippage is cheaper than hours without main.
+        # No-swap main too small or unbalanced → minimal swap to balance + mint.
         log(f"  No-swap main unbalanced (leftover > ${MAIN_MAX_LEFTOVER_USD}) "
             f"— immediate minimal swap to balance")
         user_input_json = _calc_entry_usdc_base(usdc_bal, new_tick_lower, new_tick_upper)
@@ -3049,9 +2590,6 @@ def execute_rebalance(
         "created_atr_pct": round(current_atr, 3),
         "entry_price": round(rebal_price, 2),
     }
-    # Main minted — clear pure-edge timer
-    state.pop("_pure_edge_started_at", None)
-
     # Record rebalance
     rebalance_record = {
         "time": now_iso,
@@ -3079,14 +2617,6 @@ def execute_rebalance(
     state["_value_history"] = []
     state["stop_triggered"] = None
     log("  Peak reset: cleared (next tick repopulates from real portfolio value)")
-
-    # No-swap design: consume single-side wallet excess as an edge range order.
-    # The new main mint is balanced by the limiting side; the other side may
-    # have meaningful leftover sitting idle. Park it in an edge.
-    try:
-        _mint_idle_edge(state, rebal_price or price, new_tick_lower, new_tick_upper)
-    except Exception as e:
-        log(f"  idle-edge skipped: {e}")
 
     log(
         f"  Rebalance complete: [{new_tick_lower},{new_tick_upper}] "
@@ -3787,44 +3317,6 @@ def _check_auto_switch_pool() -> bool:
     return True
 
 
-def _check_edges():
-    """Phase E4: if auto_edges enabled and main position exists, run the
-    edge_manager cascade — close filled edges, mint missing ones.
-
-    Runs BEFORE main rebalance logic so edges stay in sync with the current
-    main range. Safe to fail: logs and continues.
-    """
-    if not CFG.get("auto_edges", False):
-        return
-    state = load_state()
-    pos = state.get("position") or {}
-    if not pos.get("token_id"):
-        return  # no main position yet
-    try:
-        import edge_manager
-        import capital_efficiency as ce_mod
-        prices = ce_mod.fetch_hourly_prices(INVESTMENT_ID, POOL_CHAIN)
-        eth_price = prices[-1][1] if prices else 0
-        if eth_price <= 0:
-            return
-        edge_capital = float(CFG.get("edge_capital_usd", 20.0))
-        sides_cfg = CFG.get("edge_sides", "buy_weth")  # sell_weth needs WETH wrap
-        sides = [s.strip() for s in sides_cfg.split(",") if s.strip()]
-        summary = edge_manager.check_and_cascade(
-            main_tick_lower=int(pos["tick_lower"]),
-            main_tick_upper=int(pos["tick_upper"]),
-            capital_usd_per_edge=edge_capital,
-            eth_price=eth_price,
-            sides=sides,
-        )
-        if summary.get("closed") or summary.get("minted"):
-            log(f"  auto_edges: closed={summary.get('closed')} minted={summary.get('minted')}")
-        if summary.get("errors"):
-            log(f"  auto_edges errors: {summary.get('errors')}")
-    except Exception as e:
-        log(f"  auto_edges failed: {e}")
-
-
 def tick():
     """Main loop: check position, decide rebalance, execute."""
     # Process lock — prevent concurrent ticks
@@ -3838,8 +3330,6 @@ def tick():
         if _check_auto_switch_pool():
             log("auto_switch completed — exiting tick; next run will use new pool")
             return
-        # Phase E4: manage edge range-orders (zero-slippage swap substitutes)
-        _check_edges()
         _tick_inner()
     finally:
         _release_lock()
@@ -3909,8 +3399,7 @@ def _tick_inner():
     # Periodic orphan position check — detect untracked positions on-chain
     position = state.get("position")
     tracked_tid = position.get("token_id", "") if position else ""
-    edge_tids = {str(e.get("token_id")) for e in (state.get("edges") or []) if e.get("token_id")}
-    tracked_ids = ({str(tracked_tid)} if tracked_tid else set()) | edge_tids
+    tracked_ids = {str(tracked_tid)} if tracked_tid else set()
     try:
         all_onchain = _query_all_positions()
         active_onchain = [p for p in all_onchain if p.get("value", 0) > 1.0]
@@ -3921,8 +3410,8 @@ def _tick_inner():
             ]
             log(
                 f"ORPHAN CHECK: {len(active_onchain)} on-chain positions, "
-                f"{len(tracked_ids)} tracked (main={tracked_tid!r}, "
-                f"{len(edge_tids)} edge(s)). True orphans: {orphan_tids}"
+                f"{len(tracked_ids)} tracked (main={tracked_tid!r}). "
+                f"True orphans: {orphan_tids}"
             )
             if tracked_tid:
                 cleanup_residual_positions(tracked_tid)
@@ -4054,34 +3543,7 @@ def _tick_inner():
             # Position exists in state but API returned 0 — treat as query failure
             balance_failed = True
             log("LP position query returned 0 value — treating as query failure")
-    # Edges are separate V3 NFTs that hold real capital — must be included in
-    # portfolio_usd or PnL/stop-loss math underestimates total value (fix 2026-04-15).
-    # Each edge's value is cached on the edge dict (`last_value`) so transient
-    # OKX index lag right after a mint doesn't cause spurious portfolio dips.
-    edge_lp_value = 0.0
-    for e in state.get("edges", []) or []:
-        if not isinstance(e, dict):
-            continue
-        tid = e.get("token_id")
-        if not tid:
-            continue
-        try:
-            v = float(get_position_detail(tid).get("value", 0) or 0)
-        except Exception as ex:
-            log(f"  edge #{tid} value query failed: {ex}")
-            v = 0
-        if v > 0:
-            e["last_value"] = round(v, 2)
-            e["last_value_at"] = datetime.now().isoformat()
-            edge_lp_value += v
-        else:
-            cached = float(e.get("last_value", 0) or 0)
-            if cached > 0:
-                edge_lp_value += cached
-                log(f"  edge #{tid}: API returned 0 (likely indexer lag) — using cached ${cached:.2f}")
-            else:
-                log(f"  edge #{tid}: API returned 0 and no cached value — under-counted")
-    total_usd = wallet_usd + lp_value + edge_lp_value
+    total_usd = wallet_usd + lp_value
     # Track unclaimed fees in stats
     state.setdefault("stats", {})["unclaimed_fee_usd"] = round(unclaimed_fee, 2)
 
@@ -4269,73 +3731,31 @@ def _tick_inner():
     rebalanced = False
 
     if not position or not position.get("tick_lower"):
-        # Pending edges take priority: resolve them first (close filled /
-        # timeout); if any still pending after this, defer main mint until
-        # wallet rebalances naturally via edge fills.
-        edges_now = state.get("edges") or []
-        if edges_now:
-            closed_any = _try_resolve_pending_edges(state, price)
-            remaining = (load_state().get("edges") or [])
-            if remaining:
-                log(
-                    f"No main position but {len(remaining)} edge(s) active — "
-                    f"deferring new main until edges fill/close "
-                    f"(closed this tick: {len(edges_now) - len(remaining)})"
-                )
-                tick_status = "awaiting_edge_fill"
-                # Refresh balances for snapshot; don't call execute_rebalance.
-                # CRUCIAL: include edge LP values in total_usd (fix 2026-04-16)
-                # so dashboard shows correct portfolio when deferring main mint.
-                eth_bal, usdc_bal, balance_failed = get_balances(force=True)
-                edge_lp_total = 0.0
-                for e in remaining or []:
-                    tid = e.get("token_id") if isinstance(e, dict) else None
-                    if not tid:
-                        continue
-                    try:
-                        v = float(get_position_detail(tid).get("value", 0) or 0)
-                        edge_lp_total += v if v > 0 else float(e.get("last_value", 0) or 0)
-                    except Exception:
-                        edge_lp_total += float(e.get("last_value", 0) or 0)
-                total_usd = eth_bal * price + usdc_bal + edge_lp_total
-                # Fall through to snapshot/emit logic below (skip mint)
-                rebalanced = False
-                new_range = None  # prevent initial_deposit path below
-                goto_skip_mint = True
-            else:
-                log(f"All {len(edges_now)} edge(s) resolved; proceeding to mint new main")
-                eth_bal, usdc_bal, balance_failed = get_balances(force=True)
-                total_usd = eth_bal * price + usdc_bal
-                goto_skip_mint = False
+        # No position — clean up any orphaned positions before creating new one
+        residual_cleaned = cleanup_residual_positions("")
+        if residual_cleaned:
+            log(f"Cleaned {residual_cleaned} orphaned position(s) before initial deposit")
+            eth_bal, usdc_bal, balance_failed = get_balances(force=True)
+            total_usd = eth_bal * price + usdc_bal
+        log("No active position — creating initial LP position")
+        new_range = calc_optimal_range(price, atr_pct, mtf)
+        log(
+            f"Initial range: ${new_range['lower_price']:.2f}-${new_range['upper_price']:.2f} "
+            f"({new_range['regime']}, width {new_range['half_width_pct']:.1f}%)"
+        )
+
+        initial_trigger = {
+            "trigger": "initial_deposit",
+            "priority": "mandatory",
+            "detail": "first position",
+        }
+
+        if total_usd < MIN_TRADE_USD:
+            log(f"Balance too low for initial deposit: ${total_usd:.2f}")
+            tick_status = "insufficient_balance"
         else:
-            goto_skip_mint = False
-
-        if not goto_skip_mint:
-            # No position — clean up any orphaned positions before creating new one
-            residual_cleaned = cleanup_residual_positions("")
-            if residual_cleaned:
-                log(f"Cleaned {residual_cleaned} orphaned position(s) before initial deposit")
-                eth_bal, usdc_bal, balance_failed = get_balances(force=True)
-                total_usd = eth_bal * price + usdc_bal
-            log("No active position — creating initial LP position")
-            new_range = calc_optimal_range(price, atr_pct, mtf)
-            log(
-                f"Initial range: ${new_range['lower_price']:.2f}-${new_range['upper_price']:.2f} "
-                f"({new_range['regime']}, width {new_range['half_width_pct']:.1f}%)"
-            )
-
-            initial_trigger = {
-                "trigger": "initial_deposit",
-                "priority": "mandatory",
-                "detail": "first position",
-            }
-
-            if total_usd < MIN_TRADE_USD:
-                log(f"Balance too low for initial deposit: ${total_usd:.2f}")
-                tick_status = "insufficient_balance"
-            else:
-                rebalanced = execute_rebalance(state, price, new_range, initial_trigger)
-                tick_status = "initial_deposit" if rebalanced else "initial_deposit_failed"
+            rebalanced = execute_rebalance(state, price, new_range, initial_trigger)
+            tick_status = "initial_deposit" if rebalanced else "initial_deposit_failed"
 
     elif risk_reject:
         log(f"Risk check: {risk_reject}")
@@ -4493,8 +3913,7 @@ def _tick_inner():
         "balances": {
             "eth": round(eth_bal, 6),
             "usdc": round(usdc_bal, 2),
-            "lp_usd": round(lp_value, 2),         # main LP only
-            "edge_lp_usd": round(edge_lp_value, 2), # all edge LPs combined
+            "lp_usd": round(lp_value, 2),
             "lp_assets": [
                 {
                     "symbol": a.get("tokenSymbol", ""),
