@@ -1,0 +1,17 @@
+# lp-auto crontab fallback (Linux / macOS)
+#
+# Install: append this block to `crontab -e`
+# Register:
+#   lp-auto --instance {{INSTANCE}} scheduler-register \
+#       --type cron \
+#       --id "LP_AUTO_INSTANCE_DIR={{HOME}}/.lp-auto/instances/{{INSTANCE}}" \
+#       --interval {{INTERVAL}}
+#
+# Notes:
+#   - cron runs a fresh short-lived process every tick; use this mode
+#     INSTEAD of `lp-auto daemon`, never alongside it.
+#   - Prefer `*/5 * * * *` for 5-minute ticks; crontab granularity is 1 min.
+#   - The LP_AUTO_INSTANCE_DIR= assignment is used by status as a search
+#     marker — keep it intact when editing.
+
+*/5 * * * * PATH=/usr/local/bin:/usr/bin:/bin:{{HOME}}/.local/bin LP_AUTO_INSTANCE={{INSTANCE}} LP_AUTO_INSTANCE_DIR={{HOME}}/.lp-auto/instances/{{INSTANCE}} {{PYTHON}} {{CLI}} --instance {{INSTANCE}} start >> {{HOME}}/.lp-auto/instances/{{INSTANCE}}/cron.log 2>&1

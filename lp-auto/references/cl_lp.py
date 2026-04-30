@@ -695,6 +695,77 @@ def get_position_value(token_id: str) -> float:
     return get_position_detail(token_id)["value"]
 
 
+def verify_position_liquidity_onchain(token_id: str) -> int | None:
+    """Direct RPC call to NPM.positions(token_id).liquidity, with multi-RPC fallback.
+
+    Returns:
+      - int liquidity on success (0 means empty NFT shell)
+      - None on all-RPCs-error (caller must treat as unknown, do not act)
+
+    Guards against "mint OK + add_liquidity FAIL" bug — see
+    feedback_v3_empty_nft_shell_guard.md. Must be called before treating
+    status as authoritative; onchainos/OKX indexer can lag or return stale
+    snapshots, RPC is ground truth.
+    """
+    if not token_id:
+        return None
+    rpc_urls = {
+        "base": [
+            "https://base.publicnode.com",
+            "https://base.llamarpc.com",
+            "https://base-rpc.publicnode.com",
+            "https://1rpc.io/base",
+            "https://base.drpc.org",
+            "https://mainnet.base.org",
+        ],
+        "ethereum": ["https://eth.llamarpc.com", "https://ethereum.publicnode.com", "https://eth.drpc.org"],
+        "arbitrum": ["https://arbitrum.llamarpc.com", "https://arbitrum.publicnode.com", "https://arb1.arbitrum.io/rpc"],
+        "optimism": ["https://optimism.llamarpc.com", "https://optimism.publicnode.com", "https://mainnet.optimism.io"],
+        "polygon": ["https://polygon.llamarpc.com", "https://polygon.publicnode.com", "https://polygon-rpc.com"],
+    }
+    npm_addrs = {
+        "base": "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1",
+        "ethereum": "0xC36442b4a4522E871399CD717aBDD847Ab11FE88",
+        "arbitrum": "0xC36442b4a4522E871399CD717aBDD847Ab11FE88",
+        "optimism": "0xC36442b4a4522E871399CD717aBDD847Ab11FE88",
+        "polygon": "0xC36442b4a4522E871399CD717aBDD847Ab11FE88",
+    }
+    rpcs = rpc_urls.get(POOL_CHAIN, [])
+    npm = npm_addrs.get(POOL_CHAIN)
+    if not rpcs or not npm:
+        return None
+    import urllib.request
+    token_hex = f"{int(token_id):064x}"
+    payload = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "eth_call",
+        "params": [{"to": npm, "data": f"0x99fbab88{token_hex}"}, "latest"],
+    }).encode()
+    last_err = None
+    for rpc in rpcs:
+        try:
+            req = urllib.request.Request(
+                rpc, data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0 (lp-auto liquidity-check)",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                r = json.loads(resp.read())
+            h = r.get("result", "") or ""
+            if not h or len(h) < 2 + 64 * 8:
+                last_err = f"{rpc}: short result {h[:20]}"
+                continue
+            # positions() returns 12 fields; liquidity is the 8th (index 7).
+            liquidity_hex = h[2 + 64 * 7:2 + 64 * 8]
+            return int(liquidity_hex, 16)
+        except Exception as e:
+            last_err = f"{rpc}: {e}"
+            continue
+    log(f"verify_position_liquidity_onchain: all RPCs failed ({last_err})")
+    return None
+
+
 def _query_all_positions() -> list[dict]:
     """Query all LP positions for this pool. Returns list of {tokenId, assets, value}."""
     if not WALLET_ADDR:
@@ -1715,8 +1786,12 @@ def _wallet_contract_call(tx: dict) -> tuple[str | None, dict | None]:
         value_wei,
     ]
     try:
-        data = onchainos_cmd(args, timeout=45)
-        if data and data.get("ok") and data.get("data"):
+        data = None
+        result = None
+        for attempt_args in (args, args + ["--force"]):
+            data = onchainos_cmd(attempt_args, timeout=45)
+            if not (data and data.get("ok") and data.get("data")):
+                continue
             result = (
                 data["data"]
                 if isinstance(data["data"], dict)
@@ -1730,9 +1805,26 @@ def _wallet_contract_call(tx: dict) -> tuple[str | None, dict | None]:
             if tx_hash:
                 log(f"  Broadcast OK: {tx_hash}")
                 return tx_hash, None
+            detail_raw = result.get("detail") if isinstance(result, dict) else None
+            try:
+                detail_obj = (
+                    json.loads(detail_raw)
+                    if isinstance(detail_raw, str)
+                    else (detail_raw or {})
+                )
+            except (ValueError, TypeError):
+                detail_obj = {}
+            confirming = (
+                isinstance(result, dict) and result.get("confirming")
+            ) or (isinstance(detail_obj, dict) and detail_obj.get("confirming"))
+            if confirming and "--force" not in attempt_args:
+                log("  contract-call needs confirm — retrying with --force")
+                continue
+            break
+        if data and data.get("ok") and data.get("data"):
             return None, {
                 "reason": "no_hash",
-                "detail": json.dumps(result)[:200],
+                "detail": json.dumps(result)[:200] if result is not None else "",
                 "retriable": True,
             }
         detail = json.dumps(data)[:200] if data else "no response"
@@ -1777,6 +1869,12 @@ def simulate_tx(tx: dict) -> dict | None:
 
 
 def ensure_approval(token_addr: str, spender: str, amount: int) -> bool:
+    # Native ETH sentinel never needs ERC20 approve; onchainos returns dummy
+    # {"confirming": true} which has no tx hash and would loop forever.
+    if token_addr.lower() == "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee":
+        log(f"  Skipping approve for native ETH sentinel ({token_addr[:10]}...)")
+        return True
+
     state = load_state()
     approved_routers = state.get("approved_routers", [])
     key = f"{token_addr}:{spender}".lower()
@@ -3399,6 +3497,21 @@ def _tick_inner():
     # Periodic orphan position check — detect untracked positions on-chain
     position = state.get("position")
     tracked_tid = position.get("token_id", "") if position else ""
+
+    # On-chain liquidity guard: drop empty-NFT shells (mint OK + add_liquidity FAIL).
+    # onchainos indexer can lag and report status as "in_range" even after a
+    # failed add_liquidity, causing portfolio undercounts + false stop-loss.
+    # RPC is ground truth — see feedback_v3_empty_nft_shell_guard.md.
+    if position and tracked_tid:
+        onchain_liq = verify_position_liquidity_onchain(tracked_tid)
+        if onchain_liq == 0:
+            log(f"⚠ Position {tracked_tid} has 0 liquidity on-chain (empty NFT shell). "
+                f"Resetting state — next tick will redeploy.")
+            state["position"] = None
+            save_state(state)
+            position = None
+            tracked_tid = ""
+
     tracked_ids = {str(tracked_tid)} if tracked_tid else set()
     try:
         all_onchain = _query_all_positions()
@@ -3543,7 +3656,7 @@ def _tick_inner():
             # Position exists in state but API returned 0 — treat as query failure
             balance_failed = True
             log("LP position query returned 0 value — treating as query failure")
-    total_usd = wallet_usd + lp_value
+    total_usd = wallet_usd + lp_value + unclaimed_fee
     # Track unclaimed fees in stats
     state.setdefault("stats", {})["unclaimed_fee_usd"] = round(unclaimed_fee, 2)
 
@@ -4141,7 +4254,7 @@ def status():
         lp_value = pos_detail["value"]
         unclaimed_fee = pos_detail["unclaimed_fee_usd"]
         lp_assets_raw = pos_detail.get("assets", [])
-    total_usd = wallet_usd + lp_value
+    total_usd = wallet_usd + lp_value + unclaimed_fee
     stats = state.get("stats", {})
     history = state.get("price_history", [])
 
@@ -4250,7 +4363,7 @@ def report():
         pos_detail = get_position_detail(position["token_id"])
         unclaimed_fee = pos_detail.get("unclaimed_fee_usd", 0)
         lp_value = pos_detail.get("value", 0)
-        total_usd = eth_bal * (price or 0) + usdc_bal + lp_value
+        total_usd = eth_bal * (price or 0) + usdc_bal + lp_value + unclaimed_fee
         # Update unclaimed in stats so calc_pnl picks it up for APY
         stats["unclaimed_fee_usd"] = round(unclaimed_fee, 2)
     claimed_fee = stats.get("total_fees_claimed_usd", 0)

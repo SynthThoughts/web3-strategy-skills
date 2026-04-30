@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  lp-auto launchd template (macOS)
+  Install: ~/Library/LaunchAgents/ai.lp-auto.{{INSTANCE}}.plist
+  Load:    launchctl load   ~/Library/LaunchAgents/ai.lp-auto.{{INSTANCE}}.plist
+           launchctl kickstart -k gui/$(id -u)/ai.lp-auto.{{INSTANCE}}
+  Register: lp-auto --instance {{INSTANCE}} scheduler-register \
+              --type launchd \
+              --id ai.lp-auto.{{INSTANCE}} \
+              --interval {{INTERVAL}}
+
+  KeepAlive keeps the daemon running across crashes / logouts.
+  StandardOutPath / StandardErrorPath capture stdout+stderr to a file
+  (journald has no launchd equivalent on macOS).
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.lp-auto.{{INSTANCE}}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{PYTHON}}</string>
+        <string>{{CLI}}</string>
+        <string>--instance</string>
+        <string>{{INSTANCE}}</string>
+        <string>daemon</string>
+        <string>--interval</string>
+        <string>{{INTERVAL}}</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>LP_AUTO_INSTANCE</key>
+        <string>{{INSTANCE}}</string>
+        <key>LP_AUTO_INSTANCE_DIR</key>
+        <string>{{HOME}}/.lp-auto/instances/{{INSTANCE}}</string>
+        <!-- Ensure onchainos CLI is reachable if installed via Homebrew -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{{HOME}}/.local/bin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>15</integer>
+
+    <key>StandardOutPath</key>
+    <string>{{HOME}}/.lp-auto/instances/{{INSTANCE}}/daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{HOME}}/.lp-auto/instances/{{INSTANCE}}/daemon.err</string>
+
+    <key>WorkingDirectory</key>
+    <string>{{HOME}}/.lp-auto/instances/{{INSTANCE}}</string>
+</dict>
+</plist>

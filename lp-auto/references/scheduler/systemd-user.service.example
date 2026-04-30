@@ -1,0 +1,33 @@
+; lp-auto systemd user service template
+; Install: ~/.config/systemd/user/lp-auto@{{INSTANCE}}.service
+; Enable:  systemctl --user daemon-reload
+;          systemctl --user enable --now lp-auto@{{INSTANCE}}.service
+; Register: lp-auto --instance {{INSTANCE}} scheduler-register \
+;             --type systemd-user \
+;             --id lp-auto@{{INSTANCE}}.service \
+;             --interval {{INTERVAL}}
+;
+; On a headless server, also run once so the user manager survives logout:
+;   loginctl enable-linger {{USER}}
+
+[Unit]
+Description=lp-auto V3 LP daemon ({{INSTANCE}})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=LP_AUTO_INSTANCE={{INSTANCE}}
+Environment=LP_AUTO_INSTANCE_DIR={{HOME}}/.lp-auto/instances/{{INSTANCE}}
+; Add PATH tweaks here if onchainos CLI isn't on the default login PATH:
+; Environment=PATH=/usr/local/bin:/usr/bin:/bin:{{HOME}}/.local/bin
+ExecStart={{PYTHON}} {{CLI}} --instance {{INSTANCE}} daemon --interval {{INTERVAL}}
+Restart=on-failure
+RestartSec=15s
+; Optional safety: limit how often systemd restarts a crash loop
+StartLimitIntervalSec=300
+StartLimitBurst=5
+; Log to journald; follow with: journalctl --user -u lp-auto@{{INSTANCE}} -f
+
+[Install]
+WantedBy=default.target

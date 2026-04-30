@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# lp-auto Tier 1 portable fallback: run the daemon under nohup.
+#
+# Use when:
+#   - no systemd/launchd/Task Scheduler available, OR
+#   - you explicitly want a foreground loop you can watch in tmux/screen.
+#
+# After starting, register so status can self-check:
+#   lp-auto --instance {{INSTANCE}} scheduler-register \
+#       --type daemon-foreground \
+#       --pid-file {{HOME}}/.lp-auto/instances/{{INSTANCE}}/daemon.pid \
+#       --interval {{INTERVAL}}
+#
+# Preferred: launch inside tmux/screen so the daemon survives your SSH
+# disconnect without relying on nohup redirection alone.
+#
+#   tmux new -d -s lp-auto-{{INSTANCE}} \
+#     "{{PYTHON}} {{CLI}} --instance {{INSTANCE}} daemon --interval {{INTERVAL}}"
+
+set -euo pipefail
+
+INSTANCE="{{INSTANCE}}"
+DIR="${HOME}/.lp-auto/instances/${INSTANCE}"
+mkdir -p "${DIR}"
+
+nohup {{PYTHON}} {{CLI}} --instance "${INSTANCE}" daemon --interval {{INTERVAL}} \
+    >> "${DIR}/daemon.log" 2>&1 &
+
+echo $! > "${DIR}/daemon.pid"
+echo "Started lp-auto daemon for '${INSTANCE}' (pid $(cat "${DIR}/daemon.pid"))"
+echo "Logs:  tail -f ${DIR}/daemon.log"
+echo "Stop:  kill \$(cat ${DIR}/daemon.pid)"
