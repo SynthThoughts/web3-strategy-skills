@@ -4,7 +4,7 @@
   "max_risk": "medium",
   "capital_usd": 500,
   "pool_config": null,
-  "gas_reserve_eth": 0.02,
+  "gas_reserve_eth": 0.01,
   "min_trade_usd": 5.0,
   "slippage_pct": 0.1,
   "auto_switch": false,
