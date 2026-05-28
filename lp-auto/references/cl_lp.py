@@ -3301,6 +3301,11 @@ STOP_RESUME_REBOUND_PCT = CFG.get("stop_resume_rebound_pct", 0.02)  # 2% default
 MAX_AUTO_RESUMES_24H = CFG.get("max_auto_resumes_24h", 2)  # max 2 auto-resumes per 24h
 MAX_DEPOSIT_FAILURES = CFG.get("max_deposit_failures", 3)  # pause after N consecutive deposit fails
 MAX_BALANCE_FAILURES = CFG.get("max_balance_failures", 5)
+# Reject single-tick portfolio swings beyond this fraction vs a trusted baseline
+# (OKX balance-indexer lag can double-count just-deposited funds, or undercount).
+VALUE_GLITCH_PCT = CFG.get("value_glitch_pct", 0.30)
+# A swing that persists past this many ticks is treated as a real change, not a glitch.
+MAX_VALUE_GLITCH_TICKS = CFG.get("max_value_glitch_ticks", 2)
 
 
 def _check_auto_switch_pool() -> bool:
@@ -3657,11 +3662,47 @@ def _tick_inner():
             balance_failed = True
             log("LP position query returned 0 value — treating as query failure")
     total_usd = wallet_usd + lp_value + unclaimed_fee
+
+    # Guard against OKX balance-indexer lag. Right after a deposit the indexer can
+    # briefly still report just-deposited tokens as idle wallet balance while
+    # position-detail ALSO counts them inside the LP, double-counting the in-flight
+    # funds (observed: $601 vs real $420); it can likewise transiently undercount.
+    # Detect an implausible single-tick swing vs a trusted baseline and fall back
+    # to that baseline. A swing that persists past MAX_VALUE_GLITCH_TICKS is treated
+    # as a real change (e.g. manual capital add) and accepted.
+    value_glitch = False
+    if not balance_failed:
+        vh = state.get("_value_history", [])
+        baseline = 0.0
+        if len(vh) >= 3:
+            baseline = sorted(vh[-5:])[len(vh[-5:]) // 2]
+        elif state.get("_cached_snapshot", {}).get("portfolio_usd"):
+            baseline = state["_cached_snapshot"]["portfolio_usd"]
+        if baseline > 0 and abs(total_usd - baseline) / baseline > VALUE_GLITCH_PCT:
+            glitch_n = state.get("_value_glitch_count", 0) + 1
+            if glitch_n <= MAX_VALUE_GLITCH_TICKS:
+                log(
+                    f"Value glitch: ${total_usd:.2f} vs baseline ${baseline:.2f} "
+                    f"({(total_usd - baseline) / baseline:+.0%}) — likely OKX indexer "
+                    f"lag, using baseline ({glitch_n}/{MAX_VALUE_GLITCH_TICKS})"
+                )
+                total_usd = baseline
+                value_glitch = True
+                state["_value_glitch_count"] = glitch_n
+            else:
+                log(
+                    f"Value deviation ${total_usd:.2f} vs ${baseline:.2f} persisted "
+                    f"{glitch_n - 1} ticks — accepting as real change"
+                )
+                state["_value_glitch_count"] = 0
+        else:
+            state["_value_glitch_count"] = 0
+
     # Track unclaimed fees in stats
     state.setdefault("stats", {})["unclaimed_fee_usd"] = round(unclaimed_fee, 2)
 
     # Track portfolio value history for smoothing (only when data is reliable)
-    if not balance_failed:
+    if not balance_failed and not value_glitch:
         value_history = state.get("_value_history", [])
         value_history.append(round(total_usd, 2))
         if len(value_history) > 12:  # keep ~1h @ 5min ticks
@@ -3976,8 +4017,8 @@ def _tick_inner():
             )
 
     state["stats"]["last_check"] = datetime.now().isoformat()
-    # Save balance snapshot for fallback
-    if not balance_failed:
+    # Save balance snapshot for fallback (skip on glitch so we don't cache dirty balances)
+    if not balance_failed and not value_glitch:
         state["last_balances"] = {
             "eth": round(eth_bal, 6),
             "usdc": round(usdc_bal, 2),
