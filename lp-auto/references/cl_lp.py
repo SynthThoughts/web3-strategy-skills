@@ -695,17 +695,12 @@ def get_position_value(token_id: str) -> float:
     return get_position_detail(token_id)["value"]
 
 
-def verify_position_liquidity_onchain(token_id: str) -> int | None:
-    """Direct RPC call to NPM.positions(token_id).liquidity, with multi-RPC fallback.
+def _npm_positions_call(token_id: str) -> str | None:
+    """Raw RPC NPM.positions(token_id) → hex result string, multi-RPC fallback.
 
-    Returns:
-      - int liquidity on success (0 means empty NFT shell)
-      - None on all-RPCs-error (caller must treat as unknown, do not act)
-
-    Guards against "mint OK + add_liquidity FAIL" bug — see
-    feedback_v3_empty_nft_shell_guard.md. Must be called before treating
-    status as authoritative; onchainos/OKX indexer can lag or return stale
-    snapshots, RPC is ground truth.
+    Returns None on all-RPC failure. positions() returns 12 fields; field i sits
+    at h[2 + 64*i : 2 + 64*(i+1)] — index 5=tickLower, 6=tickUpper, 7=liquidity.
+    RPC is ground truth; onchainos/OKX indexer can lag or return stale snapshots.
     """
     if not token_id:
         return None
@@ -756,14 +751,42 @@ def verify_position_liquidity_onchain(token_id: str) -> int | None:
             if not h or len(h) < 2 + 64 * 8:
                 last_err = f"{rpc}: short result {h[:20]}"
                 continue
-            # positions() returns 12 fields; liquidity is the 8th (index 7).
-            liquidity_hex = h[2 + 64 * 7:2 + 64 * 8]
-            return int(liquidity_hex, 16)
+            return h
         except Exception as e:
             last_err = f"{rpc}: {e}"
             continue
-    log(f"verify_position_liquidity_onchain: all RPCs failed ({last_err})")
+    log(f"_npm_positions_call: all RPCs failed ({last_err})")
     return None
+
+
+def verify_position_liquidity_onchain(token_id: str) -> int | None:
+    """Direct RPC NPM.positions(token_id).liquidity. int on success (0=empty shell),
+    None on all-RPC failure (caller must treat as unknown, do not act). Guards the
+    "mint OK + add_liquidity FAIL" bug — see feedback_v3_empty_nft_shell_guard.md."""
+    h = _npm_positions_call(token_id)
+    if h is None:
+        return None
+    return int(h[2 + 64 * 7:2 + 64 * 8], 16)
+
+
+def get_position_ticks_onchain(token_id: str) -> tuple[int, int] | None:
+    """RPC NPM.positions(token_id) → (tick_lower, tick_upper). None on RPC failure or
+    empty shell (liquidity 0). Recovers the range of a position adopted from an
+    interrupted rebalance (token_id known, range unknown) so it is not mistaken for
+    'no position' and redeemed as an orphan (friendly fire — incident 2026-05-28)."""
+    h = _npm_positions_call(token_id)
+    if h is None:
+        return None
+    if int(h[2 + 64 * 7:2 + 64 * 8], 16) == 0:
+        return None  # empty shell — leave for the liquidity guard
+    def _i24(field: str) -> int:
+        v = int(field, 16)
+        return v - (1 << 256) if v >= (1 << 255) else v
+    tl = _i24(h[2 + 64 * 5:2 + 64 * 6])  # tickLower
+    tu = _i24(h[2 + 64 * 6:2 + 64 * 7])  # tickUpper
+    if tl >= tu:
+        return None
+    return (tl, tu)
 
 
 def _query_all_positions() -> list[dict]:
@@ -3550,6 +3573,35 @@ def _tick_inner():
                 save_state(state)
     except Exception as e:
         log(f"Orphan position check failed (non-fatal): {e}")
+
+    # Recover range for a position we hold a token_id for but whose tick range is
+    # unknown (adopted from an interrupted rebalance / orphan check). Without this it
+    # falls through to the "no position" branch below and gets redeemed as an orphan
+    # by cleanup_residual_positions("") — friendly fire, incident 2026-05-28.
+    position = state.get("position")
+    if position and position.get("token_id") and not position.get("tick_lower"):
+        ticks = get_position_ticks_onchain(position["token_id"])
+        if ticks:
+            tl, tu = ticks
+            position["tick_lower"], position["tick_upper"] = tl, tu
+            lo, hi = sorted([tick_to_price(tl), tick_to_price(tu)])
+            position["lower_price"], position["upper_price"] = round(lo, 2), round(hi, 2)
+            position.setdefault("created_at", datetime.now().isoformat())
+            state["position"] = position
+            save_state(state)
+            log(
+                f"Recovered range for adopted position #{position['token_id']}: "
+                f"ticks [{tl},{tu}] = ${lo:.2f}-${hi:.2f}"
+            )
+        else:
+            log(
+                f"⚠ Hold position #{position['token_id']} but range unknown and on-chain "
+                f"recovery failed — skipping tick to avoid friendly-fire redeem"
+            )
+            save_state(state)
+            emit("tick", {"status": "range_recovery_pending",
+                          "token_id": position["token_id"]})
+            return
 
     # Circuit breaker
     errors = state.get("errors", {})
