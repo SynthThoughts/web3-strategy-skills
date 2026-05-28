@@ -3725,7 +3725,9 @@ def _tick_inner():
 
         # Auto-resume logic
         resumed = False
-        if STOP_AUTO_RESUME and "trailing_stop" in trigger_msg:
+        if STOP_AUTO_RESUME and (
+            "trailing_stop" in trigger_msg or "stop_loss" in trigger_msg
+        ):
             # Check 24h resume count limit
             resume_log = state.get("_auto_resume_log", [])
             cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
@@ -3754,14 +3756,24 @@ def _tick_inner():
                 current_drawdown = (
                     (peak - smooth_usd) / peak if peak > 0 else 1.0
                 )
-                # Resume if drawdown recovered below threshold with margin
-                resume_threshold = (
-                    TRAILING_STOP_PCT * 0.7
-                )  # must recover to 70% of stop level
-                if cooldown_met and current_drawdown < resume_threshold:
+                # Recovery condition depends on stop type:
+                #   trailing_stop → drawdown from peak recovered below 70% of stop
+                #   stop_loss     → PnL climbed back above -70% of stop level
+                # (smoothed median value already guards single API-glitch spikes)
+                if "stop_loss" in trigger_msg:
+                    pnl_pct = calc_pnl(stats, smooth_usd, price)["pnl_pct"] / 100
+                    resume_threshold = STOP_LOSS_PCT * 0.7
+                    recovered = pnl_pct > -resume_threshold
+                    recovery_metric = f"PnL {pnl_pct:+.1%} > -{resume_threshold:.1%}"
+                else:
+                    resume_threshold = TRAILING_STOP_PCT * 0.7
+                    recovered = current_drawdown < resume_threshold
+                    recovery_metric = (
+                        f"drawdown {current_drawdown:.1%} < {resume_threshold:.1%}"
+                    )
+                if cooldown_met and recovered:
                     log(
-                        f"AUTO-RESUME: drawdown {current_drawdown:.1%} < "
-                        f"{resume_threshold:.1%} threshold, cooldown met "
+                        f"AUTO-RESUME ({recovery_metric}), cooldown met "
                         f"(resume {len(resume_log)+1}/{MAX_AUTO_RESUMES_24H})"
                     )
                     state.pop("stop_triggered", None)
