@@ -314,7 +314,7 @@ def cmd_init(args):
         "pool": {},
         "position": None,
         "stats": {
-            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "started_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "initial_portfolio_usd": args.capital,
             "total_rebalances": 0,
             "total_fees_claimed_usd": 0.0,
@@ -994,20 +994,39 @@ def cmd_deploy(args):
             print("✗ init failed (see above). Aborting — nothing deployed.")
             return 1
 
-    print("\n[deploy] Step 2/3 — creating initial LP position (first tick)...")
-    if cmd_start(args) != 0:
-        print("✗ Initial deposit failed (see above). Funds remain in your wallet. "
-              "Resolve the issue, then re-run `lp-auto deploy` or `lp-auto start`.")
-        return 1
+    print("\n[deploy] Step 2/3 — creating initial LP position...")
+    # On a brand-new wallet the first tick only submits the ERC-20 APPROVE, which
+    # must confirm on-chain before the deposit can succeed — so the position is
+    # minted on a later tick. Run the tick, then re-check (and re-tick) until a
+    # position actually exists, rather than reporting a phantom success.
+    position_created = False
+    for attempt in range(1, 4):
+        if attempt > 1:
+            print(f"  [deploy] position not minted yet (first-time approval likely "
+                  f"still confirming) — retrying tick {attempt}/3 in 40s...")
+            time.sleep(40)
+        if cmd_start(args) != 0:
+            print("✗ Tick crashed (see above). Funds remain in your wallet. "
+                  "Resolve the issue, then re-run `lp-auto deploy`.")
+            return 1
+        if (read_state(args.instance).get("position") or {}).get("token_id"):
+            position_created = True
+            break
 
     print("\n[deploy] Step 3/3 — installing scheduler for ongoing management...")
     if cmd_install(args) != 0:
-        print("⚠ Scheduler install failed — the position is LIVE but will NOT auto-manage. "
-              "Run `lp-auto install` manually once resolved.")
+        print("⚠ Scheduler install failed — run `lp-auto install` manually.")
 
     print("\n[deploy] Final status:")
     cmd_status(args)
-    print("\n✓ Deploy complete — position created and ongoing management scheduled.")
+    if position_created:
+        tid = (read_state(args.instance).get("position") or {}).get("token_id")
+        print(f"\n✓ Deploy complete — position {tid} is live and auto-managed.")
+        return 0
+    print("\n⏳ Deploy staged — the initial approval was submitted but the position "
+          "is not minted yet (a first-time wallet must let the approval confirm "
+          "on-chain first). The scheduler will keep retrying; run `lp-auto status` "
+          "in ~10 min to confirm. Your funds remain safe in the wallet.")
     return 0
 
 

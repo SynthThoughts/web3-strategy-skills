@@ -1618,38 +1618,22 @@ def _broadcast_defi_txs(data: dict, label: str) -> bool:
             continue
         # Convert hex value to decimal wei
         value_wei = str(int(value, 16) if value.startswith("0x") else int(value))
-        broadcast_data = onchainos_cmd(
-            [
-                "wallet",
-                "contract-call",
-                "--to",
-                to_addr,
-                "--chain",
-                CHAIN_ID,
-                "--input-data",
-                calldata,
-                "--amt",
-                value_wei,
-            ],
-            timeout=60,
+        # Route through _wallet_contract_call so an onchainos "confirming" response
+        # (no tx hash) is retried with --force. A tx that still yields no confirmed
+        # hash MUST be treated as a failure — otherwise a multi-step deposit would
+        # broadcast its DEPOSIT against a not-yet-mined APPROVE and revert on a
+        # fresh wallet with no allowance (incident 2026-05-29).
+        tx_hash, fail = _wallet_contract_call(
+            {"to": to_addr, "data": calldata, "value": value_wei}
         )
-        if broadcast_data and broadcast_data.get("ok") and broadcast_data.get("data"):
-            r = broadcast_data["data"]
-            if isinstance(r, list):
-                r = r[0] if r else {}
-            tx_hash = r.get("txHash") or r.get("hash") or r.get("orderId")
-            log(f"  {label} [{tx_type}] broadcast OK: {tx_hash}")
-            # Verify on-chain execution
-            if tx_hash:
-                confirmed = _verify_tx_receipt(tx_hash)
-                if not confirmed:
-                    log(f"  {label} [{tx_type}] TX REVERTED on-chain: {tx_hash}")
-                    return False
-        else:
-            detail = (
-                json.dumps(broadcast_data)[:200] if broadcast_data else "no response"
-            )
-            log(f"  {label} [{tx_type}] broadcast failed: {detail}")
+        if not tx_hash:
+            log(f"  {label} [{tx_type}] broadcast failed (no confirmed hash): "
+                f"{json.dumps(fail)[:160] if fail else 'no response'}")
+            return False
+        log(f"  {label} [{tx_type}] broadcast OK: {tx_hash}")
+        confirmed = _verify_tx_receipt(tx_hash)
+        if not confirmed:
+            log(f"  {label} [{tx_type}] TX REVERTED on-chain: {tx_hash}")
             return False
     return True
 
@@ -3234,6 +3218,10 @@ def calc_pnl(stats: dict, current_usd: float, current_price: float = 0) -> dict:
     # Annualized yields
     started = stats.get("started_at", "")
     started_dt = _safe_isoparse(started) if started else None
+    if started_dt and started_dt.tzinfo is None:
+        # started_at seeded without tz (init via time.strftime) — assume UTC, else
+        # naive − aware subtraction crashes the first tick on a fresh instance.
+        started_dt = started_dt.replace(tzinfo=timezone.utc)
     days = (datetime.now(timezone.utc) - started_dt).total_seconds() / 86400 if started_dt else 0
     days = max(days, 0.01)
 
