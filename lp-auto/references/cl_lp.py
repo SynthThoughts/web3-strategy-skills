@@ -3807,7 +3807,9 @@ def _tick_inner():
         # Auto-resume logic
         resumed = False
         if STOP_AUTO_RESUME and (
-            "trailing_stop" in trigger_msg or "stop_loss" in trigger_msg
+            "trailing_stop" in trigger_msg
+            or "stop_loss" in trigger_msg
+            or "il_limit" in trigger_msg
         ):
             # Check 24h resume count limit
             resume_log = state.get("_auto_resume_log", [])
@@ -3840,12 +3842,18 @@ def _tick_inner():
                 # Recovery condition depends on stop type:
                 #   trailing_stop → drawdown from peak recovered below 70% of stop
                 #   stop_loss     → PnL climbed back above -70% of stop level
+                #   il_limit      → |IL| fell back below 70% of the tolerance
                 # (smoothed median value already guards single API-glitch spikes)
                 if "stop_loss" in trigger_msg:
                     pnl_pct = calc_pnl(stats, smooth_usd, price)["pnl_pct"] / 100
                     resume_threshold = STOP_LOSS_PCT * 0.7
                     recovered = pnl_pct > -resume_threshold
                     recovery_metric = f"PnL {pnl_pct:+.1%} > -{resume_threshold:.1%}"
+                elif "il_limit" in trigger_msg:
+                    il_now = abs(stats.get("estimated_il_pct", 0))
+                    resume_threshold = MAX_IL_TOLERANCE_PCT * 0.7
+                    recovered = il_now < resume_threshold
+                    recovery_metric = f"IL {il_now:.1f}% < {resume_threshold:.1f}%"
                 else:
                     resume_threshold = TRAILING_STOP_PCT * 0.7
                     recovered = current_drawdown < resume_threshold
