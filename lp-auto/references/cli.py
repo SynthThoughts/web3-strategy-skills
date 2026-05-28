@@ -886,6 +886,131 @@ def cmd_uninstall(args):
     return 0
 
 
+# ── Preflight + one-command deploy ──────────────────────────────────────────
+
+def _onchainos_json(cli_args: list[str], timeout: int = 30) -> Optional[dict]:
+    """Run `onchainos <cli_args>` → parsed JSON dict, or None on failure."""
+    exe = shutil.which("onchainos")
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe] + cli_args, capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            return None
+        return json.loads(r.stdout)
+    except Exception:
+        return None
+
+
+def _preflight(chain: str, capital: Optional[float] = None) -> tuple[bool, str]:
+    """Verify the engine prerequisites are in place before deploying:
+      1. onchainos CLI on PATH   2. a logged-in wallet   3. funds on the chain.
+    Returns (ok, wallet_address) and prints actionable diagnostics. Read-only."""
+    print("[doctor] Preflight checks:")
+    # 1. onchainos binary — the engine for all on-chain ops
+    exe = shutil.which("onchainos")
+    if not exe:
+        print("  ✗ onchainos CLI not found on PATH.")
+        print("    → Install the OKX OnchainOS CLI and add it to PATH, then log in.")
+        print("      See QUICKSTART.md (Step 0). All on-chain ops route through it.")
+        return False, ""
+    print(f"  ✓ onchainos: {exe}")
+    # 2. logged-in wallet
+    addrs = _onchainos_json(["wallet", "addresses"])
+    wallet, acct = "", ""
+    if addrs and addrs.get("ok") and addrs.get("data"):
+        acct = addrs["data"].get("accountName", "")
+        for e in addrs["data"].get("evm", []):
+            if e.get("address"):
+                wallet = e["address"]
+                break
+    if not wallet:
+        print("  ✗ No logged-in wallet (onchainos returned no address).")
+        print("    → Check: onchainos wallet status   (log in if loggedIn:false)")
+        return False, ""
+    print(f"  ✓ wallet: {wallet}  ({acct})")
+    # 3. funds on the target chain (informational + capital sanity)
+    tv = _onchainos_json(
+        ["portfolio", "total-value", "--address", wallet, "--chains", chain]
+    )
+    total = None
+    if tv and tv.get("ok") and tv.get("data"):
+        try:
+            total = float(tv["data"][0]["totalValue"])
+        except (KeyError, IndexError, ValueError, TypeError):
+            total = None
+    if total is None:
+        print(f"  ⚠ Could not read {chain} balance (continuing; deposit re-validates).")
+    else:
+        print(f"  • {chain} wallet value: ${total:,.2f}")
+        if capital is not None and total < capital:
+            print(f"    ⚠ Below requested capital ${capital:,.0f}. Fund the wallet on "
+                  f"{chain} (native ETH for gas + capital) before deploying.")
+    return True, wallet
+
+
+def cmd_doctor(args):
+    """Preflight only — check onchainos + wallet + funds without changing anything."""
+    chain = getattr(args, "chain", None)
+    capital = getattr(args, "capital", None)
+    if not chain:
+        cfg = read_config(args.instance)
+        chain = cfg.get("chain", "base")
+        if capital is None:
+            capital = cfg.get("capital_usd")
+    ok, _ = _preflight(chain, capital)
+    if ok:
+        print("[doctor] ✓ Ready to deploy.")
+        return 0
+    print("[doctor] ✗ Not ready — resolve the above and re-run.")
+    return 1
+
+
+def cmd_deploy(args):
+    """One command, cold start → live position:
+        preflight → init (pick pool) → first deposit (mint) → scheduler → status.
+
+    Assumes onchainos is installed + logged in and the wallet is funded on
+    --chain (native ETH for gas + capital). Aborts before any on-chain action
+    if preflight fails.
+    """
+    print("=" * 64)
+    print(f"lp-auto deploy — instance '{args.instance}' on {args.chain} "
+          f"(risk={args.risk}, capital=${args.capital:.0f})")
+    print("=" * 64)
+
+    ok, _ = _preflight(args.chain, args.capital)
+    if not ok:
+        print("\n✗ Preflight failed — nothing deployed. See QUICKSTART.md.")
+        return 1
+
+    d = instance_dir(args.instance)
+    if (d / "config.json").exists() and not args.force:
+        print(f"\n[deploy] Instance '{args.instance}' already initialized — reusing "
+              f"(pass --force to re-select pool).")
+    else:
+        print("\n[deploy] Step 1/3 — selecting pool + initializing instance...")
+        if cmd_init(args) != 0:
+            print("✗ init failed (see above). Aborting — nothing deployed.")
+            return 1
+
+    print("\n[deploy] Step 2/3 — creating initial LP position (first tick)...")
+    if cmd_start(args) != 0:
+        print("✗ Initial deposit failed (see above). Funds remain in your wallet. "
+              "Resolve the issue, then re-run `lp-auto deploy` or `lp-auto start`.")
+        return 1
+
+    print("\n[deploy] Step 3/3 — installing scheduler for ongoing management...")
+    if cmd_install(args) != 0:
+        print("⚠ Scheduler install failed — the position is LIVE but will NOT auto-manage. "
+              "Run `lp-auto install` manually once resolved.")
+
+    print("\n[deploy] Final status:")
+    cmd_status(args)
+    print("\n✓ Deploy complete — position created and ongoing management scheduled.")
+    return 0
+
+
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -962,6 +1087,27 @@ def main():
     p_uninstall = sub.add_parser("uninstall")
     p_uninstall.add_argument("--force", action="store_true")
     p_uninstall.set_defaults(func=cmd_uninstall)
+
+    p_doctor = sub.add_parser("doctor",
+                              help="Preflight: check onchainos + wallet + funds (read-only)")
+    p_doctor.add_argument("--chain", default="")
+    p_doctor.add_argument("--capital", type=float, default=None)
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    p_deploy = sub.add_parser("deploy",
+                              help="One command: preflight → init → first deposit → scheduler")
+    p_deploy.add_argument("--chain", default="base")
+    p_deploy.add_argument("--risk", default="medium")
+    p_deploy.add_argument("--capital", type=float, default=500)
+    p_deploy.add_argument("--pool-id", help="Specific investmentId (skips auto-selection)")
+    p_deploy.add_argument("--tokens", help="Comma-separated discovery seeds")
+    p_deploy.add_argument("--auto-switch", action="store_true")
+    p_deploy.add_argument("--force", action="store_true", help="Re-select pool if already init'd")
+    p_deploy.add_argument("--scheduler", default="",
+                          help="Scheduler type (default: platform auto-detect)")
+    p_deploy.add_argument("--interval", type=int, default=300,
+                          help="Tick interval seconds (default 300)")
+    p_deploy.set_defaults(func=cmd_deploy, install_cron=False)
 
     args = parser.parse_args()
     sys.exit(args.func(args))
